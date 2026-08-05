@@ -1,0 +1,17 @@
+{
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "npm run test:fast",
+    "test:fast": "node --test tests/fast-suite.test.mjs",
+    "test:integration": "node --test tests/integration-suite.test.mjs",
+    "test:soak": "node tests/run-soak.mjs",
+    "test:all": "npm run test:fast && npm run test:integration && npm run test:soak",
+    "sync-version": "node scripts/sync-version.mjs",
+    "build": "node scripts/build-module.mjs",
+    "test:soak:track": "node tests/track-fuzz-tests.mjs",
+    "test:soak:race": "node tests/race-soak-tests.mjs",
+    "test:soak:full": "npm run test:soak:track && npm run test:soak:race"
+  },
+  "version": "0.16.9"
+}
