@@ -1246,7 +1246,7 @@ function spatialSegmentsNear(spatialGrid, x, y, radius, fallbackCount) {
   return indices;
 }
 
-function pitLaneFitsCircuit(pit, trackSamples, trackTotalLength, trackWidth, spatialGrid = null) {
+export function pitLaneFitsCircuit(pit, trackSamples, trackTotalLength, trackWidth, spatialGrid = null) {
   if (!pit?.samples?.length) return false;
   const leftWall = pit.samples.map((point) => wallBoundaryPoint(point, pit.width, 1));
   const rightWall = pit.samples.map((point) => wallBoundaryPoint(point, pit.width, -1));
@@ -1278,6 +1278,27 @@ function pitLaneFitsCircuit(pit, trackSamples, trackTotalLength, trackWidth, spa
     }
   }
   return true;
+}
+
+function resetPitWallAlphas(trackSamples) {
+  for (const point of trackSamples ?? []) {
+    point.wallLeftAlpha = 1;
+    point.wallRightAlpha = 1;
+  }
+}
+
+function findValidPitLane(trackSamples, trackTotalLength, trackWidth) {
+  const spatialGrid = buildSpatialGrid(trackSamples, Math.max(220, trackWidth * 1.35), true);
+  const { fullOffset } = pitLaneDimensions(trackWidth);
+  const candidates = choosePitWindows(trackSamples, fullOffset);
+  for (const placement of candidates.slice(0, 80)) {
+    resetPitWallAlphas(trackSamples);
+    const candidate = buildPitLane(trackSamples, trackTotalLength, trackWidth, placement);
+    if (!pitLaneFitsCircuit(candidate, trackSamples, trackTotalLength, trackWidth, spatialGrid)) continue;
+    return { pit: candidate, spatialGrid };
+  }
+  resetPitWallAlphas(trackSamples);
+  return null;
 }
 
 function pointToSegmentDistanceSquared(point, start, end) {
@@ -1571,9 +1592,11 @@ export function generateTrack(seed, complexity = 2, environmentTheme = "auto") {
   let samples = null;
   let totalLength = 0;
   let tournamentLayout = null;
+  let pit = null;
+  let spatialGrid = null;
   let usedAttempt = 0;
 
-  const prepareCandidate = (candidateControls, candidateSamples) => {
+  const prepareCandidate = (candidateControls, candidateSamples, { requireTournamentProfile = true } = {}) => {
     if (!candidateSamples?.length || polylineSelfIntersects(candidateSamples)) return null;
     const rotated = rotateToBestStart(candidateSamples);
     let length = 0;
@@ -1592,9 +1615,17 @@ export function generateTrack(seed, complexity = 2, environmentTheme = "auto") {
       const worstTurn = Math.max(maximumPolylineTurn(left), maximumPolylineTurn(right));
       if (!leftIntersection && !rightIntersection && worstTurn < 2.45) {
         const layout = analyzeTrackLayout(rotated, length);
-        if (safeComplexity === 5
+        if (requireTournamentProfile && safeComplexity === 5
           && (layout.longestStraightRatio < 0.105 || layout.technicalRatio < 0.28)) return null;
-        return { controls: candidateControls, samples: rotated, totalLength: length, tournamentLayout: layout };
+        const pitPlacement = findValidPitLane(rotated, length, width);
+        if (!pitPlacement) return null;
+        return {
+          controls: candidateControls,
+          samples: rotated,
+          totalLength: length,
+          tournamentLayout: layout,
+          ...pitPlacement
+        };
       }
       const problems = [leftIntersection, rightIntersection].filter(Boolean);
       if (!problems.length) return null;
@@ -1625,7 +1656,7 @@ export function generateTrack(seed, complexity = 2, environmentTheme = "auto") {
     }
     const prepared = prepareCandidate(candidateControls, candidateSamples);
     if (!prepared) continue;
-    ({ controls, samples, totalLength, tournamentLayout } = prepared);
+    ({ controls, samples, totalLength, tournamentLayout, pit, spatialGrid } = prepared);
     usedAttempt = attempt;
     break;
   }
@@ -1644,24 +1675,40 @@ export function generateTrack(seed, complexity = 2, environmentTheme = "auto") {
       });
       fallbackControls = smoothControlLoop(fallbackControls, safeComplexity <= 2 ? 2 : 0);
     }
+
     const prepared = prepareCandidate(fallbackControls, sampleSpline(fallbackControls, safeComplexity));
-    if (prepared) ({ controls, samples, totalLength, tournamentLayout } = prepared);
-    else {
-      const count = safeComplexity === 5 ? 18 : 12 + safeComplexity;
-      controls = Array.from({ length: count }, (_, index) => {
-        const angle = index / count * Math.PI * 2;
-        const radius = (940 + safeComplexity * 45) * TRACK_LENGTH_SCALE;
-        return { x: Math.cos(angle) * radius, y: Math.sin(angle) * radius * 0.82 };
-      });
-      samples = rotateToBestStart(sampleSpline(controls, safeComplexity >= 4 ? 3 : safeComplexity));
-      totalLength = finalizeClosedSamples(samples);
-      assignTrackRunoffProfile(samples, totalLength, width, seed, resolvedEnvironmentTheme);
-      assignWallCoordinates(samples, width, true);
-      constrainWallCoordinates(samples, width);
-      enforceWallSegmentClearance(samples, width, true);
-      tournamentLayout = analyzeTrackLayout(samples, totalLength);
+    if (prepared) {
+      ({ controls, samples, totalLength, tournamentLayout, pit, spatialGrid } = prepared);
+      usedAttempt = 99;
+    } else {
+      const emergencyAttempts = safeComplexity === 5 ? 24 : 4;
+      for (let emergencyAttempt = 0; emergencyAttempt < emergencyAttempts && !samples; emergencyAttempt += 1) {
+        let emergencyControls;
+        let emergencySamples;
+        if (safeComplexity === 5) {
+          const irregularity = Math.max(0.30, 0.42 - emergencyAttempt * 0.004);
+          emergencyControls = smoothControlLoop(
+            makeTournamentControlPoints(seededRng(`${seed}:tournament-emergency:${emergencyAttempt}`), irregularity),
+            1
+          );
+          emergencySamples = sampleSpline(emergencyControls, safeComplexity);
+        } else {
+          const count = 12 + safeComplexity;
+          const radius = (940 + safeComplexity * 45 + emergencyAttempt * 120) * TRACK_LENGTH_SCALE;
+          const yScale = 0.82 - emergencyAttempt * 0.025;
+          emergencyControls = Array.from({ length: count }, (_, index) => {
+            const angle = index / count * Math.PI * 2;
+            return { x: Math.cos(angle) * radius, y: Math.sin(angle) * radius * yScale };
+          });
+          emergencySamples = sampleSpline(emergencyControls, safeComplexity >= 4 ? 3 : safeComplexity);
+        }
+        const emergency = prepareCandidate(emergencyControls, emergencySamples);
+        if (!emergency) continue;
+        ({ controls, samples, totalLength, tournamentLayout, pit, spatialGrid } = emergency);
+        usedAttempt = 100 + emergencyAttempt;
+      }
+      if (!samples || !pit || !spatialGrid) throw new Error(`Unable to generate a valid circuit and pit lane for seed ${seed}`);
     }
-    usedAttempt = 99;
   }
 
   const sectorCount = 12;
@@ -1669,27 +1716,6 @@ export function generateTrack(seed, complexity = 2, environmentTheme = "auto") {
     const sampleIndex = Math.floor(index * samples.length / sectorCount) % samples.length;
     return { index, sampleIndex, progress: samples[sampleIndex].cumulative / totalLength };
   });
-  const spatialGrid = buildSpatialGrid(samples, Math.max(220, width * 1.35), true);
-  const { fullOffset } = pitLaneDimensions(width);
-  const pitCandidates = choosePitWindows(samples, fullOffset);
-  let pit = null;
-  for (const placement of pitCandidates.slice(0, 80)) {
-    for (const point of samples) {
-      point.wallLeftAlpha = 1;
-      point.wallRightAlpha = 1;
-    }
-    const candidate = buildPitLane(samples, totalLength, width, placement);
-    if (!pitLaneFitsCircuit(candidate, samples, totalLength, width, spatialGrid)) continue;
-    pit = candidate;
-    break;
-  }
-  if (!pit) {
-    for (const point of samples) {
-      point.wallLeftAlpha = 1;
-      point.wallRightAlpha = 1;
-    }
-    pit = buildPitLane(samples, totalLength, width, pitCandidates[0]);
-  }
   applyWallSegmentSafetyMasks(samples, totalLength, width, pit);
   const scenery = buildScenery(samples, totalLength, width, pit, seed, safeComplexity, resolvedEnvironmentTheme);
   pit.spatialGrid = buildSpatialGrid(pit.samples, Math.max(180, pit.width * 1.75), false);

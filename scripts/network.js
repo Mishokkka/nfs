@@ -544,28 +544,54 @@ function hydrateRaceFrame(frame, race) {
 }
 
 function normalizeResults(raw, race) {
-  if (!raw || typeof raw !== "object" || !race) return null;
-  const meta = new Map((race.carMeta ?? []).map((entry) => [entry.id, entry]));
+  if (!raw || typeof raw !== "object" || Array.isArray(raw) || !race || !Array.isArray(raw.cars)) return null;
+  const metadata = Array.isArray(race.carMeta) ? race.carMeta : [];
+  const entries = Array.isArray(race.entries) ? race.entries : [];
+  if (!metadata.length || metadata.length > MAX_RACE_ENTRIES
+    || entries.length !== metadata.length || raw.cars.length !== metadata.length) return null;
+
+  const meta = new Map();
+  const entryMeta = new Map();
+  for (const entry of metadata) {
+    const id = typeof entry?.id === "string" ? entry.id : "";
+    if (!id || id.length > 80 || meta.has(id)) return null;
+    meta.set(id, entry);
+  }
+  for (const entry of entries) {
+    const id = typeof entry?.id === "string" ? entry.id : "";
+    if (!id || id.length > 80 || entryMeta.has(id) || !meta.has(id)) return null;
+    entryMeta.set(id, entry);
+  }
+  if (meta.size !== metadata.length || entryMeta.size !== meta.size) return null;
+
   const seen = new Set();
   const cars = [];
-  for (const source of Array.isArray(raw.cars) ? raw.cars.slice(0, MAX_RACE_ENTRIES) : []) {
-    const id = String(source?.id ?? "").slice(0, 80);
+  for (const source of raw.cars) {
+    if (!source || typeof source !== "object" || Array.isArray(source)) return null;
+    const id = typeof source.id === "string" ? source.id : "";
     const staticData = meta.get(id);
-    if (!id || !staticData || seen.has(id)) continue;
+    if (!id || id.length > 80 || !staticData || seen.has(id)) return null;
+
+    const finished = Boolean(source.finished);
+    const numericFinishTime = source.finishTime == null ? null : Number(source.finishTime);
+    if (finished && !Number.isFinite(numericFinishTime)) return null;
+
     seen.add(id);
     cars.push({
       id,
       name: staticData.name,
       driverName: staticData.driverName,
-      isBot: Boolean(source.isBot),
-      finishTime: source.finishTime == null ? null : rounded(source.finishTime, 3, 0, 0, 1000000),
-      finished: Boolean(source.finished),
+      isBot: Boolean(entryMeta.get(id)?.isBot),
+      finishTime: finished ? rounded(numericFinishTime, 3, 0, 0, 1000000) : null,
+      finished,
       health: rounded(source.health, 2, 0, 0, staticData.maxHealth),
       maxHealth: staticData.maxHealth,
       pitStopsCompleted: Math.max(0, Math.floor(finite(source.pitStopsCompleted, 0, 0, 20))),
-      pitStopsRequired: Math.max(0, Math.floor(finite(source.pitStopsRequired, race.config?.requiredPitStops ?? 0, 0, 20)))
+      pitStopsRequired: Math.max(0, Math.floor(finite(race.config?.requiredPitStops, 0, 0, 20)))
     });
   }
+  if (seen.size !== meta.size) return null;
+
   return {
     seed: Math.floor(finite(raw.seed, race.config?.seed ?? 1, -Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER)),
     laps: Math.max(1, Math.floor(finite(raw.laps, race.config?.laps ?? 1, 1, 100))),
@@ -1099,7 +1125,8 @@ export class RaceNetwork {
       }
 
       case "host-claim": {
-        if (!game.users?.get(message.senderId)?.isGM) break;
+        const sender = game.users?.get(message.senderId);
+        if (!sender?.isGM || !sender.active) break;
         if (!this.#acceptLobby(message)) break;
         const incoming = this.#normalizeLobby(message.lobby);
         const abortRace = Boolean(message.abortRace);
@@ -1180,11 +1207,13 @@ export class RaceNetwork {
         if (!this.#isExpectedHost(message) || message.lobbyId !== this.lobby?.id) break;
         const race = this.#normalizeRace(message.race, message.senderId, message.sentAt);
         if (!race || race.lobbyId !== this.lobby.id) break;
+        const restoredResults = race.phase === "results" ? normalizeResults(message.results, race) : null;
+        if (race.phase === "results" && !restoredResults) break;
         this.activeRace = race;
         const restoredFrame = decodeRaceFrame(message.frame, this.activeRace);
         this.lastFrame = encodeNormalizedFrame(restoredFrame);
         this.lastSnapshot = hydrateRaceFrame(restoredFrame, this.activeRace);
-        this.lastResults = normalizeResults(message.results, this.activeRace);
+        this.lastResults = restoredResults;
         this.#markHostAlive();
         this.#emit("raceState", {
           race: clone(this.activeRace),

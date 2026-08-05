@@ -16,7 +16,8 @@ const users = new Map([
   ["player", { id: "player", name: "Player", isGM: false, active: true }],
   ["attacker", { id: "attacker", name: "Attacker", isGM: false, active: true }],
   ["gm-a", { id: "gm-a", name: "GM A", isGM: true, active: true }],
-  ["gm-b", { id: "gm-b", name: "GM B", isGM: true, active: true }]
+  ["gm-b", { id: "gm-b", name: "GM B", isGM: true, active: true }],
+  ["gm-inactive", { id: "gm-inactive", name: "Inactive GM", isGM: true, active: false }]
 ]);
 let socketHandler = null;
 let socketOnCalls = 0;
@@ -177,12 +178,36 @@ const message = (payload) => ({
 
   const lobbyPhaseBeforeInvalidResults = network.lobby.phase;
   const racePhaseBeforeInvalidResults = network.activeRace.phase;
+  const previousResults = { sentinel: true };
+  network.lastResults = previousResults;
+  const invalidResultPayloads = [
+    null,
+    {},
+    { cars: [] },
+    { cars: [{ id: "car-player", finished: true, finishTime: 10 }, { id: "unknown", finished: true, finishTime: 11 }] },
+    { cars: [{ id: "car-player", finished: true, finishTime: 10 }, { id: "car-player", finished: true, finishTime: 11 }] },
+    { cars: [{ id: "car-player", finished: true, finishTime: 10 }] }
+  ];
+  for (const results of invalidResultPayloads) {
+    socketHandler(message({
+      type: "race-results", senderId: "host", lobbyId: "lobby-a", raceId: "race-a", results
+    }));
+    assert.equal(network.lobby.phase, lobbyPhaseBeforeInvalidResults, "invalid results changed the lobby phase");
+    assert.equal(network.activeRace.phase, racePhaseBeforeInvalidResults, "invalid results changed the race phase");
+    assert.equal(network.lastResults, previousResults, "invalid results replaced the previous result set");
+  }
+
+  const raceBeforeInvalidState = network.activeRace;
   socketHandler(message({
-    type: "race-results", senderId: "host", lobbyId: "lobby-a", raceId: "race-a", results: null
+    type: "race-state",
+    senderId: "host",
+    lobbyId: "lobby-a",
+    race: { ...structuredClone(network.activeRace), phase: "results" },
+    frame: null,
+    results: { cars: [] }
   }));
-  assert.equal(network.lobby.phase, lobbyPhaseBeforeInvalidResults, "invalid results changed the lobby phase");
-  assert.equal(network.activeRace.phase, racePhaseBeforeInvalidResults, "invalid results changed the race phase");
-  assert.equal(network.lastResults, null, "invalid results were stored");
+  assert.equal(network.activeRace, raceBeforeInvalidState, "invalid restored results replaced the active race");
+  assert.equal(network.lastResults, previousResults, "invalid restored results replaced the previous result set");
 
   // race-frame validation must stay structural. Re-serializing every accepted
   // snapshot on every client was measurable overhead with larger grids.
@@ -223,6 +248,26 @@ const message = (payload) => ({
     }
   }));
   assert.equal(snapshots, 4, "oversized compact row string was accepted");
+
+  socketHandler(message({
+    type: "race-results",
+    senderId: "host",
+    lobbyId: "lobby-a",
+    raceId: "race-a",
+    results: {
+      seed: 1,
+      laps: 1,
+      cars: [
+        { id: "car-player", isBot: true, finished: true, finishTime: 10, health: 90, pitStopsCompleted: 1 },
+        { id: "car-host", isBot: true, finished: false, finishTime: 999, health: 80, pitStopsCompleted: 0 }
+      ]
+    }
+  }));
+  assert.equal(network.lobby.phase, "results", "complete results did not advance the lobby phase");
+  assert.equal(network.activeRace.phase, "results", "complete results did not advance the race phase");
+  assert.deepEqual(network.lastResults.cars.map((car) => car.id), ["car-player", "car-host"]);
+  assert.equal(network.lastResults.cars[0].isBot, false, "result payload overrode authoritative bot metadata");
+  assert.equal(network.lastResults.cars[1].finishTime, null, "unfinished car retained an arbitrary finish time");
 }
 
 // The host accepts input only for the car owned by the sender and only for the
@@ -357,6 +402,17 @@ const message = (payload) => ({
   assert.equal(pitCompletions, 1);
   socketHandler(message({ ...pit, senderId: "player" }));
   assert.equal(pitCompletions, 1, "pit request rate limit did not reject an immediate duplicate");
+
+  const hostLobbyPhase = network.lobby.phase;
+  const hostRacePhase = network.activeRace.phase;
+  const hostPreviousResults = { sentinel: "host" };
+  network.lastResults = hostPreviousResults;
+  const sentResultsBefore = emitted.filter((entry) => entry.type === "race-results").length;
+  network.sendResults({ cars: [{ id: "car-host", finished: true, finishTime: 10 }] });
+  assert.equal(network.lobby.phase, hostLobbyPhase, "host published partial results");
+  assert.equal(network.activeRace.phase, hostRacePhase, "host advanced the race with partial results");
+  assert.equal(network.lastResults, hostPreviousResults, "host replaced previous results with a partial set");
+  assert.equal(emitted.filter((entry) => entry.type === "race-results").length, sentResultsBefore, "host emitted partial results");
 }
 
 // Competing GM recovery claims for one lobby converge by host epoch, claim time
@@ -400,6 +456,17 @@ const message = (payload) => ({
   socketHandler(message({ type: "host-claim", senderId: "attacker", lobby: claimB, abortRace: true, abortedRaceId: "race-recovery" }));
   assert.equal(network.lobby.hostId, "host", "non-GM host claim changed the lobby owner");
   assert.equal(network.activeRace, activeBeforeAttack, "non-GM host claim changed the active race");
+  const phaseBeforeInactiveClaim = network.activeRace.phase;
+  const inactiveClaim = {
+    ...claimB,
+    hostId: "gm-inactive",
+    hostName: "Inactive GM",
+    hostClaimId: "claim-inactive"
+  };
+  socketHandler(message({ type: "host-claim", senderId: "gm-inactive", lobby: inactiveClaim, abortRace: true, abortedRaceId: "race-recovery" }));
+  assert.equal(network.lobby.hostId, "host", "inactive GM host claim changed the lobby owner");
+  assert.equal(network.activeRace, activeBeforeAttack, "inactive GM host claim changed the active race");
+  assert.equal(network.activeRace.phase, phaseBeforeInactiveClaim, "inactive GM host claim changed the race phase");
   socketHandler(message({ type: "host-claim", senderId: "gm-b", lobby: claimB, abortRace: true, abortedRaceId: "race-recovery" }));
   assert.equal(network.lobby.hostId, "gm-b");
   assert.equal(network.activeRace, null);
