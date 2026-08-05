@@ -5,7 +5,7 @@ import { positiveInteger } from "./test-harness.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const {
-  generateTrack, polylineSelfIntersects, wallBoundaryPoint, nearestTrackPoint, nearestPitPoint,
+  generateTrack, pitLaneFitsCircuit, polylineSelfIntersects, wallBoundaryPoint, nearestTrackPoint, nearestPitPoint,
   MAIN_TRACK_SCENERY_CLEARANCE, SCENERY_CLEARANCE
 } = await import(pathToFileURL(path.join(root, "scripts/track.js")).href);
 
@@ -37,6 +37,11 @@ function headingTurn(points, width, side, closed = true, alphaKey = null) {
 for (let seed = 0; seed < trackSeeds; seed += 1) {
   const track = generateTrack(seed, 1 + seed % 5);
   assert.equal(polylineSelfIntersects(track.samples), false, `self-intersection at seed ${seed}`);
+  assert.equal(
+    pitLaneFitsCircuit(track.pit, track.samples, track.totalLength, track.width, track.spatialGrid),
+    true,
+    `unvalidated pit lane at seed ${seed}`
+  );
   assert.ok(track.scenery.length >= 18, `scenery generation starved at seed ${seed}`);
   for (const obstacle of track.scenery) {
     const main = nearestTrackPoint(track, obstacle.x, obstacle.y);
