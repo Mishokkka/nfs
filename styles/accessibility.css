@@ -1,0 +1,12 @@
+/* Настройки доступности и системные предпочтения пользователя. */
+
+@media (prefers-reduced-motion: reduce) {
+  .fbl-need-for-speed *,
+  .fbl-need-for-speed *::before,
+  .fbl-need-for-speed *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}

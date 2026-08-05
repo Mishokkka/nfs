@@ -1,0 +1,417 @@
+<div class="nfs-shell">
+  <header class="nfs-topbar">
+    <div class="nfs-brand">
+      <span class="nfs-brand__mark"><i class="fas fa-flag-checkered"></i></span>
+      <div class="nfs-brand__copy">
+        <strong>Большие Гонки</strong>
+        <span>Аллантре · сезон 882 П.П.</span>
+      </div>
+    </div>
+
+    {{#unless isRace}}
+    <nav class="nfs-tabs" aria-label="Разделы модуля">
+      <button type="button" data-action="show-garage" class="nfs-tab {{#if isGarage}}is-active{{/if}}" aria-current="{{#if isGarage}}page{{else}}false{{/if}}">
+        <i class="fas fa-wrench"></i><span>Гараж</span>
+      </button>
+      <button type="button" data-action="show-lobby" class="nfs-tab {{#if isLobby}}is-active{{/if}}" aria-current="{{#if isLobby}}page{{else}}false{{/if}}">
+        <i class="fas fa-users"></i><span>Лобби</span>
+      </button>
+    </nav>
+    {{/unless}}
+  </header>
+
+  {{#if isGarage}}
+  <main class="nfs-view nfs-view--scroll nfs-garage">
+    <form id="nfs-garage-form" data-form="garage" autocomplete="off" class="nfs-garage__grid">
+      <section class="nfs-card">
+        <header class="nfs-card__header nfs-card__header--compact">
+          <div class="nfs-heading-row">
+            <div>
+              <span class="nfs-eyebrow">Объект</span>
+              <h2>Болид</h2>
+            </div>
+            <span class="nfs-help" tabindex="0" aria-label="Справка" data-nfs-tooltip="Соберите машину из шести основных узлов и одного специального модуля. Описания выбранных деталей доступны при наведении на поле."><i class="fas fa-circle-question"></i></span>
+          </div>
+          <span class="nfs-chip"><i class="fas fa-cubes-stacked"></i> 7 узлов</span>
+        </header>
+
+        <div class="nfs-section nfs-section--compact">
+          <label class="nfs-field nfs-field--wide">
+            <span class="nfs-field__label">Название болида</span>
+            <input type="text" name="name" value="{{build.name}}" maxlength="60" placeholder="Безымянный болид">
+          </label>
+        </div>
+
+        <div class="nfs-section">
+          <div class="nfs-section__title">
+            <h3>Комплектующие</h3>
+            <span class="nfs-help" tabindex="0" aria-label="Справка" data-nfs-tooltip="Наведите на любое поле, чтобы увидеть полное название и эффект выбранного узла."><i class="fas fa-circle-question"></i></span>
+          </div>
+
+          <div class="nfs-parts-grid">
+            <label class="nfs-field" {{#each frameOptions}}{{#if selected}}data-nfs-tooltip="{{name}}: {{description}}"{{/if}}{{/each}}>
+              <span class="nfs-field__label"><i class="fas fa-car-side"></i> Рама</span>
+              <select name="frame" aria-label="Рама">{{#each frameOptions}}<option value="{{id}}" {{#if selected}}selected{{/if}}>{{displayName}}</option>{{/each}}</select>
+            </label>
+
+            <label class="nfs-field" {{#each coreOptions}}{{#if selected}}data-nfs-tooltip="{{name}}: {{description}}"{{/if}}{{/each}}>
+              <span class="nfs-field__label"><i class="fas fa-gem"></i> Ядро</span>
+              <select name="core" aria-label="Кристаллическое ядро">{{#each coreOptions}}<option value="{{id}}" {{#if selected}}selected{{/if}}>{{displayName}}</option>{{/each}}</select>
+            </label>
+
+            <label class="nfs-field" {{#each transmissionOptions}}{{#if selected}}data-nfs-tooltip="{{name}}: {{description}}"{{/if}}{{/each}}>
+              <span class="nfs-field__label"><i class="fas fa-gears"></i> Передача</span>
+              <select name="transmission" aria-label="Передача">{{#each transmissionOptions}}<option value="{{id}}" {{#if selected}}selected{{/if}}>{{displayName}}</option>{{/each}}</select>
+            </label>
+
+            <label class="nfs-field" {{#each steeringOptions}}{{#if selected}}data-nfs-tooltip="{{name}}: {{description}}"{{/if}}{{/each}}>
+              <span class="nfs-field__label"><i class="fas fa-arrows-left-right"></i> Рулевое</span>
+              <select name="steering" aria-label="Рулевая система">{{#each steeringOptions}}<option value="{{id}}" {{#if selected}}selected{{/if}}>{{displayName}}</option>{{/each}}</select>
+            </label>
+
+            <label class="nfs-field" {{#each runningOptions}}{{#if selected}}data-nfs-tooltip="{{name}}: {{description}}"{{/if}}{{/each}}>
+              <span class="nfs-field__label"><i class="fas fa-circle-nodes"></i> Ходовая</span>
+              <select name="running" aria-label="Ходовая">{{#each runningOptions}}<option value="{{id}}" {{#if selected}}selected{{/if}}>{{displayName}}</option>{{/each}}</select>
+            </label>
+
+            <label class="nfs-field" {{#each bodyOptions}}{{#if selected}}data-nfs-tooltip="{{name}}: {{description}}"{{/if}}{{/each}}>
+              <span class="nfs-field__label"><i class="fas fa-shield-halved"></i> Корпус</span>
+              <select name="body" aria-label="Корпус">{{#each bodyOptions}}<option value="{{id}}" {{#if selected}}selected{{/if}}>{{displayName}}</option>{{/each}}</select>
+            </label>
+
+            <label class="nfs-field nfs-field--span-3" {{#each moduleOptions}}{{#if selected}}data-nfs-tooltip="{{name}}: {{description}}"{{/if}}{{/each}}>
+              <span class="nfs-field__label"><i class="fas fa-puzzle-piece"></i> Спецмодуль</span>
+              <select name="module" aria-label="Специальный модуль">{{#each moduleOptions}}<option value="{{id}}" {{#if selected}}selected{{/if}}>{{displayName}}</option>{{/each}}</select>
+            </label>
+          </div>
+        </div>
+
+        <div class="nfs-section">
+          <div class="nfs-section__title">
+            <h3>Профиль машины</h3>
+            <span class="nfs-help" tabindex="0" aria-label="Справка" data-nfs-tooltip="Верхний ряд показывает рейтинги сборки. Нижний ряд содержит фактические параметры физической модели."><i class="fas fa-circle-question"></i></span>
+          </div>
+          <div class="nfs-stat-grid">
+            {{#each stats}}
+            <article class="nfs-stat" data-stat="{{key}}" data-nfs-tooltip="{{tooltip}}" tabindex="0">
+              <div class="nfs-stat__line"><span>{{displayLabel}}</span><strong>{{value}}{{#if hasOverflow}} <small>+{{overflow}}</small>{{/if}}</strong></div>
+              <div class="nfs-rating"><span class="nfs-rating__fill" style="--rating-pct: {{percent}}%"></span></div>
+            </article>
+            {{/each}}
+          </div>
+          <div class="nfs-physics-strip" aria-label="Расчётные параметры болида">
+            {{#each physicsPreview}}
+            <span data-nfs-tooltip="{{label}}" tabindex="0"><small>{{shortLabel}}</small><strong data-physics-preview="{{key}}">{{value}}</strong></span>
+            {{/each}}
+          </div>
+        </div>
+      </section>
+
+      <section class="nfs-card nfs-card--driver">
+        <header class="nfs-card__header nfs-card__header--compact">
+          <div class="nfs-heading-row">
+            <div>
+              <span class="nfs-eyebrow">Объект</span>
+              <h2>Гонщик</h2>
+            </div>
+            <span class="nfs-help" tabindex="0" aria-label="Справка" data-nfs-tooltip="Распределите ровно {{driverPointBudget}} очков. Каждая характеристика принимает целое значение от {{driverStatMin}} до {{driverStatMax}}."><i class="fas fa-circle-question"></i></span>
+          </div>
+          <span class="nfs-points {{#if (nfsEq driverPoints driverPointBudget)}}is-valid{{else}}is-invalid{{/if}}">{{driverPoints}} / {{driverPointBudget}}</span>
+        </header>
+
+        <div class="nfs-section nfs-section--compact">
+          <label class="nfs-field nfs-field--wide">
+            <span class="nfs-field__label">Имя гонщика</span>
+            <input type="text" name="driverName" value="{{driver.name}}" maxlength="60" placeholder="Гонщик">
+          </label>
+        </div>
+
+        <div class="nfs-section nfs-section--driver-stats">
+          <div class="nfs-section__title nfs-section__title--driver">
+            <h3>Характеристики</h3>
+            <span id="nfs-driver-points-status" data-driver-points-status role="status" aria-live="polite" class="nfs-driver-points-status {{#if driverPointsValid}}is-valid{{else}}is-invalid{{/if}}">{{driverPointsStatus}}</span>
+          </div>
+          <div class="nfs-driver-stats">
+            {{#each driverStatRows}}
+            <div class="nfs-attribute" data-nfs-tooltip="{{tooltip}}" tabindex="0">
+              <div class="nfs-attribute__copy"><span><i class="{{icon}}"></i> {{displayLabel}}</span></div>
+              <div class="nfs-stepper" role="group" aria-label="{{label}}">
+                <button type="button" data-driver-stat="{{key}}" data-driver-step="-1" aria-label="Уменьшить {{label}}" {{#unless canDecrease}}disabled{{/unless}}><i class="fas fa-minus"></i></button>
+                <input type="number" name="{{key}}" value="{{value}}" min="{{../driverStatMin}}" max="{{../driverStatMax}}" step="1" inputmode="numeric" aria-label="{{label}}" aria-describedby="nfs-driver-points-status">
+                <button type="button" data-driver-stat="{{key}}" data-driver-step="1" aria-label="Увеличить {{label}}" {{#unless canIncrease}}disabled{{/unless}}><i class="fas fa-plus"></i></button>
+              </div>
+            </div>
+            {{/each}}
+          </div>
+        </div>
+
+        <div class="nfs-section">
+          <label class="nfs-field nfs-field--wide" {{#each specializationOptions}}{{#if selected}}data-nfs-tooltip="{{name}}: {{description}}"{{/if}}{{/each}}>
+            <span class="nfs-field__label"><i class="fas fa-medal"></i> Специализация</span>
+            <select name="specialization">{{#each specializationOptions}}<option value="{{id}}" {{#if selected}}selected{{/if}}>{{displayName}}</option>{{/each}}</select>
+          </label>
+        </div>
+
+        <div class="nfs-section">
+          <div class="nfs-section__title">
+            <h3>Таланты <span>2</span></h3>
+            <span class="nfs-help" tabindex="0" aria-label="Справка" data-nfs-tooltip="Выберите ровно два таланта. Наведите на карточку, чтобы прочитать эффект."><i class="fas fa-circle-question"></i></span>
+          </div>
+          <div class="nfs-talent-grid">
+            {{#each talentOptions}}
+            <label class="nfs-talent {{#if checked}}is-selected{{/if}}" data-nfs-tooltip="{{tooltip}}">
+              <input type="checkbox" name="talents" value="{{id}}" {{#if checked}}checked{{/if}}>
+              <span class="nfs-talent__check"><i class="fas fa-check"></i></span>
+              <span class="nfs-talent__copy"><strong>{{name}}</strong></span>
+            </label>
+            {{/each}}
+          </div>
+        </div>
+      </section>
+    </form>
+  </main>
+
+  <footer class="nfs-actionbar">
+    <div class="nfs-actionbar__hint"><i class="fas fa-circle-info"></i> Сборка сохраняется локально для текущего пользователя.</div>
+    <div class="nfs-actionbar__actions">
+      <button type="button" data-action="save-build" class="nfs-btn nfs-btn--ghost"><i class="fas fa-floppy-disk"></i> Сохранить</button>
+      <button type="button" data-action="practice" class="nfs-btn nfs-btn--primary"><i class="fas fa-play"></i> Тренировка</button>
+      <button type="button" data-action="create-lobby" class="nfs-btn nfs-btn--accent"><i class="fas fa-flag-checkered"></i> Создать лобби</button>
+    </div>
+  </footer>
+  {{/if}}
+
+  {{#if isLobby}}
+  <main class="nfs-view nfs-view--scroll">
+    {{#if hasLobby}}
+    <div class="nfs-lobby__grid">
+      <section class="nfs-card">
+        <header class="nfs-card__header">
+          <div>
+            <span class="nfs-eyebrow">Объект</span>
+            <h2>Лобби</h2>
+            <p>Ведущий: {{lobby.hostName}}</p>
+          </div>
+          {{#if hostOffline}}
+          <span class="nfs-chip nfs-chip--danger"><i class="fas fa-triangle-exclamation"></i> Ведущий вне сети</span>
+          {{else}}
+          <span class="nfs-chip nfs-chip--success"><i class="fas fa-signal"></i> {{lobbyPhaseLabel}}</span>
+          {{/if}}
+        </header>
+
+        <div class="nfs-meta-row">
+          <span><i class="fas fa-hashtag"></i> {{lobby.id}}</span>
+          <span><i class="fas fa-users"></i> {{participants.length}} участник(а)</span>
+        </div>
+
+        <div class="nfs-racers-list">
+          {{#each participants}}
+          <article class="nfs-racer {{#if isSelf}}is-self{{/if}}">
+            <span class="nfs-racer__icon"><i class="fas fa-user-astronaut"></i></span>
+            <div class="nfs-racer__copy">
+              <strong>{{driverName}}</strong>
+              <span>{{bolidName}}</span>
+              <small>{{userName}}{{#if isHost}} · ведущий{{/if}}</small>
+            </div>
+            {{#if isHost}}<span class="nfs-chip nfs-chip--small"><i class="fas fa-crown"></i> Ведущий</span>{{/if}}
+          </article>
+          {{/each}}
+        </div>
+
+        {{#unless isParticipant}}
+        <div class="nfs-callout"><i class="fas fa-circle-info"></i><span>Вы видите лобби, но ещё не участвуете в заезде.</span></div>
+        {{/unless}}
+      </section>
+
+      <section class="nfs-card">
+        <header class="nfs-card__header">
+          <div>
+            <span class="nfs-eyebrow">Настройки</span>
+            <h2>Параметры заезда</h2>
+            <p>Трасса генерируется по одному зерну у всех клиентов.</p>
+          </div>
+        </header>
+
+        <form data-form="lobby-config" class="nfs-config-grid">
+          <label class="nfs-field"><span class="nfs-field__label">Зерно трассы</span><input type="number" name="seed" value="{{config.seed}}" {{#unless isHost}}disabled{{/unless}}></label>
+          <label class="nfs-field"><span class="nfs-field__label">Кругов</span><input type="number" name="laps" value="{{config.laps}}" min="1" max="12" {{#unless isHost}}disabled{{/unless}}></label>
+          <label class="nfs-field"><span class="nfs-field__label">Обязательных пит-стопов</span><input type="number" name="requiredPitStops" value="{{config.requiredPitStops}}" min="0" max="4" {{#unless isHost}}disabled{{/unless}}><small>Без нужного числа остановок финиш не засчитывается.</small></label>
+          <label class="nfs-field"><span class="nfs-field__label">Ботов</span><input type="number" name="bots" value="{{config.bots}}" min="0" max="11" {{#unless isHost}}disabled{{/unless}}></label>
+          <label class="nfs-field"><span class="nfs-field__label">Сложность ботов</span>
+            <select name="botDifficulty" {{#unless isHost}}disabled{{/unless}}>
+              <option value="1" {{#if (nfsEq config.botDifficulty 1)}}selected{{/if}}>1 · осторожные</option>
+              <option value="2" {{#if (nfsEq config.botDifficulty 2)}}selected{{/if}}>2 · турнирные</option>
+              <option value="3" {{#if (nfsEq config.botDifficulty 3)}}selected{{/if}}>3 · опытные</option>
+              <option value="4" {{#if (nfsEq config.botDifficulty 4)}}selected{{/if}}>4 · безжалостные</option>
+            </select>
+          </label>
+          <label class="nfs-field"><span class="nfs-field__label">Профиль трассы</span>
+            <select name="trackComplexity" {{#unless isHost}}disabled{{/unless}}>
+              <option value="1" {{#if (nfsEq config.trackComplexity 1)}}selected{{/if}}>1 · скоростная</option>
+              <option value="2" {{#if (nfsEq config.trackComplexity 2)}}selected{{/if}}>2 · смешанная</option>
+              <option value="3" {{#if (nfsEq config.trackComplexity 3)}}selected{{/if}}>3 · техническая</option>
+              <option value="4" {{#if (nfsEq config.trackComplexity 4)}}selected{{/if}}>4 · предельная</option>
+              <option value="5" {{#if (nfsEq config.trackComplexity 5)}}selected{{/if}}>5 · турнирная</option>
+            </select>
+          </label>
+          <label class="nfs-field"><span class="nfs-field__label">Окружение трассы</span>
+            <select name="environmentTheme" {{#unless isHost}}disabled{{/unless}}>
+              <option value="auto" {{#if (nfsEq config.environmentTheme "auto")}}selected{{/if}}>Автоматически по зерну</option>
+              <option value="industrial" {{#if (nfsEq config.environmentTheme "industrial")}}selected{{/if}}>Промышленный пояс</option>
+              <option value="woodland" {{#if (nfsEq config.environmentTheme "woodland")}}selected{{/if}}>Лесная трасса</option>
+              <option value="estate" {{#if (nfsEq config.environmentTheme "estate")}}selected{{/if}}>Дворцовый парк</option>
+              <option value="ruins" {{#if (nfsEq config.environmentTheme "ruins")}}selected{{/if}}>Древние руины</option>
+              <option value="tournament" {{#if (nfsEq config.environmentTheme "tournament")}}selected{{/if}}>Большой турнир</option>
+            </select>
+            <small>Набор определяет здания, деревья, колонны и другие твёрдые объекты на траве.</small>
+          </label>
+          <label class="nfs-field"><span class="nfs-field__label">Поломка болида</span>
+            <select name="collisionMode" {{#unless isHost}}disabled{{/unless}}>
+              <option value="recovery" {{#if (nfsEq config.collisionMode "recovery")}}selected{{/if}}>Возврат через 3 секунды</option>
+              <option value="elimination" {{#if (nfsEq config.collisionMode "elimination")}}selected{{/if}}>Полное выбывание</option>
+            </select>
+          </label>
+        </form>
+      </section>
+    </div>
+    {{else}}
+    <section class="nfs-empty-state">
+      <span class="nfs-empty-state__icon"><i class="fas fa-tower-broadcast"></i></span>
+      <span class="nfs-eyebrow">Сеть</span>
+      <h2>Активное лобби не найдено</h2>
+      <p>Создайте заезд из гаража или подождите, пока ведущий откроет лобби.</p>
+      <button type="button" data-action="show-garage" class="nfs-btn nfs-btn--primary"><i class="fas fa-arrow-left"></i> В гараж</button>
+    </section>
+    {{/if}}
+  </main>
+
+  {{#if hasLobby}}
+  <footer class="nfs-actionbar">
+    <div class="nfs-actionbar__hint"><i class="fas fa-signal"></i> Состояние лобби синхронизируется через сокет Foundry.</div>
+    <div class="nfs-actionbar__actions">
+      {{#if canRecoverHost}}
+      <button type="button" data-action="recover-host" class="nfs-btn nfs-btn--danger"><i class="fas fa-screwdriver-wrench"></i> {{recoverHostLabel}}</button>
+      {{/if}}
+      {{#if isLobbyRacing}}
+      <button type="button" data-action="resume-race" class="nfs-btn nfs-btn--primary"><i class="fas fa-eye"></i> Вернуться к гонке</button>
+      {{else}}
+        {{#if isLobbyResults}}
+        <button type="button" data-action="resume-race" class="nfs-btn nfs-btn--primary"><i class="fas fa-trophy"></i> Открыть результаты</button>
+        {{else}}
+          {{#if isParticipant}}
+          {{#unless isHost}}<button type="button" data-action="leave-lobby" class="nfs-btn nfs-btn--danger"><i class="fas fa-person-walking-arrow-right"></i> Покинуть</button>{{/unless}}
+          {{else}}
+          <button type="button" data-action="join-lobby" class="nfs-btn nfs-btn--primary"><i class="fas fa-right-to-bracket"></i> Присоединиться</button>
+          {{/if}}
+          {{#if isHost}}
+          <button type="button" data-action="close-lobby" class="nfs-btn nfs-btn--ghost"><i class="fas fa-xmark"></i> Закрыть</button>
+          <button type="button" data-action="start-race" class="nfs-btn nfs-btn--accent"><i class="fas fa-flag-checkered"></i> Начать гонку</button>
+          {{/if}}
+        {{/if}}
+      {{/if}}
+    </div>
+  </footer>
+  {{/if}}
+  {{/if}}
+
+  {{#if isRace}}
+  <main class="nfs-race-stage">
+    <canvas data-race-canvas tabindex="0" aria-label="Гоночная трасса"></canvas>
+    <div class="nfs-input-status" data-race-focus role="button" tabindex="0" aria-hidden="false"><i class="fas fa-keyboard"></i><span>Управление неактивно. Щёлкните, чтобы продолжить</span></div>
+
+    <div class="nfs-race-error" data-race-error role="alert" hidden>
+      <i class="fas fa-triangle-exclamation"></i>
+      <strong>Не удалось запустить рендер гонки</strong>
+      <span data-race-error-text>Проверьте консоль Foundry.</span>
+      <button type="button" data-action="abandon-race" class="nfs-btn nfs-btn--danger">Вернуться</button>
+    </div>
+
+    <aside class="nfs-hud nfs-hud--race">
+      <div class="nfs-hud-stat"><span>Место</span><strong data-hud-place>—</strong></div>
+      <div class="nfs-hud-stat"><span>Круг</span><strong data-hud-lap>—</strong></div>
+      <div class="nfs-hud-stat"><span>Пит-стопы</span><strong data-hud-pits>0 / {{requiredPitStops}}</strong></div>
+      <div class="nfs-hud-stat"><span>Время</span><strong data-hud-time>0:00.00</strong></div>
+    </aside>
+
+    <aside class="nfs-hud nfs-hud--timing">
+      <div class="nfs-hud-stat nfs-hud-stat--wide"><span>Текущий круг</span><strong data-hud-current-lap>0:00.00</strong></div>
+      <div class="nfs-hud-stat nfs-hud-stat--wide"><span>Последний</span><strong data-hud-last-lap>—</strong></div>
+      <div class="nfs-hud-stat nfs-hud-stat--wide"><span>Лучший</span><strong data-hud-best-lap>—</strong></div>
+    </aside>
+
+    <aside class="nfs-hud nfs-hud--vehicle">
+      <div class="nfs-speed"><span>Скорость</span><strong data-hud-speed>0 км/ч</strong></div>
+      <div class="nfs-meter nfs-meter--health" data-hud-health><span>Прочность</span><i></i></div>
+      <div class="nfs-meter nfs-meter--charge" data-hud-charge><span data-hud-charge-label>Заряд</span><i></i></div>
+      <div class="nfs-meter nfs-meter--heat" data-hud-heat><span data-hud-heat-label>Нагрев</span><i></i></div>
+    </aside>
+
+    <div class="nfs-race-status" data-hud-status></div>
+
+    <section class="nfs-pit-overlay" data-pit-overlay hidden role="dialog" aria-modal="true" aria-busy="false" aria-live="assertive" aria-labelledby="nfs-pit-title" aria-describedby="nfs-pit-instructions">
+      <div class="nfs-pit-card">
+        <span class="nfs-eyebrow">Пит-стоп <b data-pit-count>0 / {{requiredPitStops}}</b></span>
+        <h2 id="nfs-pit-title">Работа механиков</h2>
+        <p id="nfs-pit-instructions">Введите слово без ошибок. После ошибки ввод начинается заново.</p>
+        <strong class="nfs-pit-word" data-pit-word>кристалл</strong>
+        <input data-pit-input type="text" autocomplete="off" autocapitalize="off" spellcheck="false" aria-label="Слово пит-стопа">
+        <small data-pit-errors>Введите слово без единой ошибки.</small>
+        <div class="nfs-pit-benefits"><span><i class="fas fa-shield-halved"></i> полный ремонт</span><span><i class="fas fa-gem"></i> полный заряд</span><span><i class="fas fa-temperature-low"></i> охлаждение</span></div>
+      </div>
+    </section>
+
+    <nav class="nfs-camera-switch" aria-label="Режим камеры">
+      <button type="button" data-action="camera-overview" data-camera-mode="overview" class="nfs-camera-switch__button {{#if isOverviewCamera}}is-active{{/if}}" aria-pressed="{{#if isOverviewCamera}}true{{else}}false{{/if}}" title="Неподвижная камера сверху (1)">
+        <kbd>1</kbd><i class="fas fa-map"></i><span>Обзор</span>
+      </button>
+      <button type="button" data-action="camera-chase" data-camera-mode="chase" class="nfs-camera-switch__button {{#if isChaseCamera}}is-active{{/if}}" aria-pressed="{{#if isChaseCamera}}true{{else}}false{{/if}}" title="Камера следует за направлением болида (2)">
+        <kbd>2</kbd><i class="fas fa-location-arrow"></i><span>Погоня</span>
+      </button>
+      <button type="button" data-action="toggle-minimap" class="nfs-camera-switch__button {{#if minimapEnabled}}is-active{{/if}}" aria-pressed="{{#if minimapEnabled}}true{{else}}false{{/if}}" title="Показать или скрыть мини-карту (M)">
+        <kbd>M</kbd><i class="fas fa-route"></i><span>Карта</span>
+      </button>
+      {{#if performanceOverlay}}
+      <button type="button" data-action="copy-performance-report" class="nfs-camera-switch__button" title="Скопировать диагностический отчёт">
+        <i class="fas fa-clipboard-list"></i><span>Отчёт</span>
+      </button>
+      {{/if}}
+    </nav>
+
+    <div class="nfs-controls-help">
+      <span><kbd>WASD</kbd> движение</span>
+      <span><kbd>Space</kbd> форсаж</span>
+      <span><kbd>Ctrl</kbd> дрифт в повороте</span>
+      <span><kbd>Shift</kbd> таранный упор</span>
+      <span><kbd>C</kbd> смена камеры</span>
+      <span><kbd>M</kbd> мини-карта</span>
+      <span><i class="fas fa-wrench"></i> пит-лейн: 60 км/ч, остановитесь в голубой зоне</span>
+    </div>
+
+    <button type="button" class="nfs-race-exit" data-action="abandon-race"><i class="fas fa-flag"></i> Завершить</button>
+  </main>
+  {{/if}}
+
+  {{#if isResults}}
+  <main class="nfs-view nfs-view--scroll nfs-results">
+    <section class="nfs-card nfs-results__card">
+      <header class="nfs-results__header">
+        <span class="nfs-results__trophy"><i class="fas fa-trophy"></i></span>
+        <div><span class="nfs-eyebrow">Финиш</span><h2>Гонка завершена</h2><p>Зерно трассы: {{results.seed}} · кругов: {{results.laps}}</p></div>
+      </header>
+      <div class="nfs-results-list">
+        {{#each formattedResults}}
+        <article class="nfs-result place-{{place}}">
+          <strong class="nfs-result__place">{{place}}</strong>
+          <div class="nfs-result__copy"><b>{{name}}</b><span>{{driverName}}{{#if isBot}} · бот{{/if}} · пит {{pitStopsCompleted}}/{{pitStopsRequired}}</span></div>
+          <span class="nfs-result__status">{{#if finished}}{{timeText}}{{else}}не финишировал{{/if}}</span>
+        </article>
+        {{/each}}
+      </div>
+    </section>
+  </main>
+  <footer class="nfs-actionbar">
+    <div></div>
+    <div class="nfs-actionbar__actions"><button type="button" data-action="results-lobby" class="nfs-btn nfs-btn--accent"><i class="fas fa-arrow-left"></i> Вернуться</button></div>
+  </footer>
+  {{/if}}
+</div>
