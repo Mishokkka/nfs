@@ -1,14 +1,13 @@
 import assert from "node:assert/strict";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { positiveInteger } from "./test-harness.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const { generateTrack, polylineSelfIntersects, wallBoundaryPoint, nearestTrackPoint, nearestPitPoint } = await import(path.join(root, "scripts/track.js"));
-
-function positiveInteger(name, fallback) {
-  const value = Number.parseInt(process.env[name] ?? "", 10);
-  return Number.isFinite(value) && value > 0 ? value : fallback;
-}
+const {
+  generateTrack, polylineSelfIntersects, wallBoundaryPoint, nearestTrackPoint, nearestPitPoint,
+  MAIN_TRACK_SCENERY_CLEARANCE, SCENERY_CLEARANCE
+} = await import(pathToFileURL(path.join(root, "scripts/track.js")).href);
 
 const trackSeeds = positiveInteger("NFS_TRACK_FUZZ_SEEDS", 400);
 const wallSeeds = positiveInteger("NFS_WALL_FUZZ_SEEDS", 60);
@@ -42,8 +41,8 @@ for (let seed = 0; seed < trackSeeds; seed += 1) {
   for (const obstacle of track.scenery) {
     const main = nearestTrackPoint(track, obstacle.x, obstacle.y);
     const pit = nearestPitPoint(track, obstacle.x, obstacle.y);
-    assert.ok(main.distance >= track.width * 0.5 + obstacle.collisionRadius + 7.7, `scenery entered track at seed ${seed}`);
-    assert.ok(pit.distance >= track.pit.width * 0.5 + obstacle.collisionRadius + 11.7, `scenery entered pit at seed ${seed}`);
+    assert.ok(main.distance >= track.width * 0.5 + obstacle.collisionRadius + MAIN_TRACK_SCENERY_CLEARANCE - 0.3, `scenery entered track at seed ${seed}`);
+    assert.ok(pit.distance >= track.pit.width * 0.5 + obstacle.collisionRadius + SCENERY_CLEARANCE - 0.3, `scenery entered pit at seed ${seed}`);
   }
   if (track.complexity === 5) {
     assert.ok(track.tournamentLayout.longStraights.length >= 1 && track.tournamentLayout.longStraights.length <= 2,

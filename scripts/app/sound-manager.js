@@ -105,6 +105,7 @@ export class RaceSoundManager {
     this.updateCount = 0;
     this.updateCostEma = 0;
     this.updateCostMax = 0;
+    this.#stopLoops();
     this.#loadLoops();
     this.#bindUnlock(root);
     this.#tryUnlock();
@@ -125,6 +126,7 @@ export class RaceSoundManager {
     if (this.suspended) {
       for (const [name, audio] of this.loops) {
         audio.volume = 0;
+        try { audio.pause(); } catch (_) { /* already disposed */ }
         const state = this.loopState.get(name);
         if (state) state.volume = 0;
       }

@@ -8,6 +8,7 @@ import {
   seededRng,
   runoffSurfaceForSide,
   wallSegmentActiveRange,
+  wallBoundaryPoint,
   WALL_COLLISION_ALPHA
 } from "./track.js";
 import { computeBotInput, shouldBotPit } from "./physics/bot-controller.js";
@@ -495,7 +496,7 @@ export class RaceSimulation {
 
     this.#resolveCarCollisions();
     this.#updateRaceOrder();
-    if (this.cars.every((car) => car.finished || car.disabled && this.collisionMode === "elimination")) {
+    if (this.cars.every((car) => car.finished || (car.disabled && this.collisionMode === "elimination"))) {
       this.finished = true;
     }
   }
@@ -708,11 +709,12 @@ export class RaceSimulation {
     if (car.isBot && car.pitState !== "track" && pitNearest
       && pitNearest.distance > this.track.pit.width * 0.52) {
       const point = pitNearest.point;
+      const speed = Math.min(this.track.pit.speedLimit * 0.55, Math.max(52, Math.hypot(car.vx, car.vy)));
       car.x = point.x;
       car.y = point.y;
       car.angle = Math.atan2(point.ty, point.tx);
-      car.vx = point.tx * Math.min(this.track.pit.speedLimit * 0.55, Math.max(52, Math.hypot(car.vx, car.vy)));
-      car.vy = point.ty * Math.min(this.track.pit.speedLimit * 0.55, Math.max(52, Math.hypot(car.vx, car.vy)));
+      car.vx = point.tx * speed;
+      car.vy = point.ty * speed;
       car.angularVelocity = 0;
       car.botSteer = 0;
       car.botThrottle = 0.4;
@@ -835,7 +837,6 @@ export class RaceSimulation {
     this.#applyTerrain(car, mainNearest, pitNearest, dt, previousPosition);
 
     car.raceDistance = (car.startedLap ? car.lap : -1) + car.progress;
-    car.lastSteer = steering;
   }
 
   #isInsidePitServiceZone(car) {
@@ -966,22 +967,6 @@ export class RaceSimulation {
     let hardWallCrossing = false;
     let recoveryCandidate = null;
 
-    const wallCoordinate = (point, roadWidth, side) => {
-      const xKey = side > 0 ? "wallLeftX" : "wallRightX";
-      const yKey = side > 0 ? "wallLeftY" : "wallRightY";
-      const x = Number(point?.[xKey]);
-      const y = Number(point?.[yKey]);
-      if (Number.isFinite(x) && Number.isFinite(y)) return { x, y };
-      const grass = side > 0
-        ? Number(point?.grassWidthLeft ?? point?.grassWidth ?? 0)
-        : Number(point?.grassWidthRight ?? point?.grassWidth ?? 0);
-      const distance = roadWidth * 0.5 + Math.max(0, grass);
-      return {
-        x: Number(point?.x) + Number(point?.nx) * distance * side,
-        y: Number(point?.y) + Number(point?.ny) * distance * side
-      };
-    };
-
     for (let pass = 0; pass < 4; pass += 1) {
       let best = null;
       const capsule = carCapsule(car);
@@ -1008,8 +993,8 @@ export class RaceSimulation {
           for (const side of [1, -1]) {
             const active = wallSegmentActiveRange(startPoint, endPoint, side, WALL_COLLISION_ALPHA);
             if (!active) continue;
-            const rawWallStart = wallCoordinate(startPoint, roadWidth, side);
-            const rawWallEnd = wallCoordinate(endPoint, roadWidth, side);
+            const rawWallStart = wallBoundaryPoint(startPoint, roadWidth, side);
+            const rawWallEnd = wallBoundaryPoint(endPoint, roadWidth, side);
             const wallStart = {
               x: rawWallStart.x + (rawWallEnd.x - rawWallStart.x) * active.startT,
               y: rawWallStart.y + (rawWallEnd.y - rawWallStart.y) * active.startT

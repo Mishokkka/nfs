@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 globalThis.foundry = { utils: { deepClone: structuredClone } };
@@ -8,7 +8,7 @@ let clock = 100;
 let pump = null;
 let handler = null;
 const posted = [];
-globalThis.performance = { now: () => clock };
+globalThis.performance = { timeOrigin: 0, now: () => clock };
 let scheduledDelay = 0;
 globalThis.setTimeout = (callback, delay = 0) => { pump = callback; scheduledDelay = delay; return 1; };
 globalThis.clearTimeout = () => { pump = null; };
@@ -18,9 +18,12 @@ globalThis.self = {
   close: () => {}
 };
 
-const { cloneDefaultBuild } = await import(path.join(root, "scripts/catalog.js"));
-const { generateTrack } = await import(path.join(root, "scripts/track.js"));
-await import(`${path.join(root, "scripts/simulation-worker.js")}?worker-test=${Date.now()}`);
+const load = (relative) => import(pathToFileURL(path.join(root, relative)).href);
+const { cloneDefaultBuild } = await load("scripts/catalog.js");
+const { generateTrack } = await load("scripts/track.js");
+const workerUrl = pathToFileURL(path.join(root, "scripts/simulation-worker.js"));
+workerUrl.searchParams.set("worker-test", String(Date.now()));
+await import(workerUrl.href);
 assert.equal(typeof handler, "function");
 
 handler({ data: {
@@ -32,6 +35,8 @@ handler({ data: {
 } });
 assert.ok(posted.some((message) => message.type === "ready" && message.raceId === "worker-race"));
 assert.ok(posted.some((message) => message.type === "snapshot"));
+assert.ok(posted.every((message) => message.generatedAt == null || Number.isFinite(message.generatedAt)),
+  "worker published a non-finite generatedAt timestamp");
 assert.equal(typeof pump, "function");
 
 handler({ data: { type: "input", carId: "car", input: { throttle: 1, steer: 0, brake: false, reverse: false, boost: false, ram: false, drift: false } } });

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -65,8 +65,8 @@ globalThis.document = { createElement: () => {
   return makeCanvas();
 } };
 
-const { generateTrack } = await import(path.join(root, "scripts/track.js"));
-const { RaceRenderer } = await import(path.join(root, "scripts/renderer.js"));
+const { generateTrack } = await import(pathToFileURL(path.join(root, "scripts/track.js")).href);
+const { RaceRenderer } = await import(pathToFileURL(path.join(root, "scripts/renderer.js")).href);
 const track = generateTrack("renderer-countdown", 2);
 
 
@@ -78,29 +78,29 @@ const track = generateTrack("renderer-countdown", 2);
   const physicsSource = fs.readFileSync(path.join(root, "scripts/physics.js"), "utf8");
   const hudSource = fs.readFileSync(path.join(root, "scripts/app/race-hud.js"), "utf8");
   const raceCss = fs.readFileSync(path.join(root, "styles/screens/race.css"), "utf8");
-  assert.match(rendererSource, /correctionX:\s*clamp\(errorX/);
-  assert.match(rendererSource, /smoothingFactor\(step, Number\(state\.correctionTime\)/);
-  assert.doesNotMatch(rendererSource, /state\.x\s*\+=\s*\(authoritative\.x\s*-\s*state\.x\)\s*\*/);
-  assert.match(rendererSource, /import \{ applyDriveModel \} from "\.\/physics\/drive-model\.js"/);
-  assert.match(physicsSource, /import \{ applyDriveModel \} from "\.\/physics\/drive-model\.js"/);
-  assert.match(rendererSource, /applyDriveModel\(state, input/);
-  assert.match(physicsSource, /applyDriveModel\(car, input/);
-  assert.doesNotMatch(rendererSource, /forwardSpeed \*= Math\.exp\(-0\.045/);
-  assert.doesNotMatch(rendererSource, /1000 \/ 45/);
-  assert.match(rendererSource, /this\.#drawHighResolutionTrackTiles\(ctx, worldScale\)/);
-  assert.match(rendererSource, /#drawTrackLayerRegion\(ctx/);
-  assert.match(rendererSource, /fadedPaths/);
-  assert.doesNotMatch(rendererSource, /geometry\.fadedSegments/);
-  assert.match(rendererSource, /#chooseRenderDivisor\(refreshHz, targetFps\)/);
-  assert.match(rendererSource, /displayRefreshHz/);
-  assert.match(rendererSource, /renderDivisor/);
-  assert.match(rendererSource, /const presentationDt = rawDt/);
-  assert.match(rendererSource, /smoothAuthoritativePresentation/);
-  assert.match(rendererSource, /PLACE_ORDER_STABILITY_MS = 180/);
-  assert.match(rendererSource, /#stabilizeRaceOrder\(snapshot, now\)/);
-  assert.doesNotMatch(rendererSource, /elapsed < this\.renderInterval - 1/);
-  assert.match(rendererSource, /trackTileReuses/);
-  assert.match(rendererSource, /TRACK_TILE_OVERLAP_PX/);
+  assert.match(rendererSource, /correctionX:\s*clamp\(errorX/, "prediction correction must be bounded");
+  assert.match(rendererSource, /smoothingFactor\(step, Number\(state\.correctionTime\)/, "prediction correction must use time-based smoothing");
+  assert.doesNotMatch(rendererSource, /state\.x\s*\+=\s*\(authoritative\.x\s*-\s*state\.x\)\s*\*/, "fixed-fraction reconciliation returned");
+  assert.match(rendererSource, /import \{ applyDriveModel \} from "\.\/physics\/drive-model\.js"/, "renderer must share the production drive model");
+  assert.match(physicsSource, /import \{ applyDriveModel \} from "\.\/physics\/drive-model\.js"/, "authoritative physics must use the shared drive model");
+  assert.match(rendererSource, /applyDriveModel\(state, input/, "renderer prediction no longer invokes the drive model");
+  assert.match(physicsSource, /applyDriveModel\(car, input/, "authoritative simulation no longer invokes the drive model");
+  assert.doesNotMatch(rendererSource, /forwardSpeed \*= Math\.exp\(-0\.045/, "obsolete duplicate drag model returned");
+  assert.doesNotMatch(rendererSource, /1000 \/ 45/, "hard-coded 45 Hz renderer timing returned");
+  assert.match(rendererSource, /this\.#drawHighResolutionTrackTiles\(ctx, worldScale\)/, "high-resolution track tile rendering is missing");
+  assert.match(rendererSource, /#drawTrackLayerRegion\(ctx/, "regional track-layer painting is missing");
+  assert.match(rendererSource, /fadedPaths/, "faded path cache is missing");
+  assert.doesNotMatch(rendererSource, /geometry\.fadedSegments/, "obsolete per-segment fade geometry returned");
+  assert.match(rendererSource, /#chooseRenderDivisor\(refreshHz, targetFps\)/, "adaptive render divisor is missing");
+  assert.match(rendererSource, /displayRefreshHz/, "display refresh-rate tracking is missing");
+  assert.match(rendererSource, /renderDivisor/, "render divisor state is missing");
+  assert.match(rendererSource, /const presentationDt = rawDt/, "presentation timestep no longer follows RAF time");
+  assert.match(rendererSource, /smoothAuthoritativePresentation/, "authoritative smoothing toggle is missing");
+  assert.match(rendererSource, /PLACE_ORDER_STABILITY_MS = 180/, "place-order stabilization window changed unexpectedly");
+  assert.match(rendererSource, /#stabilizeRaceOrder\(snapshot, now\)/, "race order stabilization is not applied");
+  assert.doesNotMatch(rendererSource, /elapsed < this\.renderInterval - 1/, "legacy interval-skipping gate returned");
+  assert.match(rendererSource, /trackTileReuses/, "track tile reuse telemetry is missing");
+  assert.match(rendererSource, /TRACK_TILE_OVERLAP_PX/, "track tile overlap guard is missing");
   const staticTrackPaint = rendererSource.slice(rendererSource.indexOf("#paintStaticTrack(ctx)"), rendererSource.indexOf("\n  #drawScenery(ctx) {"));
   assert.ok(staticTrackPaint.indexOf("#drawBoundaryWallGeometry") < staticTrackPaint.indexOf("this.#drawScenery(ctx)"),
     "solid scenery must be painted after fence geometry");

@@ -13,10 +13,16 @@ const angleDelta = (target, current) => Math.atan2(Math.sin(target - current), M
 const smoothingFactor = (dt, timeConstant) => 1 - Math.exp(-Math.max(0, dt) / Math.max(0.001, timeConstant));
 const formatRaceTime = (seconds) => {
   if (!Number.isFinite(seconds)) return "—";
-  const minutes = Math.floor(seconds / 60);
-  const remaining = seconds - minutes * 60;
-  return `${minutes}:${remaining.toFixed(2).padStart(5, "0")}`;
+  const totalCentiseconds = Math.max(0, Math.round(seconds * 100));
+  const minutes = Math.floor(totalCentiseconds / 6000);
+  const remaining = totalCentiseconds % 6000;
+  return `${minutes}:${String(Math.floor(remaining / 100)).padStart(2, "0")}.${String(remaining % 100).padStart(2, "0")}`;
 };
+const maximumRunoffWidth = (points) => (points ?? []).reduce((maximum, point) => Math.max(
+  maximum,
+  grassWidthForSide(point, 1),
+  grassWidthForSide(point, -1)
+), 0);
 const CAMERA_MODES = new Set(["overview", "chase"]);
 const MAX_STATIC_LAYER_SIZE = 2560;
 const MAX_CANVAS_PIXELS = 3_200_000;
@@ -375,6 +381,10 @@ export class RaceRenderer {
       current,
       alpha: clamp(Number(alpha) || 0, 0, 1)
     };
+  }
+
+  setSmoothAuthoritativePresentation(enabled) {
+    this.smoothAuthoritativePresentation = Boolean(enabled);
   }
 
   /** Buffered snapshots for remote clients and the local simulation worker. */
@@ -932,8 +942,8 @@ export class RaceRenderer {
   #rebuildTrackLayer() {
     const ctx = this.trackLayerContext;
     if (!ctx) return;
-    const maxTrackGrass = Math.max(0, ...this.track.samples.flatMap((point) => [grassWidthForSide(point, 1), grassWidthForSide(point, -1)]));
-    const maxPitGrass = Math.max(0, ...(this.track.pit?.samples ?? []).flatMap((point) => [grassWidthForSide(point, 1), grassWidthForSide(point, -1)]));
+    const maxTrackGrass = maximumRunoffWidth(this.track.samples);
+    const maxPitGrass = maximumRunoffWidth(this.track.pit?.samples);
     const padding = Math.max(this.track.width * 0.5 + maxTrackGrass, (this.track.pit?.width ?? 0) * 0.5 + maxPitGrass) + 72;
     const minX = this.track.bounds.minX - padding;
     const minY = this.track.bounds.minY - padding;
@@ -1231,6 +1241,7 @@ export class RaceRenderer {
       orderChanged = true;
     }
 
+    if (!Array.isArray(this.presentationOrder)) return snapshot;
     if (orderChanged || this.presentationPlaceById.size !== this.presentationOrder.length) {
       this.presentationPlaceById.clear();
       for (let index = 0; index < this.presentationOrder.length; index += 1) {
@@ -1450,12 +1461,11 @@ export class RaceRenderer {
           ? 0.95 * Math.max(0.3, Number(p.boostPower) || 1) * lowHealthBoost * boostFraction
           : 0,
         boostTopSpeedMultiplier: boostActive ? 1.17 * Math.max(0.3, Number(p.boostPower) || 1) : 1,
-        speedLimit: state.pitState !== "track" ? this.track.pit.speedLimit : Infinity,
-        speedLimitDeceleration: state.pitState !== "track" ? Number(this.track.pit.speedLimitDeceleration ?? 96) : 0,
+        speedLimit: state.pitState !== "track" ? Number(this.track.pit?.speedLimit ?? Infinity) : Infinity,
+        speedLimitDeceleration: state.pitState !== "track" ? Number(this.track.pit?.speedLimitDeceleration ?? 96) : 0,
         previousSteer: state.lastSteer,
         smoothSteer: Boolean(p.smoothSteer)
       });
-      state.lastSteer = drive.steering;
       state.lastAt = now;
     }
 
@@ -2514,7 +2524,8 @@ export class RaceRenderer {
     ];
     ctx.save();
     ctx.font = `600 ${fontSize}px ui-monospace, SFMono-Regular, Consolas, monospace`;
-    const boxWidth = Math.min(width - padding * 2, Math.max(...lines.map((line) => ctx.measureText(line).width)) + padding * 2);
+    const maximumLineWidth = lines.reduce((maximum, line) => Math.max(maximum, ctx.measureText(line).width), 0);
+    const boxWidth = Math.min(width - padding * 2, maximumLineWidth + padding * 2);
     const boxHeight = lines.length * lineHeight + padding * 2;
     const x = padding;
     const y = height - boxHeight - padding;

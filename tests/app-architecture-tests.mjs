@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const appDir = path.join(root, "scripts/app");
@@ -37,16 +37,20 @@ const racingAppText = fs.readFileSync(path.join(appDir, "racing-app.js"), "utf8"
 assert.match(racingAppText, /ScreenStateMachine/);
 assert.doesNotMatch(racingAppText, /this\.state\s*=/, "ApplicationV2.state is getter-only in Foundry v13");
 
-const { ScreenStateMachine } = await import(path.join(appDir, "app-helpers.js"));
+const appHelpersUrl = pathToFileURL(path.join(appDir, "app-helpers.js"));
+const { ScreenStateMachine, formatTime } = await import(appHelpersUrl.href);
 const state = new ScreenStateMachine();
 assert.equal(state.current, "garage");
 assert.equal(state.transition("lobby"), true);
 assert.equal(state.transition("race"), true);
 assert.equal(state.transition("results"), true);
 assert.throws(() => state.transition("unknown"));
+assert.equal(formatTime(59.999), "1:00.00", "centisecond rounding must carry into the next minute");
+assert.equal(formatTime(3599.999), "60:00.00", "minute carry must remain valid for long races");
+assert.equal(formatTime(-0.01), "0:00.00", "negative transient timestamps must clamp to zero");
 
 globalThis.foundry = { utils: { deepClone: structuredClone } };
-const { normalizeConfig } = await import(path.join(root, "scripts/network.js"));
+const { normalizeConfig } = await import(pathToFileURL(path.join(root, "scripts/network.js")).href);
 assert.equal(normalizeConfig({ seed: 0 }).seed, 0, "seed 0 must be preserved");
 assert.notEqual(normalizeConfig({ seed: "" }).seed, 0, "blank seed must use the default");
 
@@ -60,7 +64,7 @@ const botControllerPath = path.join(root, "scripts/physics/bot-controller.js");
 assert.ok(fs.existsSync(botControllerPath), "bot controller was not extracted from RaceSimulation");
 assert.match(physicsText, /return computeBotInput\(\{/);
 assert.ok((physicsText.match(/#botInput\(car, dt, routeContext\)/g) ?? []).length === 1);
-const { shouldBotPit } = await import(botControllerPath);
+const { shouldBotPit } = await import(pathToFileURL(botControllerPath).href);
 const botFixture = {
   pitStopsCompleted: 0, pitStopsRequired: 1, lap: 1, finishBlocked: false,
   health: 100, physics: { maxHealth: 100 }, overheated: false
@@ -78,6 +82,10 @@ assert.doesNotMatch(templateText, /data-tooltip=/, "Foundry and module tooltips 
 assert.match(templateText, /data-action="copy-performance-report"/);
 assert.match(templateText, /data-hud-pits>0 \/ \{\{requiredPitStops\}\}/);
 assert.match(templateText, /data-driver-points-status role="status" aria-live="polite"/);
+assert.match(templateText, /data-race-focus role="button" tabindex="-1" aria-hidden="true"/,
+  "the initially hidden focus notice must not enter the accessibility tree or tab order");
+assert.match(raceInputText, /setAttribute\("aria-hidden", String\(!lost\)\)/);
+assert.match(raceInputText, /setAttribute\("tabindex", lost \? "0" : "-1"\)/);
 assert.match(templateText, /data-pit-overlay hidden role="dialog"/);
 assert.doesNotMatch(templateText, /nfs-field--tooltip|nfs-card--bolide|nfs-section--profile|nfs-section--talents|nfs-section__count/);
 assert.doesNotMatch(templateText, /nfs-chip--neutral|nfs-section__title--plain|class="[^"]*nfs-lobby(?:\s|")/, "empty UI modifiers returned");
@@ -91,6 +99,11 @@ assert.match(raceRuntimeText, /handleClaimControl\(message\)[\s\S]*lastInputSequ
 const tooltipText = fs.readFileSync(path.join(appDir, "tooltip-controller.js"), "utf8");
 assert.match(tooltipText, /document\.body\.append/);
 assert.match(tooltipText, /positionFrame/);
+assert.match(tooltipText, /Math\.round\(Math\.max\(margin, left\)\)/, "tooltip placement must clamp the final left edge to the viewport margin");
+assert.match(racingAppText, /#restoreRaceState\(raceState = \{\}\)/,
+  "race-state restoration must tolerate an omitted payload");
+assert.match(racingAppText, /const \{ race, snapshot, results \} = raceState \?\? \{\}/,
+  "race-state restoration must tolerate a null payload");
 
 // Smoke-import and construct the ApplicationV2 coordinator with minimal Foundry globals.
 class ApplicationV2 {
@@ -114,7 +127,9 @@ const network = {
   lobby: null, participant: null, isHost: false,
   on: () => () => {}, requestState() {}
 };
-const { BigRacesApp } = await import(`${path.join(appDir, "racing-app.js")}?smoke=${Date.now()}`);
+const racingAppUrl = pathToFileURL(path.join(appDir, "racing-app.js"));
+racingAppUrl.searchParams.set("smoke", String(Date.now()));
+const { BigRacesApp } = await import(racingAppUrl.href);
 const app = new BigRacesApp(network);
 assert.equal(app.screen, "garage");
 app.runtime.start({

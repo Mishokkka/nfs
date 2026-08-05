@@ -238,6 +238,7 @@ export function applyDriveModel(state, input, physics, dt, modifiers = {}) {
   state.driftAmount = driftAmount;
   state.driftDirection = driftDirection;
   state.slipAngle = Math.atan2(lateralSpeed, Math.max(22, Math.abs(forwardSpeed)));
+  state.lastSteer = steering;
 
   return {
     forwardSpeed,

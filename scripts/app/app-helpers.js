@@ -57,7 +57,10 @@ export function optionList(entries, selected) {
 
 export function formatTime(seconds) {
   if (!Number.isFinite(seconds)) return "—";
-  const minutes = Math.floor(seconds / 60);
-  const remaining = seconds - minutes * 60;
-  return `${minutes}:${remaining.toFixed(2).padStart(5, "0")}`;
+  const totalCentiseconds = Math.max(0, Math.round(seconds * 100));
+  const minutes = Math.floor(totalCentiseconds / 6000);
+  const remaining = totalCentiseconds % 6000;
+  const wholeSeconds = Math.floor(remaining / 100);
+  const centiseconds = remaining % 100;
+  return `${minutes}:${String(wholeSeconds).padStart(2, "0")}.${String(centiseconds).padStart(2, "0")}`;
 }

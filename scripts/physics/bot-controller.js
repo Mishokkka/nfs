@@ -16,7 +16,7 @@ export function shouldBotPit(car, laps) {
 export function computeBotInput({ car, dt, routeContext, track, cars, laps, tick }) {
   const velocity = Math.hypot(car.vx, car.vy);
   const forwardSpeed = Math.max(0, dot(car.vx, car.vy, Math.cos(car.angle), Math.sin(car.angle)));
-  const skill = clamp(car.botSkill, 1, 4);
+  const skill = Math.round(clamp(car.botSkill, 1, 4));
   const mainNearest = routeContext.mainNearest;
   const pitNearest = routeContext.pitNearest;
   const wantsPit = shouldBotPit(car, laps);

@@ -1,6 +1,6 @@
 export const MODULE_ID = "fbl-need-for-speed";
 export const SOCKET = `module.${MODULE_ID}`;
-export const VERSION = "0.16.9";
+export const VERSION = "0.16.10";
 export const PROTOCOL_VERSION = 13;
 
 export const PHYSICS_HZ = 60;
@@ -21,10 +21,10 @@ export const DEFAULT_CONFIG = Object.freeze({
   collisionMode: "recovery"
 });
 
-export const CAR_COLORS = [
+export const CAR_COLORS = Object.freeze([
   "#e24b3b", "#37a8d6", "#e0b23f", "#65b55a", "#a06cce", "#d56eae",
   "#d27b34", "#57b8a8", "#d8d8d8", "#7f8ca8", "#c84f67", "#86b947"
-];
+]);
 
 
 export const TRACK_ENVIRONMENT_THEMES = Object.freeze([

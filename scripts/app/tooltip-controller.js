@@ -29,10 +29,10 @@ export class TooltipController {
     const signal = this.abortController.signal;
     this.#ensureElement();
 
-    root.addEventListener("pointerover", this.#onPointerOver, { signal });
-    root.addEventListener("pointerout", this.#onPointerOut, { signal });
-    root.addEventListener("focusin", this.#onFocusIn, { signal });
-    root.addEventListener("focusout", this.#onFocusOut, { signal });
+    root.addEventListener("pointerover", this.#onEnter, { signal });
+    root.addEventListener("pointerout", this.#onLeave, { signal });
+    root.addEventListener("focusin", this.#onEnter, { signal });
+    root.addEventListener("focusout", this.#onLeave, { signal });
     root.addEventListener("keydown", this.#onKeyDown, { signal });
     window.addEventListener("resize", this.#schedulePosition, { signal });
     window.addEventListener("scroll", this.#schedulePosition, { capture: true, passive: true, signal });
@@ -127,30 +127,16 @@ export class TooltipController {
     const top = fitsAbove
       ? targetRect.top - tooltipRect.height - gap
       : Math.min(viewportHeight - tooltipRect.height - margin, targetRect.bottom + gap);
-    tooltip.style.left = `${Math.round(left)}px`;
+    tooltip.style.left = `${Math.round(Math.max(margin, left))}px`;
     tooltip.style.top = `${Math.round(Math.max(margin, top))}px`;
   }
 
-  #onPointerOver = (event) => {
+  #onEnter = (event) => {
     const target = this.#targetFrom(event.target);
     if (target) this.#show(target);
   };
 
-  #onPointerOut = (event) => {
-    if (!this.currentTarget) return;
-    const related = event.relatedTarget;
-    if (related instanceof Node && this.currentTarget.contains(related)) return;
-    const next = this.#targetFrom(related);
-    if (next) this.#show(next);
-    else this.#hide();
-  };
-
-  #onFocusIn = (event) => {
-    const target = this.#targetFrom(event.target);
-    if (target) this.#show(target);
-  };
-
-  #onFocusOut = (event) => {
+  #onLeave = (event) => {
     if (!this.currentTarget) return;
     const related = event.relatedTarget;
     if (related instanceof Node && this.currentTarget.contains(related)) return;

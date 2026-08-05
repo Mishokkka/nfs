@@ -11,7 +11,7 @@
     "build": "node scripts/build-module.mjs",
     "test:soak:track": "node tests/track-fuzz-tests.mjs",
     "test:soak:race": "node tests/race-soak-tests.mjs",
-    "test:soak:full": "npm run test:soak:track && npm run test:soak:race"
+    "test:soak:full": "npm run test:soak"
   },
-  "version": "0.16.9"
+  "version": "0.16.10"
 }

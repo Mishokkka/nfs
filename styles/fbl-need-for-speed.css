@@ -21,6 +21,7 @@
   --nfs-radius: 10px;
   --nfs-radius-sm: 7px;
   --nfs-shadow: 0 16px 38px rgba(0, 0, 0, 0.32);
+
   color: var(--nfs-text);
   background: var(--nfs-bg-0);
   min-width: 360px;
@@ -77,7 +78,7 @@
   inline-size: 14px;
   block-size: 2px;
   border-radius: 2px;
-  background: currentColor;
+  background: currentcolor;
   pointer-events: none;
 }
 

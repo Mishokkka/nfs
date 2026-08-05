@@ -5,6 +5,29 @@ import { fileURLToPath } from "node:url";
 
 export const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
+export function positiveInteger(name, fallback) {
+  const value = Number.parseInt(process.env[name] ?? "", 10);
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+export function entry(cloneDefaultBuild, id, { bot = false, skill = 2, seed = id } = {}) {
+  return {
+    id,
+    userId: bot ? null : `user-${id}`,
+    name: id,
+    build: cloneDefaultBuild(),
+    color: "#ffffff",
+    isBot: bot,
+    botSkill: skill,
+    botSeed: seed
+  };
+}
+
+export function skipCountdown(simulation) {
+  simulation.countdown = 0;
+  simulation.started = true;
+}
+
 export function runScript(file, { timeout = 30_000, env = {} } = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [path.join(root, "tests", file)], {

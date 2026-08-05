@@ -420,6 +420,7 @@ export class RaceRuntime {
     this.simulationWorker = null;
     this.workerReady = false;
     this.#startMainThreadSimulation(this.workerInitEntries ?? []);
+    this.renderer?.setSmoothAuthoritativePresentation(false);
     this.renderer?.setSimulationFrame(this.currentSimulationSnapshot, this.currentSimulationSnapshot, 0);
     ui.notifications.warn("Большие Гонки: Web Worker недоступен, симуляция продолжена в основном потоке.");
   }

@@ -52,7 +52,7 @@ for (const relative of manifest.styles) {
   assert.equal(depth, 0, `${relative} has unbalanced braces`);
 
   if (relative !== "styles/responsive.css" && relative !== "styles/accessibility.css") {
-    for (const match of css.matchAll(/(?:^|\})\s*([^@{}][^{}]*)\{/g)) {
+    for (const match of css.matchAll(/(?:^|[{}])\s*([^@{}][^{}]*)\{/g)) {
       const selector = match[1].trim().replace(/\s+/g, " ");
       if (!selector || selector === "from" || selector === "to" || /^\d+%$/.test(selector)) continue;
       assert.ok(!selectorOwners.has(selector), `${selector} is defined in both ${selectorOwners.get(selector)} and ${relative}`);

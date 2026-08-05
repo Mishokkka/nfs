@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const load = (relative) => import(pathToFileURL(path.join(root, relative)).href);
 
 class FakeClassList {
   constructor() { this.values = new Set(); }
@@ -59,7 +60,7 @@ globalThis.window = {
   }
 };
 
-const { PitUi } = await import(path.join(root, "scripts/app/pit-ui.js"));
+const { PitUi } = await load("scripts/app/pit-ui.js");
 {
   const overlay = new FakeElement();
   const word = new FakeElement();
@@ -126,7 +127,7 @@ globalThis.cancelAnimationFrame = (id) => {
   frameCallbacks.delete(id);
 };
 
-const { RaceInput } = await import(path.join(root, "scripts/app/race-input.js"));
+const { RaceInput } = await load("scripts/app/race-input.js");
 {
   const canvas = new FakeElement();
   const raceInput = new RaceInput({
@@ -161,7 +162,7 @@ const { RaceInput } = await import(path.join(root, "scripts/app/race-input.js"))
   raceInput.destroyListeners();
 }
 
-const { RaceHud } = await import(path.join(root, "scripts/app/race-hud.js"));
+const { RaceHud } = await load("scripts/app/race-hud.js");
 {
   const hud = new RaceHud({ pitUi: { update() {} } });
   hud.updateCount = 9;
@@ -181,6 +182,8 @@ const { RaceHud } = await import(path.join(root, "scripts/app/race-hud.js"));
 {
   const instances = [];
   let allowPlayback = false;
+  let audioClock = 0;
+  globalThis.performance = { now: () => audioClock };
   class FakeAudio {
     constructor(path) {
       this.path = path;
@@ -203,7 +206,9 @@ const { RaceHud } = await import(path.join(root, "scripts/app/race-hud.js"));
     addEventListener() {}
   }
   globalThis.Audio = FakeAudio;
-  const { RaceSoundManager } = await import(`${path.join(root, "scripts/app/sound-manager.js")}?audio=${Date.now()}`);
+  const soundManagerUrl = pathToFileURL(path.join(root, "scripts/app/sound-manager.js"));
+  soundManagerUrl.searchParams.set("audio", String(Date.now()));
+  const { RaceSoundManager } = await import(soundManagerUrl.href);
   const audioRoot = new FakeElement();
   const manager = new RaceSoundManager({ getLocalCarId: () => "car-1" });
   manager.mount(audioRoot);
@@ -218,7 +223,10 @@ const { RaceHud } = await import(path.join(root, "scripts/app/race-hud.js"));
     countdown: 0,
     cars: [{ id: "car-1", vx: 0, vy: 0, angle: 0, pitState: "track", health: 100 }]
   };
-  for (let index = 0; index < 50; index += 1) manager.update(snapshot);
+  for (let index = 0; index < 50; index += 1) {
+    audioClock += 100;
+    manager.update(snapshot);
+  }
   await Promise.resolve();
   assert.equal(instances.reduce((sum, audio) => sum + audio.playCalls, 0), 5,
     "audio update loop retried blocked autoplay");
@@ -234,6 +242,16 @@ const { RaceHud } = await import(path.join(root, "scripts/app/race-hud.js"));
   await Promise.resolve();
   assert.equal(instances.reduce((sum, audio) => sum + audio.playCalls, 0), 10,
     "already playing loops were restarted on every pointer event");
+
+  manager.setSuspended(true);
+  assert.equal(manager.getDiagnosticStats().playingLoops, 0, "suspending audio left loop decoders running");
+  assert.ok(instances.every((audio) => audio.paused), "suspending audio did not pause every loop");
+  manager.setSuspended(false);
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(manager.getDiagnosticStats().playingLoops, 5, "resuming audio did not restart eligible loops");
+  assert.equal(instances.reduce((sum, audio) => sum + audio.playCalls, 0), 15,
+    "resuming audio retried an unexpected number of loops");
   manager.destroy();
   delete globalThis.Audio;
 }
