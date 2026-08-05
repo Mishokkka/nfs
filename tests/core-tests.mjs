@@ -1,15 +1,17 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { entry, skipCountdown } from "./test-harness.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 globalThis.foundry = { utils: { deepClone: structuredClone } };
 
-const catalog = await import(path.join(root, "scripts/catalog.js"));
-const trackApi = await import(path.join(root, "scripts/track.js"));
-const physicsApi = await import(path.join(root, "scripts/physics.js"));
-const { applyDriveModel } = await import(path.join(root, "scripts/physics/drive-model.js"));
+const load = (relative) => import(pathToFileURL(path.join(root, relative)).href);
+const catalog = await load("scripts/catalog.js");
+const trackApi = await load("scripts/track.js");
+const physicsApi = await load("scripts/physics.js");
+const { applyDriveModel } = await load("scripts/physics/drive-model.js");
 
 const {
   PARTS,
@@ -23,27 +25,10 @@ const {
 const {
   generateTrack, polylineSelfIntersects, sampleTrack, nearestTrackPoint,
   pointAtTrackProgress, pointAtPitProgress, grassWidthForSide, runoffSurfaceForSide, boundaryPoint, wallBoundaryPoint,
-  nearestPitPoint, wallSegmentActiveRange
+  nearestPitPoint, wallSegmentActiveRange, MAIN_TRACK_SCENERY_CLEARANCE, SCENERY_CLEARANCE
 } = trackApi;
 const { RaceSimulation, neutralInput, deriveCarPhysics } = physicsApi;
-
-function entry(id, { bot = false, skill = 2, seed = id } = {}) {
-  return {
-    id,
-    userId: bot ? null : `user-${id}`,
-    name: id,
-    build: cloneDefaultBuild(),
-    color: "#ffffff",
-    isBot: bot,
-    botSkill: skill,
-    botSeed: seed
-  };
-}
-
-function skipCountdown(simulation) {
-  simulation.countdown = 0;
-  simulation.started = true;
-}
+const raceEntry = (id, options) => entry(cloneDefaultBuild, id, options);
 
 function forwardSpeed(car) {
   return car.vx * Math.cos(car.angle) + car.vy * Math.sin(car.angle);
@@ -67,7 +52,7 @@ function forwardSpeed(car) {
 // Simulation tick and transport clock advance during the countdown while race
 // time remains zero. This keeps remote countdown snapshots monotonic.
 {
-  const simulation = new RaceSimulation({ track: generateTrack("countdown", 2), entries: [entry("countdown")] });
+  const simulation = new RaceSimulation({ track: generateTrack("countdown", 2), entries: [raceEntry("countdown")] });
   const before = simulation.snapshot();
   simulation.step(1 / 60);
   const after = simulation.snapshot();
@@ -215,16 +200,16 @@ function forwardSpeed(car) {
       assert.ok(allowed.has(obstacle.kind), `${theme} emitted ${obstacle.kind}`);
       const main = nearestTrackPoint(track, obstacle.x, obstacle.y);
       const pit = nearestPitPoint(track, obstacle.x, obstacle.y);
-      assert.ok(main.distance >= track.width * 0.5 + obstacle.collisionRadius + 7.8,
+      assert.ok(main.distance >= track.width * 0.5 + obstacle.collisionRadius + MAIN_TRACK_SCENERY_CLEARANCE - 0.2,
         `${theme} obstacle entered the track: ${main.distance}`);
-      assert.ok(pit.distance >= track.pit.width * 0.5 + obstacle.collisionRadius + 11.8,
+      assert.ok(pit.distance >= track.pit.width * 0.5 + obstacle.collisionRadius + SCENERY_CLEARANCE - 0.2,
         `${theme} obstacle entered the pit lane: ${pit.distance}`);
     }
     for (let first = 0; first < track.scenery.length; first += 1) {
       for (let second = first + 1; second < track.scenery.length; second += 1) {
         const a = track.scenery[first];
         const b = track.scenery[second];
-        assert.ok(Math.hypot(a.x - b.x, a.y - b.y) > a.collisionRadius + b.collisionRadius + 11.8,
+        assert.ok(Math.hypot(a.x - b.x, a.y - b.y) > a.collisionRadius + b.collisionRadius + SCENERY_CLEARANCE - 0.2,
           `${theme} obstacles overlapped: ${a.id}/${b.id}`);
       }
     }
@@ -354,7 +339,7 @@ function forwardSpeed(car) {
   assert.ok(pit.samples[pit.entryTriggerStart].separation > 0.55);
   assert.ok(pit.samples[pit.serviceIndex].separation > 0.95);
 
-  const simulation = new RaceSimulation({ track, entries: [entry("pit-entry")], laps: 2, requiredPitStops: 1 });
+  const simulation = new RaceSimulation({ track, entries: [raceEntry("pit-entry")], laps: 2, requiredPitStops: 1 });
   skipCountdown(simulation);
   const car = simulation.cars[0];
   const branch = pit.samples[pit.entryTriggerEnd];
@@ -376,7 +361,7 @@ function forwardSpeed(car) {
 // not adopt the pit route or collide with its rails.
 {
   const track = generateTrack("pit-close-pass", 4);
-  const simulation = new RaceSimulation({ track, entries: [entry("pit-close")], laps: 2, requiredPitStops: 1 });
+  const simulation = new RaceSimulation({ track, entries: [raceEntry("pit-close")], laps: 2, requiredPitStops: 1 });
   skipCountdown(simulation);
   const car = simulation.cars[0];
   const branch = track.pit.samples[track.pit.entryTriggerEnd];
@@ -410,7 +395,7 @@ function forwardSpeed(car) {
   assert.ok(minimumClearance >= requiredClearance,
     `pit lane overlapped the circuit: ${minimumClearance}/${requiredClearance}`);
 
-  const simulation = new RaceSimulation({ track, entries: [entry("pit-exit-graze")], laps: 2, requiredPitStops: 1 });
+  const simulation = new RaceSimulation({ track, entries: [raceEntry("pit-exit-graze")], laps: 2, requiredPitStops: 1 });
   skipCountdown(simulation);
   const car = simulation.cars[0];
   const branch = track.pit.samples[Math.min(track.pit.samples.length - 2, track.pit.exitMergeStart + 3)];
@@ -447,7 +432,7 @@ function forwardSpeed(car) {
     && sampleIndex <= track.pit.entryTriggerEnd && Number(point.separation) > 0.45);
   assert.ok(index >= 0);
   const point = track.pit.samples[index];
-  const simulation = new RaceSimulation({ track, entries: [entry("pit-asphalt")], laps: 2, requiredPitStops: 1 });
+  const simulation = new RaceSimulation({ track, entries: [raceEntry("pit-asphalt")], laps: 2, requiredPitStops: 1 });
   skipCountdown(simulation);
   const car = simulation.cars[0];
   Object.assign(car, {
@@ -474,7 +459,7 @@ function forwardSpeed(car) {
   const track = generateTrack("grass-runoff", 2);
   track.scenery = []; // Isolate runoff drag from solid scenery collisions.
   for (const sample of track.samples) { sample.wallLeftAlpha = 0; sample.wallRightAlpha = 0; }
-  const simulation = new RaceSimulation({ track, entries: [entry("grass")], laps: 2 });
+  const simulation = new RaceSimulation({ track, entries: [raceEntry("grass")], laps: 2 });
   skipCountdown(simulation);
   const car = simulation.cars[0];
   const point = sampleTrack(track, 180);
@@ -506,9 +491,10 @@ function forwardSpeed(car) {
   track.scenery = []; // Isolate footprint terrain sampling from obstacle impacts.
   for (const sample of track.samples) { sample.wallLeftAlpha = 0; sample.wallRightAlpha = 0; }
   const index = track.samples.findIndex((point) => point.grassWidthLeft > 55);
+  assert.ok(index >= 0, "no sample with grassWidthLeft > 55");
   const point = track.samples[index];
   const run = (offset) => {
-    const simulation = new RaceSimulation({ track, entries: [entry(`grass-${offset}`)], laps: 2 });
+    const simulation = new RaceSimulation({ track, entries: [raceEntry(`grass-${offset}`)], laps: 2 });
     skipCountdown(simulation);
     const car = simulation.cars[0];
     Object.assign(car, {
@@ -525,7 +511,7 @@ function forwardSpeed(car) {
     }
     return { severity: car.surfaceSeverity, speed: Math.hypot(car.vx, car.vy), health: car.health, maxHealth: car.physics.maxHealth };
   };
-  const radius = new RaceSimulation({ track, entries: [entry("grass-radius")], laps: 2 }).cars[0].physics.radius;
+  const radius = new RaceSimulation({ track, entries: [raceEntry("grass-radius")], laps: 2 }).cars[0].physics.radius;
   const partial = run(track.width * 0.5 - radius * 0.25);
   const deep = run(track.width * 0.5 + radius * 0.95);
   assert.ok(partial.severity > 0.03 && partial.severity < deep.severity);
@@ -539,13 +525,14 @@ function forwardSpeed(car) {
 {
   const track = generateTrack("wall-runoff-impact", 3);
   track.scenery = []; // Exercise the perimeter response without a foreground obstacle.
-  const simulation = new RaceSimulation({ track, entries: [entry("wall-impact")], laps: 2 });
+  const simulation = new RaceSimulation({ track, entries: [raceEntry("wall-impact")], laps: 2 });
   skipCountdown(simulation);
   const car = simulation.cars[0];
   let index = track.samples.findIndex((point, sampleIndex) => sampleIndex > 20
     && Number(point.wallLeftAlpha) > 0.99 && Number(point.grassWidthLeft) > 40);
   if (index < 0) index = track.samples.findIndex((point, sampleIndex) => sampleIndex > 20
     && Number(point.wallLeftAlpha) > 0.99 && Number(point.grassWidthLeft) > 20);
+  assert.ok(index >= 0, "no fully walled sample with usable left runoff");
   const point = track.samples[index];
   const wall = wallBoundaryPoint(point, track.width, 1);
   const startOffset = track.width * 0.5 + point.grassWidthLeft * 0.15;
@@ -578,7 +565,7 @@ function forwardSpeed(car) {
   track.width = 10000;
   track.scenery = [];
   for (const point of track.samples) { point.wallLeftAlpha = 0; point.wallRightAlpha = 0; }
-  const simulation = new RaceSimulation({ track, entries: [entry("scenery-impact")], laps: 2 });
+  const simulation = new RaceSimulation({ track, entries: [raceEntry("scenery-impact")], laps: 2 });
   skipCountdown(simulation);
   const car = simulation.cars[0];
   const point = sampleTrack(track, 120);
@@ -613,7 +600,7 @@ function forwardSpeed(car) {
   track.width = 10000;
   track.scenery = [];
   for (const point of track.samples) { point.wallLeftAlpha = 0; point.wallRightAlpha = 0; }
-  const simulation = new RaceSimulation({ track, entries: [entry("impact-a"), entry("impact-b")], laps: 2 });
+  const simulation = new RaceSimulation({ track, entries: [raceEntry("impact-a"), raceEntry("impact-b")], laps: 2 });
   skipCountdown(simulation);
   const [a, b] = simulation.cars;
   const point = sampleTrack(track, 150);
@@ -699,7 +686,7 @@ function forwardSpeed(car) {
 // counter and sector sequence as crossing on the main straight.
 {
   const track = generateTrack("pit-lap-route", 2);
-  const simulation = new RaceSimulation({ track, entries: [entry("pit-lap")], laps: 3, requiredPitStops: 0 });
+  const simulation = new RaceSimulation({ track, entries: [raceEntry("pit-lap")], laps: 3, requiredPitStops: 0 });
   skipCountdown(simulation);
   const car = simulation.cars[0];
   car.startedLap = true;
@@ -754,7 +741,7 @@ function forwardSpeed(car) {
   build.module = "recuperator";
   const track = generateTrack("recuperator-balance", 2);
   track.width = 10000;
-  const simulation = new RaceSimulation({ track, entries: [{ ...entry("recuperator"), build }], laps: 2 });
+  const simulation = new RaceSimulation({ track, entries: [{ ...raceEntry("recuperator"), build }], laps: 2 });
   skipCountdown(simulation);
   const car = simulation.cars[0];
   const point = sampleTrack(track, 80);
@@ -785,10 +772,10 @@ function forwardSpeed(car) {
   const simulation = new RaceSimulation({
     track,
     entries: [
-      { ...entry("slow"), build: slow },
-      { ...entry("fast"), build: fast },
-      { ...entry("agile"), build: agile },
-      { ...entry("heavy"), build: heavy }
+      { ...raceEntry("slow"), build: slow },
+      { ...raceEntry("fast"), build: fast },
+      { ...raceEntry("agile"), build: agile },
+      { ...raceEntry("heavy"), build: heavy }
     ]
   });
   const [slowCar, fastCar, agileCar, heavyCar] = simulation.cars;
@@ -804,7 +791,7 @@ function forwardSpeed(car) {
 {
   const track = generateTrack(101, 2);
   track.width = 10000; // isolate transmission/braking from road-edge effects
-  const simulation = new RaceSimulation({ track, entries: [entry("reverse")], laps: 3 });
+  const simulation = new RaceSimulation({ track, entries: [raceEntry("reverse")], laps: 3 });
   skipCountdown(simulation);
   const car = simulation.cars[0];
   const start = sampleTrack(track, 80);
@@ -830,7 +817,7 @@ function forwardSpeed(car) {
 {
   const track = generateTrack(202, 2);
   const run = (leader) => {
-    const simulation = new RaceSimulation({ track, entries: leader ? [entry("tail"), entry("lead")] : [entry("tail")], laps: 3 });
+    const simulation = new RaceSimulation({ track, entries: leader ? [raceEntry("tail"), raceEntry("lead")] : [raceEntry("tail")], laps: 3 });
     skipCountdown(simulation);
     const tailPoint = sampleTrack(track, 80);
     const tail = simulation.cars[0];
@@ -874,7 +861,7 @@ function forwardSpeed(car) {
   const makeRun = (boost, initialCharge = null) => {
     const track = generateTrack(252, 2);
     track.width = 10000;
-    const simulation = new RaceSimulation({ track, entries: [entry(`boost-${boost}-${initialCharge}`)], laps: 3 });
+    const simulation = new RaceSimulation({ track, entries: [raceEntry(`boost-${boost}-${initialCharge}`)], laps: 3 });
     skipCountdown(simulation);
     const car = simulation.cars[0];
     const start = sampleTrack(track, 80);
@@ -908,7 +895,7 @@ function forwardSpeed(car) {
 
 // Pit service requires an exact word and only then restores all three resources.
 {
-  const simulation = new RaceSimulation({ track: generateTrack(262, 3), entries: [entry("pit")], laps: 3, requiredPitStops: 1 });
+  const simulation = new RaceSimulation({ track: generateTrack(262, 3), entries: [raceEntry("pit")], laps: 3, requiredPitStops: 1 });
   skipCountdown(simulation);
   const car = simulation.cars[0];
   Object.assign(car, {
@@ -932,7 +919,7 @@ function forwardSpeed(car) {
 {
   const track = generateTrack("pit-manual-stop", 3);
   assert.equal(Math.round(track.pit.speedLimit * (0.62 / 3)), 60);
-  const simulation = new RaceSimulation({ track, entries: [entry("pit-manual-stop")], laps: 2, requiredPitStops: 1 });
+  const simulation = new RaceSimulation({ track, entries: [raceEntry("pit-manual-stop")], laps: 2, requiredPitStops: 1 });
   skipCountdown(simulation);
   const car = simulation.cars[0];
   const point = track.pit.samples[track.pit.serviceIndex];
@@ -967,7 +954,7 @@ function forwardSpeed(car) {
 // A full stop outside the painted service rectangle must not trigger mechanics.
 {
   const track = generateTrack("pit-outside-box", 2);
-  const simulation = new RaceSimulation({ track, entries: [entry("pit-outside-box")], laps: 2, requiredPitStops: 1 });
+  const simulation = new RaceSimulation({ track, entries: [raceEntry("pit-outside-box")], laps: 2, requiredPitStops: 1 });
   skipCountdown(simulation);
   const car = simulation.cars[0];
   const point = track.pit.samples[track.pit.serviceIndex];
@@ -985,7 +972,7 @@ function forwardSpeed(car) {
 // Entering the service box keeps pit progress in arc-length coordinates.
 {
   const track = generateTrack("pit-progress", 3);
-  const simulation = new RaceSimulation({ track, entries: [entry("pit-progress")], laps: 2, requiredPitStops: 1 });
+  const simulation = new RaceSimulation({ track, entries: [raceEntry("pit-progress")], laps: 2, requiredPitStops: 1 });
   skipCountdown(simulation);
   const car = simulation.cars[0];
   const point = track.pit.samples[track.pit.serviceIndex];
@@ -1002,7 +989,7 @@ function forwardSpeed(car) {
 // Pit typing is not a network inactivity period. A human can spend more than
 // five seconds on the word and must still receive control after service.
 {
-  const simulation = new RaceSimulation({ track: generateTrack(267, 2), entries: [entry("pit-focus")], laps: 3, requiredPitStops: 1 });
+  const simulation = new RaceSimulation({ track: generateTrack(267, 2), entries: [raceEntry("pit-focus")], laps: 3, requiredPitStops: 1 });
   skipCountdown(simulation);
   const car = simulation.cars[0];
   Object.assign(car, { pitState: "service", pitWord: "передача", pitAttemptId: "focus-1", inputAge: 4.9 });
@@ -1023,7 +1010,7 @@ function forwardSpeed(car) {
 // A disconnected human in service eventually receives temporary autopilot so
 // the pit lane cannot block the race forever.
 {
-  const simulation = new RaceSimulation({ track: generateTrack("pit-disconnect", 2), entries: [entry("pit-disconnect")], laps: 2, requiredPitStops: 1 });
+  const simulation = new RaceSimulation({ track: generateTrack("pit-disconnect", 2), entries: [raceEntry("pit-disconnect")], laps: 2, requiredPitStops: 1 });
   skipCountdown(simulation);
   const car = simulation.cars[0];
   Object.assign(car, {
@@ -1041,7 +1028,7 @@ function forwardSpeed(car) {
 {
   const track = generateTrack(272, 4);
   track.scenery = []; // This regression measures wall avoidance, not obstacle navigation.
-  const simulation = new RaceSimulation({ track, entries: [entry("clean-bot", { bot: true, skill: 1, seed: "clean-bot" })], laps: 2 });
+  const simulation = new RaceSimulation({ track, entries: [raceEntry("clean-bot", { bot: true, skill: 1, seed: "clean-bot" })], laps: 2 });
   let maximumLateral = 0;
   for (let tick = 0; tick < 60 * 90 && !simulation.finished; tick += 1) {
     simulation.step(1 / 60);
@@ -1071,7 +1058,7 @@ for (const scenario of [
 ]) {
   const simulation = new RaceSimulation({
     track: generateTrack(scenario.trackSeed, scenario.complexity),
-    entries: [entry(`pit-bot-${scenario.trackSeed}`, { bot: true, skill: scenario.skill, seed: scenario.botSeed })],
+    entries: [raceEntry(`pit-bot-${scenario.trackSeed}`, { bot: true, skill: scenario.skill, seed: scenario.botSeed })],
     laps: 2,
     requiredPitStops: 1
   });
@@ -1085,7 +1072,7 @@ for (const scenario of [
 // Missing input is neutralized quickly and then activates a reversible low-skill
 // autopilot. A valid owner input restores control; only explicit leave is final.
 {
-  const simulation = new RaceSimulation({ track: generateTrack(303, 2), entries: [entry("stale")], laps: 3 });
+  const simulation = new RaceSimulation({ track: generateTrack(303, 2), entries: [raceEntry("stale")], laps: 3 });
   skipCountdown(simulation);
   simulation.setInput("stale", { ...neutralInput(), throttle: 1, steer: 1, ram: true });
   for (let tick = 0; tick < 50; tick += 1) simulation.step(1 / 60);
@@ -1108,7 +1095,7 @@ for (const scenario of [
 {
   const track = generateTrack("exact-overlap", 2);
   track.width = 10000;
-  const simulation = new RaceSimulation({ track, entries: [entry("overlap-a"), entry("overlap-b")], laps: 2 });
+  const simulation = new RaceSimulation({ track, entries: [raceEntry("overlap-a"), raceEntry("overlap-b")], laps: 2 });
   skipCountdown(simulation);
   const [a, b] = simulation.cars;
   Object.assign(b, { x: a.x, y: a.y, vx: 0, vy: 0, angle: a.angle });
@@ -1123,7 +1110,7 @@ for (const scenario of [
 // a lap. This protects close parallel road sections and teleports.
 {
   const track = generateTrack(404, 2);
-  const simulation = new RaceSimulation({ track, entries: [entry("checkpoint")], laps: 2 });
+  const simulation = new RaceSimulation({ track, entries: [raceEntry("checkpoint")], laps: 2 });
   skipCountdown(simulation);
   const car = simulation.cars[0];
   const crossStart = () => {
@@ -1161,7 +1148,7 @@ for (const scenario of [
 // progress or is physically nearby.
 {
   const track = generateTrack("lapping-order", 2);
-  const simulation = new RaceSimulation({ track, entries: [entry("leader"), entry("lapped")], laps: 5 });
+  const simulation = new RaceSimulation({ track, entries: [raceEntry("leader"), raceEntry("lapped")], laps: 5 });
   skipCountdown(simulation);
   const [leader, lapped] = simulation.cars;
   const leaderPoint = pointAtTrackProgress(track, 0.18);
@@ -1224,7 +1211,7 @@ for (const scenario of [
       point.surfaceLeft = type;
       point.surfaceRight = type;
     }
-    const simulation = new RaceSimulation({ track, entries: [entry(`surface-${type}`)], laps: 2 });
+    const simulation = new RaceSimulation({ track, entries: [raceEntry(`surface-${type}`)], laps: 2 });
     skipCountdown(simulation);
     const car = simulation.cars[0];
     const point = track.samples[sampleIndex];
@@ -1277,7 +1264,7 @@ for (const scenario of [
   track.scenery = [];
   const point = track.pit.samples[track.pit.serviceIndex];
   const side = Number(point.wallLeftAlpha) > 0.9 ? 1 : -1;
-  const simulation = new RaceSimulation({ track, entries: [entry("pit-wall-route")], laps: 2, requiredPitStops: 1 });
+  const simulation = new RaceSimulation({ track, entries: [raceEntry("pit-wall-route")], laps: 2, requiredPitStops: 1 });
   skipCountdown(simulation);
   const car = simulation.cars[0];
   const wall = wallBoundaryPoint(point, track.pit.width, side);
@@ -1323,7 +1310,7 @@ for (const scenario of [
   const sampleIndex = track.samples.findIndex((point) => point.grassWidthLeft > 100);
   assert.ok(sampleIndex >= 0);
   const point = track.samples[sampleIndex];
-  const simulation = new RaceSimulation({ track, entries: [entry("sand-escape")], laps: 2 });
+  const simulation = new RaceSimulation({ track, entries: [raceEntry("sand-escape")], laps: 2 });
   skipCountdown(simulation);
   const car = simulation.cars[0];
   const startOffset = track.width * 0.5 + 70;
@@ -1410,7 +1397,7 @@ for (const scenario of [
 // A remounted client commonly restarts at sequence 1, so preserving the prior
 // session's high-water mark would remove the banner while rejecting all control.
 {
-  const simulation = new RaceSimulation({ track: generateTrack("claim-sequence-reset", 2), entries: [entry("claim-sequence")] });
+  const simulation = new RaceSimulation({ track: generateTrack("claim-sequence-reset", 2), entries: [raceEntry("claim-sequence")] });
   skipCountdown(simulation);
   const car = simulation.cars[0];
   simulation.setInput(car.id, { ...neutralInput(), throttle: 1 }, 84);
@@ -1438,7 +1425,7 @@ for (const scenario of [
   }
   const sampleIndex = track.samples.findIndex((point) => point.grassWidthLeft > 80);
   assert.ok(sampleIndex >= 0);
-  const simulation = new RaceSimulation({ track, entries: [entry("surface-entry")], laps: 2 });
+  const simulation = new RaceSimulation({ track, entries: [raceEntry("surface-entry")], laps: 2 });
   skipCountdown(simulation);
   const car = simulation.cars[0];
   const point = track.samples[sampleIndex];

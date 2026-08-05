@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 globalThis.foundry = { utils: { deepClone: structuredClone } };
@@ -35,9 +35,9 @@ globalThis.game = {
   }
 };
 
-const { PROTOCOL_VERSION } = await import(path.join(root, "scripts/constants.js"));
-const { cloneDefaultBuild } = await import(path.join(root, "scripts/catalog.js"));
-const { RaceNetwork, normalizeConfig } = await import(path.join(root, "scripts/network.js"));
+const { PROTOCOL_VERSION } = await import(pathToFileURL(path.join(root, "scripts/constants.js")).href);
+const { cloneDefaultBuild } = await import(pathToFileURL(path.join(root, "scripts/catalog.js")).href);
+const { RaceNetwork, normalizeConfig } = await import(pathToFileURL(path.join(root, "scripts/network.js")).href);
 
 // Repeated startup and teardown must keep exactly one listener and heartbeat.
 {
@@ -174,6 +174,15 @@ const message = (payload) => ({
   assert.equal(network.lastSnapshot.cars[0].x, 5);
   assert.equal(network.lastSnapshot.cars[0].driftAmount, 0.73, "remote drift HUD state was lost");
   assert.equal(network.lastSnapshot.cars[0].pitInServiceZone, true, "remote pit service-zone state was lost");
+
+  const lobbyPhaseBeforeInvalidResults = network.lobby.phase;
+  const racePhaseBeforeInvalidResults = network.activeRace.phase;
+  socketHandler(message({
+    type: "race-results", senderId: "host", lobbyId: "lobby-a", raceId: "race-a", results: null
+  }));
+  assert.equal(network.lobby.phase, lobbyPhaseBeforeInvalidResults, "invalid results changed the lobby phase");
+  assert.equal(network.activeRace.phase, racePhaseBeforeInvalidResults, "invalid results changed the race phase");
+  assert.equal(network.lastResults, null, "invalid results were stored");
 
   // race-frame validation must stay structural. Re-serializing every accepted
   // snapshot on every client was measurable overhead with larger grids.
@@ -387,6 +396,10 @@ const message = (payload) => ({
     ...baseLobby, hostId: "gm-a", hostName: "GM A", phase: "lobby",
     hostEpoch: 1, hostClaimedAt: 100, hostClaimId: "claim-a"
   };
+  const activeBeforeAttack = network.activeRace;
+  socketHandler(message({ type: "host-claim", senderId: "attacker", lobby: claimB, abortRace: true, abortedRaceId: "race-recovery" }));
+  assert.equal(network.lobby.hostId, "host", "non-GM host claim changed the lobby owner");
+  assert.equal(network.activeRace, activeBeforeAttack, "non-GM host claim changed the active race");
   socketHandler(message({ type: "host-claim", senderId: "gm-b", lobby: claimB, abortRace: true, abortedRaceId: "race-recovery" }));
   assert.equal(network.lobby.hostId, "gm-b");
   assert.equal(network.activeRace, null);

@@ -272,7 +272,8 @@ export class BigRacesApp extends HandlebarsApplicationMixin(ApplicationV2) {
     this.render({ force: true });
   }
 
-  #restoreRaceState({ race, snapshot, results }) {
+  #restoreRaceState(raceState = {}) {
+    const { race, snapshot, results } = raceState ?? {};
     if (!race) return;
     if (race.phase === "results" && results) {
       this.#showResults(results);

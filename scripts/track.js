@@ -1,5 +1,7 @@
 const TRACK_LENGTH_SCALE = 3.30;
 export const WALL_COLLISION_ALPHA = 0.08;
+export const MAIN_TRACK_SCENERY_CLEARANCE = 8;
+export const SCENERY_CLEARANCE = 12;
 
 const clamp01 = (value) => Math.max(0, Math.min(1, Number(value) || 0));
 
@@ -74,7 +76,6 @@ function findOpenPolylineIntersection(points) {
     const a = points[i];
     const b = points[i + 1];
     for (let j = i + 2; j < length - 1; j += 1) {
-      if (j === i + 1) continue;
       const c = points[j];
       const d = points[j + 1];
       if (segmentIntersection(a, b, c, d)) return { i, j };
@@ -559,7 +560,7 @@ function curveScore(samples, rawIndex, span = 7) {
   return Math.abs(angleDelta(after, before));
 }
 
-function choosePitWindow(trackSamples, fullOffset, rank = 0) {
+function choosePitWindows(trackSamples, fullOffset) {
   const count = trackSamples.length;
   const totalLength = Math.max(1, Number(trackSamples[count - 1]?.cumulative ?? 0) + Number(trackSamples[count - 1]?.segmentLength ?? 0));
   const progressAt = (index) => Number(trackSamples[(index % count + count) % count]?.cumulative ?? 0) / totalLength;
@@ -628,14 +629,15 @@ function choosePitWindow(trackSamples, fullOffset, rank = 0) {
     || a.startProgress - b.startProgress
     || a.windowProgress - b.windowProgress
     || a.side - b.side);
-  return candidates[Math.max(0, Math.floor(Number(rank) || 0))] ?? candidates[0] ?? {
+  if (candidates.length) return candidates;
+  return [{
     startIndex: indexAtProgress(0.95),
     endUnwrapped: indexAtProgress(1.045),
     side: -1,
     score: Infinity,
     startProgress: 0.95,
     windowProgress: 0.095
-  };
+  }];
 }
 
 function smoothOpenCoordinates(samples, passes = 2) {
@@ -915,14 +917,22 @@ function buildSpatialGrid(points, cellSize, closed = true) {
   return { cellSize: safeCellSize, cells };
 }
 
-function buildPitLane(trackSamples, trackTotalLength, width, candidateRank = 0) {
-  const count = trackSamples.length;
+function pitLaneDimensions(width) {
   const pitWidth = Math.max(84, width * 0.42);
+  return {
+    pitWidth,
+    fullOffset: width * 0.70 + pitWidth * 0.62
+  };
+}
+
+function buildPitLane(trackSamples, trackTotalLength, width, placement = null) {
+  const count = trackSamples.length;
+  const { pitWidth, fullOffset } = pitLaneDimensions(width);
   // Leave a real grass median between the two asphalt ribbons. The previous
   // offset only barely exceeded their combined half-widths, so technical bends
   // could visually and physically overlap even when both centrelines were valid.
-  const fullOffset = width * 0.70 + pitWidth * 0.62;
-  const { startIndex, endUnwrapped, side, score: placementScore } = choosePitWindow(trackSamples, fullOffset, candidateRank);
+  const selectedPlacement = placement ?? choosePitWindows(trackSamples, fullOffset)[0];
+  const { startIndex, endUnwrapped, side, score: placementScore } = selectedPlacement;
   let averageTx = 0;
   let averageTy = 0;
   for (let raw = startIndex; raw <= endUnwrapped; raw += 1) {
@@ -1218,7 +1228,25 @@ function buildPitLane(trackSamples, trackTotalLength, width, candidateRank = 0) 
   };
 }
 
-function pitLaneFitsCircuit(pit, trackSamples, trackTotalLength, trackWidth) {
+function spatialSegmentsNear(spatialGrid, x, y, radius, fallbackCount) {
+  if (!spatialGrid?.cells || !Number.isFinite(spatialGrid.cellSize)) {
+    return Array.from({ length: fallbackCount }, (_, index) => index);
+  }
+  const cellSize = spatialGrid.cellSize;
+  const minX = Math.floor((x - radius) / cellSize);
+  const maxX = Math.floor((x + radius) / cellSize);
+  const minY = Math.floor((y - radius) / cellSize);
+  const maxY = Math.floor((y + radius) / cellSize);
+  const indices = new Set();
+  for (let cellX = minX; cellX <= maxX; cellX += 1) {
+    for (let cellY = minY; cellY <= maxY; cellY += 1) {
+      for (const index of spatialGrid.cells[`${cellX},${cellY}`] ?? []) indices.add(index);
+    }
+  }
+  return indices;
+}
+
+function pitLaneFitsCircuit(pit, trackSamples, trackTotalLength, trackWidth, spatialGrid = null) {
   if (!pit?.samples?.length) return false;
   const leftWall = pit.samples.map((point) => wallBoundaryPoint(point, pit.width, 1));
   const rightWall = pit.samples.map((point) => wallBoundaryPoint(point, pit.width, -1));
@@ -1240,12 +1268,13 @@ function pitLaneFitsCircuit(pit, trackSamples, trackTotalLength, trackWidth) {
     if (!Number.isFinite(signedSeparation) || signedSeparation < expected) return false;
 
     if (separation < 0.88) continue;
-    for (let segmentIndex = 0; segmentIndex < count; segmentIndex += 1) {
+    const searchRadius = requiredSeparation + 22;
+    for (const segmentIndex of spatialSegmentsNear(spatialGrid, point.x, point.y, searchRadius, count)) {
       const delta = Math.abs(segmentIndex - Number(point.mainIndex || 0));
       const circular = Math.min(delta, count - delta);
       if (circular <= localExclusion) continue;
       const projected = projectSegment(trackSamples, segmentIndex, point.x, point.y, true);
-      if (Math.sqrt(projected.distanceSquared) < requiredSeparation + 22) return false;
+      if (Math.sqrt(projected.distanceSquared) < searchRadius) return false;
     }
   }
   return true;
@@ -1501,13 +1530,13 @@ function buildScenery(trackSamples, totalLength, trackWidth, pit, seed, complexi
     // A candidate may be on the intended verge but still overlap another remote
     // section of a folded circuit or the separately generated pit lane.
     const mainDistance = distanceToPolyline(trackSamples, x, y, true);
-    if (mainDistance < trackWidth * 0.5 + collisionRadius + 8) continue;
+    if (mainDistance < trackWidth * 0.5 + collisionRadius + MAIN_TRACK_SCENERY_CLEARANCE) continue;
     if (pit?.samples?.length) {
       const pitDistance = distanceToPolyline(pit.samples, x, y, false);
-      if (pitDistance < pit.width * 0.5 + collisionRadius + 12) continue;
+      if (pitDistance < pit.width * 0.5 + collisionRadius + SCENERY_CLEARANCE) continue;
     }
     if (obstacles.some((other) => Math.hypot(other.x - x, other.y - y)
-      < other.collisionRadius + collisionRadius + Math.max(12, Math.min(32, visualRadius * 0.35)))) continue;
+      < other.collisionRadius + collisionRadius + Math.max(SCENERY_CLEARANCE, Math.min(32, visualRadius * 0.35)))) continue;
 
     const angle = Math.atan2(point.ty, point.tx) + (rng() - 0.5) * (kind === "house" || kind === "workshop" || kind === "barn" || kind === "grandstand" ? 0.42 : Math.PI);
     obstacles.push({
@@ -1640,14 +1669,17 @@ export function generateTrack(seed, complexity = 2, environmentTheme = "auto") {
     const sampleIndex = Math.floor(index * samples.length / sectorCount) % samples.length;
     return { index, sampleIndex, progress: samples[sampleIndex].cumulative / totalLength };
   });
+  const spatialGrid = buildSpatialGrid(samples, Math.max(220, width * 1.35), true);
+  const { fullOffset } = pitLaneDimensions(width);
+  const pitCandidates = choosePitWindows(samples, fullOffset);
   let pit = null;
-  for (let candidateRank = 0; candidateRank < 80; candidateRank += 1) {
+  for (const placement of pitCandidates.slice(0, 80)) {
     for (const point of samples) {
       point.wallLeftAlpha = 1;
       point.wallRightAlpha = 1;
     }
-    const candidate = buildPitLane(samples, totalLength, width, candidateRank);
-    if (!pitLaneFitsCircuit(candidate, samples, totalLength, width)) continue;
+    const candidate = buildPitLane(samples, totalLength, width, placement);
+    if (!pitLaneFitsCircuit(candidate, samples, totalLength, width, spatialGrid)) continue;
     pit = candidate;
     break;
   }
@@ -1656,11 +1688,10 @@ export function generateTrack(seed, complexity = 2, environmentTheme = "auto") {
       point.wallLeftAlpha = 1;
       point.wallRightAlpha = 1;
     }
-    pit = buildPitLane(samples, totalLength, width, 0);
+    pit = buildPitLane(samples, totalLength, width, pitCandidates[0]);
   }
   applyWallSegmentSafetyMasks(samples, totalLength, width, pit);
   const scenery = buildScenery(samples, totalLength, width, pit, seed, safeComplexity, resolvedEnvironmentTheme);
-  const spatialGrid = buildSpatialGrid(samples, Math.max(220, width * 1.35), true);
   pit.spatialGrid = buildSpatialGrid(pit.samples, Math.max(180, pit.width * 1.75), false);
   const start = samples[0];
   const sceneryBounds = scenery.obstacles.flatMap((obstacle) => [
@@ -1953,6 +1984,12 @@ function pointAtDistance(samples, targetDistance, totalLength, closed) {
   const tx = point.tx + (next.tx - point.tx) * t;
   const ty = point.ty + (next.ty - point.ty) * t;
   const magnitude = Math.hypot(tx, ty) || 1;
+  const startGrassLeft = Number(point.grassWidthLeft ?? point.grassWidth ?? 0);
+  const endGrassLeft = Number(next.grassWidthLeft ?? next.grassWidth ?? startGrassLeft);
+  const startGrassRight = Number(point.grassWidthRight ?? point.grassWidth ?? 0);
+  const endGrassRight = Number(next.grassWidthRight ?? next.grassWidth ?? startGrassRight);
+  const grassWidthLeft = startGrassLeft + (endGrassLeft - startGrassLeft) * t;
+  const grassWidthRight = startGrassRight + (endGrassRight - startGrassRight) * t;
   return {
     x: point.x + (next.x - point.x) * t,
     y: point.y + (next.y - point.y) * t,
@@ -1960,10 +1997,9 @@ function pointAtDistance(samples, targetDistance, totalLength, closed) {
     ty: ty / magnitude,
     nx: -(ty / magnitude),
     ny: tx / magnitude,
-    grassWidthLeft: Number(point.grassWidthLeft ?? point.grassWidth ?? 0) + (Number(next.grassWidthLeft ?? next.grassWidth ?? point.grassWidthLeft ?? point.grassWidth ?? 0) - Number(point.grassWidthLeft ?? point.grassWidth ?? 0)) * t,
-    grassWidthRight: Number(point.grassWidthRight ?? point.grassWidth ?? 0) + (Number(next.grassWidthRight ?? next.grassWidth ?? point.grassWidthRight ?? point.grassWidth ?? 0) - Number(point.grassWidthRight ?? point.grassWidth ?? 0)) * t,
-    grassWidth: ((Number(point.grassWidthLeft ?? point.grassWidth ?? 0) + (Number(next.grassWidthLeft ?? next.grassWidth ?? point.grassWidthLeft ?? point.grassWidth ?? 0) - Number(point.grassWidthLeft ?? point.grassWidth ?? 0)) * t)
-      + (Number(point.grassWidthRight ?? point.grassWidth ?? 0) + (Number(next.grassWidthRight ?? next.grassWidth ?? point.grassWidthRight ?? point.grassWidth ?? 0) - Number(point.grassWidthRight ?? point.grassWidth ?? 0)) * t)) * 0.5,
+    grassWidthLeft,
+    grassWidthRight,
+    grassWidth: (grassWidthLeft + grassWidthRight) * 0.5,
     surfaceLeft: runoffSurfaceForSide(t < 0.5 ? point : next, 1),
     surfaceRight: runoffSurfaceForSide(t < 0.5 ? point : next, -1),
     wallLeftX: Number(point.wallLeftX ?? point.x) + (Number(next.wallLeftX ?? next.x ?? point.wallLeftX ?? point.x) - Number(point.wallLeftX ?? point.x)) * t,

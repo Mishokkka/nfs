@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 globalThis.foundry = { utils: { deepClone: structuredClone } };
@@ -28,8 +28,8 @@ const socket = {
 };
 globalThis.game = { user: users.get("host"), users, socket };
 
-const { RaceNetwork } = await import(path.join(root, "scripts/network.js"));
-const { cloneDefaultBuild } = await import(path.join(root, "scripts/catalog.js"));
+const { RaceNetwork } = await import(pathToFileURL(path.join(root, "scripts/network.js")).href);
+const { cloneDefaultBuild } = await import(pathToFileURL(path.join(root, "scripts/catalog.js")).href);
 const host = new RaceNetwork();
 host.initialize();
 game.user = users.get("player");

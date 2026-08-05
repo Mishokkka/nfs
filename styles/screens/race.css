@@ -119,6 +119,7 @@
 
 .nfs-meter {
   --ratio: 1;
+
   position: relative;
   height: 31px;
   padding: 6px 9px;
@@ -308,6 +309,7 @@
 
 .nfs-meter--charge.is-empty {
   --ratio: 0;
+
   border-color: rgba(205, 93, 78, 0.76);
   background: rgba(58, 24, 20, 0.9);
 }

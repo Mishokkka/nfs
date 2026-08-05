@@ -1,41 +1,21 @@
 import assert from "node:assert/strict";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { entry, positiveInteger, skipCountdown } from "./test-harness.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 globalThis.foundry = { utils: { deepClone: structuredClone } };
-const { cloneDefaultBuild } = await import(path.join(root, "scripts/catalog.js"));
-const { generateTrack } = await import(path.join(root, "scripts/track.js"));
-const { RaceSimulation } = await import(path.join(root, "scripts/physics.js"));
-
-function positiveInteger(name, fallback) {
-  const value = Number.parseInt(process.env[name] ?? "", 10);
-  return Number.isFinite(value) && value > 0 ? value : fallback;
-}
-
-function entry(id, { bot = false, skill = 2, seed = id } = {}) {
-  return {
-    id,
-    userId: bot ? null : `user-${id}`,
-    name: id,
-    build: cloneDefaultBuild(),
-    color: "#ffffff",
-    isBot: bot,
-    botSkill: skill,
-    botSeed: seed
-  };
-}
-
-function skipCountdown(simulation) {
-  simulation.countdown = 0;
-  simulation.started = true;
-}
+const load = (relative) => import(pathToFileURL(path.join(root, relative)).href);
+const { cloneDefaultBuild } = await load("scripts/catalog.js");
+const { generateTrack } = await load("scripts/track.js");
+const { RaceSimulation } = await load("scripts/physics.js");
+const raceEntry = (id, options) => entry(cloneDefaultBuild, id, options);
 
 const profileCount = Math.min(3, positiveInteger("NFS_RACE_SOAK_PROFILES", 3));
 const profiles = [[1, 1], [2, 3], [3, 5]].slice(0, profileCount);
 for (const [race, complexity] of profiles) {
   const track = generateTrack(7000 + race, complexity);
-  const entries = Array.from({ length: 12 }, (_, index) => entry(`bot-${race}-${index}`, {
+  const entries = Array.from({ length: 12 }, (_, index) => raceEntry(`bot-${race}-${index}`, {
     bot: true,
     skill: 1 + index % 4,
     seed: `${race}:${index}`
@@ -52,14 +32,17 @@ const finishTime = (skill, seed) => {
   const track = generateTrack(seed, 4);
   const simulation = new RaceSimulation({
     track,
-    entries: [entry(`bot-${skill}`, { bot: true, skill, seed })],
+    entries: [raceEntry(`bot-${skill}`, { bot: true, skill, seed })],
     laps: 2,
     requiredPitStops: 0,
     botDifficulty: skill
   });
   skipCountdown(simulation);
   for (let tick = 0; tick < 60 * 240 && !simulation.finished; tick += 1) simulation.step(1 / 60);
-  return simulation.cars[0].finishTime ?? 240;
+  assert.equal(simulation.finished, true, `skill ${skill} bot did not finish seed ${seed}`);
+  const time = simulation.cars[0].finishTime;
+  assert.ok(Number.isFinite(time), `skill ${skill} bot on seed ${seed} has no finish time`);
+  return time;
 };
 const eliteSeedCount = Math.min(3, positiveInteger("NFS_ELITE_BOT_SEEDS", 3));
 const seeds = ["elite-bot-a", "elite-bot-b", "elite-bot-c"].slice(0, eliteSeedCount);

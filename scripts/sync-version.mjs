@@ -16,7 +16,8 @@ if (!/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(version)) {
 
 const manifest = JSON.parse(fs.readFileSync(modulePath, "utf8"));
 manifest.version = version;
-fs.writeFileSync(modulePath, `${JSON.stringify(manifest, null, 2)}\n`);
+manifest.manifest = "https://raw.githubusercontent.com/Mishokkka/nfs/main/module.json";
+manifest.download = `https://github.com/Mishokkka/nfs/releases/download/v${version}/fbl-need-for-speed-${version}.zip`;
 
 const constants = fs.readFileSync(constantsPath, "utf8");
 const updatedConstants = constants.replace(
@@ -26,13 +27,15 @@ const updatedConstants = constants.replace(
 if (updatedConstants === constants && !constants.includes(`export const VERSION = "${version}";`)) {
   throw new Error("VERSION constant was not found");
 }
-fs.writeFileSync(constantsPath, updatedConstants);
 
 const readme = fs.readFileSync(readmePath, "utf8");
 const updatedReadme = readme.replace(/- Версия: `[^`]+`/, `- Версия: \`${version}\``);
 if (updatedReadme === readme && !readme.includes(`- Версия: \`${version}\``)) {
   throw new Error("README version line was not found");
 }
+
+fs.writeFileSync(modulePath, `${JSON.stringify(manifest, null, 2)}\n`);
+fs.writeFileSync(constantsPath, updatedConstants);
 fs.writeFileSync(readmePath, updatedReadme);
 
 console.log(`Synchronized module version ${version}`);

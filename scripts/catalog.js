@@ -216,14 +216,19 @@ function findPart(category, id) {
   return PARTS[category].find((entry) => entry.id === id) ?? PARTS[category][0];
 }
 
+const MULTIPLICATIVE_TRAITS = new Set([
+  "collisionResistance", "sideYieldFactor", "heatRate",
+  "ramPower", "boostPower", "charge", "cooling", "spinResistance",
+  "offroadGrip", "drift", "recovery", "durabilityMult", "topSpeed",
+  "cornerGrip", "slipstream"
+]);
+
 function mergeTraits(target, traits) {
   for (const [key, value] of Object.entries(traits ?? {})) {
     if (typeof value !== "number" || !Number.isFinite(value)) continue;
     if (key === "radiusBase") {
       target.radiusBase = value;
-    } else if (["collisionResistance", "sideYieldFactor", "heatRate"].includes(key)) {
-      target[key] *= value;
-    } else if (["ramPower", "boostPower", "charge", "cooling", "spinResistance", "offroadGrip", "drift", "recovery", "durabilityMult", "topSpeed", "cornerGrip", "slipstream"].includes(key)) {
+    } else if (MULTIPLICATIVE_TRAITS.has(key)) {
       target[key] *= value;
     } else {
       target[key] = (target[key] ?? 0) + value;

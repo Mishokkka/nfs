@@ -1099,6 +1099,7 @@ export class RaceNetwork {
       }
 
       case "host-claim": {
+        if (!game.users?.get(message.senderId)?.isGM) break;
         if (!this.#acceptLobby(message)) break;
         const incoming = this.#normalizeLobby(message.lobby);
         const abortRace = Boolean(message.abortRace);
@@ -1289,17 +1290,18 @@ export class RaceNetwork {
         break;
       }
 
-      case "race-results":
+      case "race-results": {
         if (!this.activeRace || !this.#isExpectedHost(message)) break;
         if (message.lobbyId !== this.lobby?.id || message.raceId !== this.activeRace.raceId) break;
-        if (this.lobby) this.lobby.phase = "results";
-        this.activeRace.phase = "results";
         const safeResults = normalizeResults(message.results, this.activeRace);
         if (!safeResults) break;
+        if (this.lobby) this.lobby.phase = "results";
+        this.activeRace.phase = "results";
         this.lastResults = safeResults;
         this.#markHostAlive();
         this.#emit("results", this.lastResults);
         break;
+      }
 
       case "stop-race":
         if (this.lobby?.id !== message.lobbyId || !this.#isExpectedHost(message)) break;
