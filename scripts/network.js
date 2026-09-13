@@ -11,10 +11,18 @@ import { buildRaceCarMeta, sanitizeInput } from "./physics.js";
 const clone = (value) => foundry.utils.deepClone(value);
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 
+const MESSAGE_SESSION = (() => {
+  try {
+    return globalThis.crypto?.randomUUID?.()
+      ?? `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+  } catch (_) {
+    return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+  }
+})();
 let messageCounter = 0;
 function messageId() {
   messageCounter = (messageCounter + 1) % Number.MAX_SAFE_INTEGER;
-  return `${game.user.id}-${messageCounter}`;
+  return `${game.user.id}:${MESSAGE_SESSION}:${messageCounter}`;
 }
 
 const MESSAGE_SIZE_LIMITS = Object.freeze({

@@ -133,7 +133,7 @@ export class RaceRuntime {
         cameraMode: this.cameraMode,
         minimapEnabled: this.minimapEnabled,
         enableLocalPrediction: !this.practice && !this.isHost,
-        networkRenderDelay: this.isHost ? 0.032 : 0.14,
+        networkRenderDelay: this.isHost ? 0.032 : 0.08,
         maxExtrapolation: this.isHost ? 0.10 : 0.30,
         performanceOverlay: this.performanceOverlay,
         smoothAuthoritativePresentation: Boolean(this.simulationWorker)
@@ -455,7 +455,10 @@ export class RaceRuntime {
     // presentation buffer as network frames. This decouples visible motion from
     // message-delivery jitter and prevents alpha from resetting on every packet.
     this.renderer?.pushSnapshot(message.snapshot, { source: "worker", generatedAt: message.generatedAt });
-    if (!this.practice && this.network.isHost && now - this.lastSnapshotSent >= 1000 / SNAPSHOT_HZ) {
+    if (!this.practice && this.network.isHost) {
+      // The worker already publishes on the fixed simulation cadence. Forward
+      // each authoritative snapshot directly instead of applying a second wall-
+      // clock gate that can accidentally turn 30 Hz into an uneven 15-30 Hz stream.
       this.lastSnapshotSent = now;
       this.network.sendSnapshot(message.snapshot);
     }
@@ -513,6 +516,10 @@ export class RaceRuntime {
     }
   }
 
+  /**
+   * Keep the main-thread fallback advancing at the network snapshot cadence while
+   * the host tab is hidden, so remote clients do not drop to a 10 Hz update rate.
+   */
   #startHiddenMainThreadClock() {
     const fixedDt = 1 / PHYSICS_HZ;
     this.hiddenWallAt = performance.now();
@@ -545,7 +552,7 @@ export class RaceRuntime {
       } catch (error) {
         console.error("FBL Need for Speed | hidden simulation failed", error);
       }
-    }, 100);
+    }, 1000 / SNAPSHOT_HZ);
   }
 
   #raceLoop = (time) => {
