@@ -516,6 +516,10 @@ export class RaceRuntime {
     }
   }
 
+  /**
+   * Keep the main-thread fallback advancing at the network snapshot cadence while
+   * the host tab is hidden, so remote clients do not drop to a 10 Hz update rate.
+   */
   #startHiddenMainThreadClock() {
     const fixedDt = 1 / PHYSICS_HZ;
     this.hiddenWallAt = performance.now();
@@ -548,7 +552,7 @@ export class RaceRuntime {
       } catch (error) {
         console.error("FBL Need for Speed | hidden simulation failed", error);
       }
-    }, 100);
+    }, 1000 / SNAPSHOT_HZ);
   }
 
   #raceLoop = (time) => {
