@@ -57,5 +57,10 @@ assert.match(
   /if \(!this\.practice && this\.network\.isHost\) \{[\s\S]*?this\.network\.sendSnapshot\(message\.snapshot\);[\s\S]*?\}/,
   "worker snapshots are no longer forwarded directly to the network"
 );
+assert.match(
+  runtimeSource,
+  /#startHiddenMainThreadClock\(\)[\s\S]*?window\.setInterval\([\s\S]*?\},\s*1000\s*\/\s*SNAPSHOT_HZ\);/,
+  "hidden main-thread fallback no longer follows the authoritative snapshot cadence"
+);
 
 console.log("netcode-latency-tests: ok");
