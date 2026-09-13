@@ -5,7 +5,7 @@ export const PROTOCOL_VERSION = 13;
 
 export const PHYSICS_HZ = 60;
 export const WORKER_SNAPSHOT_HZ = 30;
-export const SNAPSHOT_HZ = 15;
+export const SNAPSHOT_HZ = 30;
 export const INPUT_KEEPALIVE_MS = 100;
 export const INPUT_TIMEOUT_SECONDS = 0.8;
 export const MAX_RACE_ENTRIES = 12;
