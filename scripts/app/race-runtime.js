@@ -42,6 +42,8 @@ export class RaceRuntime {
     this.hiddenAccumulator = 0;
     this.resultsSent = false;
     this.lastInputSequence = new Map();
+    this.networkStatus = null;
+    this.lastConnectionCheckAt = -Infinity;
     try {
       this.cameraMode = game.settings.get(MODULE_ID, "cameraMode") || "overview";
       this.minimapEnabled = game.settings.get(MODULE_ID, "minimapEnabled") !== false;
@@ -112,7 +114,7 @@ export class RaceRuntime {
   }
 
   restoreSnapshot(snapshot) {
-    if (!snapshot) return;
+    if (!snapshot || this.isHost) return;
     this.pendingInitialSnapshot = snapshot;
     this.currentSimulationSnapshot = snapshot;
     this.renderer?.pushSnapshot(snapshot);
@@ -127,14 +129,15 @@ export class RaceRuntime {
       this.pitUi.mount(root);
       this.hud.mount(root);
       this.audio.mount(root);
+      this.networkStatus = root.querySelector("[data-network-status]");
       this.renderer = new RaceRenderer(canvas, this.track, {
         localCarId: this.localCarId,
         onHud: (car, snapshot) => this.hud.update(car, snapshot),
         cameraMode: this.cameraMode,
         minimapEnabled: this.minimapEnabled,
-        enableLocalPrediction: !this.practice && !this.isHost,
-        networkRenderDelay: this.isHost ? 0.032 : 0.08,
-        maxExtrapolation: this.isHost ? 0.10 : 0.30,
+        enableLocalPrediction: !this.simulation,
+        networkRenderDelay: this.isHost ? 0.032 : 0.06,
+        maxExtrapolation: this.isHost ? 0.10 : 0.25,
         performanceOverlay: this.performanceOverlay,
         smoothAuthoritativePresentation: Boolean(this.simulationWorker)
       });
@@ -148,6 +151,7 @@ export class RaceRuntime {
         this.renderer.pushSnapshot(this.pendingInitialSnapshot);
       }
 
+      this.renderer.setNetworkTiming(this.network.timing);
       this.input.mount(canvas, root);
       if (this.localCarId) {
         this.input.focus();
@@ -155,8 +159,7 @@ export class RaceRuntime {
           if (this.simulationWorker) this.simulationWorker.postMessage({ type: "claim-control", carId: this.localCarId });
           else this.simulation?.claimControl(this.localCarId);
           this.controlConfirmed = true;
-        } else {
-          this.controlConfirmed = false;
+        } else if (!this.controlConfirmed) {
           this.network.requestControlAssignment();
         }
       } else if (!this.practice) {
@@ -191,6 +194,7 @@ export class RaceRuntime {
     if (!message || String(message.raceId ?? "") !== String(this.currentRaceId ?? "")) return;
     const carId = String(message.carId ?? "");
     if (!carId || carId !== String(this.localCarId ?? "")) return;
+    if (this.controlConfirmed) return;
     this.controlConfirmed = true;
     this.renderer?.setLocalCarId(carId);
     this.network.claimControl(carId);
@@ -371,6 +375,19 @@ export class RaceRuntime {
     this.hud.destroy();
     this.pitUi.destroy();
     this.audio.stop();
+    this.networkStatus = null;
+    this.lastConnectionCheckAt = -Infinity;
+  }
+
+  #updateConnectionStatus(now) {
+    if (!this.networkStatus || now - this.lastConnectionCheckAt < 250) return;
+    this.lastConnectionCheckAt = now;
+    const age = this.simulation ? 0 : now - (this.renderer?.snapshotAt ?? now);
+    const text = age < 350 ? "" : this.isHost
+      ? "Симуляция задерживается…"
+      : age < 1500 ? "Ожидаем данные ведущего…" : "Ведущий не отвечает. Проверьте связь или вернитесь в лобби.";
+    if (this.networkStatus.textContent !== text) this.networkStatus.textContent = text;
+    this.networkStatus.hidden = !text;
   }
 
   #startMainThreadSimulation(entries) {
@@ -460,7 +477,7 @@ export class RaceRuntime {
       // each authoritative snapshot directly instead of applying a second wall-
       // clock gate that can accidentally turn 30 Hz into an uneven 15-30 Hz stream.
       this.lastSnapshotSent = now;
-      this.network.sendSnapshot(message.snapshot);
+      this.network.sendSnapshot(message.snapshot, { generatedAt: message.generatedAt });
     }
     if (message.type === "finished" && !this.resultsSent) this.#finish(message.snapshot);
   };
@@ -572,8 +589,9 @@ export class RaceRuntime {
         this.accumulator += elapsed;
         const fixedDt = 1 / PHYSICS_HZ;
         let steps = 0;
-        const previous = this.currentSimulationSnapshot ?? this.simulation.snapshot();
+        let previous = this.currentSimulationSnapshot ?? this.simulation.snapshot();
         while (this.accumulator >= fixedDt && steps < 6) {
+          if (steps > 0) previous = this.simulation.snapshot();
           this.simulation.step(fixedDt);
           this.accumulator -= fixedDt;
           steps += 1;
@@ -596,6 +614,7 @@ export class RaceRuntime {
         }
       }
       this.renderer?.render(time);
+      this.#updateConnectionStatus(time);
       this.raceFrame = requestAnimationFrame(this.#raceLoop);
     } catch (error) {
       this.showError(error, this.renderer?.canvas?.closest?.(".fbl-need-for-speed"));

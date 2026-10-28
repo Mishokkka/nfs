@@ -121,7 +121,10 @@ export class GarageController {
 
   #onDriverInput(event, root) {
     const target = event.target;
-    if (!(target instanceof HTMLInputElement) || !DRIVER_STAT_KEYS.includes(target.name)) return;
+    if (!(target instanceof HTMLInputElement)) return;
+    if (target.name === "name") { this.build.name = target.value.slice(0, 80); return; }
+    if (target.name === "driverName") { this.build.driver.name = target.value.slice(0, 80); return; }
+    if (!DRIVER_STAT_KEYS.includes(target.name)) return;
     const value = Number(target.value);
     const valid = Number.isInteger(value) && value >= DRIVER_STAT_MIN && value <= DRIVER_STAT_MAX;
     target.setCustomValidity(valid ? "" : `Введите целое число от ${DRIVER_STAT_MIN} до ${DRIVER_STAT_MAX}.`);

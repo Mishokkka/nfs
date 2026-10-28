@@ -78,13 +78,7 @@ const track = generateTrack("renderer-countdown", 2);
   const physicsSource = fs.readFileSync(path.join(root, "scripts/physics.js"), "utf8");
   const hudSource = fs.readFileSync(path.join(root, "scripts/app/race-hud.js"), "utf8");
   const raceCss = fs.readFileSync(path.join(root, "styles/screens/race.css"), "utf8");
-  assert.match(rendererSource, /correctionX:\s*clamp\(errorX/, "prediction correction must be bounded");
-  assert.match(rendererSource, /smoothingFactor\(step, Number\(state\.correctionTime\)/, "prediction correction must use time-based smoothing");
   assert.doesNotMatch(rendererSource, /state\.x\s*\+=\s*\(authoritative\.x\s*-\s*state\.x\)\s*\*/, "fixed-fraction reconciliation returned");
-  assert.match(rendererSource, /import \{ applyDriveModel \} from "\.\/physics\/drive-model\.js"/, "renderer must share the production drive model");
-  assert.match(physicsSource, /import \{ applyDriveModel \} from "\.\/physics\/drive-model\.js"/, "authoritative physics must use the shared drive model");
-  assert.match(rendererSource, /applyDriveModel\(state, input/, "renderer prediction no longer invokes the drive model");
-  assert.match(physicsSource, /applyDriveModel\(car, input/, "authoritative simulation no longer invokes the drive model");
   assert.doesNotMatch(rendererSource, /forwardSpeed \*= Math\.exp\(-0\.045/, "obsolete duplicate drag model returned");
   assert.doesNotMatch(rendererSource, /1000 \/ 45/, "hard-coded 45 Hz renderer timing returned");
   assert.match(rendererSource, /this\.#drawHighResolutionTrackTiles\(ctx, worldScale\)/, "high-resolution track tile rendering is missing");
@@ -108,7 +102,6 @@ const track = generateTrack("renderer-countdown", 2);
   assert.match(rendererSource, /#drawRaceHud\(ctx, focus, snapshot, width, height\)/);
   assert.doesNotMatch(rendererSource, /surfaceSeverity\s*>\s*0\.06\s*\|\|\s*wallContactTimer/,
     "ordinary runoff must not disable client prediction");
-  assert.match(rendererSource, /const unsafeContact = wallContactTimer > 0\.02/);
   assert.match(hudSource, /mode: "canvas"/);
   assert.match(hudSource, /domWrites: 0/);
   assert.doesNotMatch(hudSource, /requestIdleCallback/);
@@ -380,5 +373,39 @@ for (let index = 0; index < 6; index += 1) {
   assert.equal(mainCanvas.height, 1);
 }
 assert.equal(rafCallbacks.size, 0);
+
+
+// The backing-store budget applies even below one physical pixel per CSS pixel.
+for (const [width, height] of [[2560, 1440], [3840, 2160], [7680, 4320], [40000, 100]]) {
+  const canvas = makeCanvas(); canvas.getBoundingClientRect = () => ({ width, height });
+  const renderer = new RaceRenderer(canvas, track);
+  assert.ok(canvas.width * canvas.height <= 3_200_000, `pixel budget exceeded at ${width}x${height}`);
+  renderer.destroy();
+}
+
+// Jitter expands the buffer within its bound; presentation never rewinds. A
+// host clock stall must not leave the all-time minimum clock estimate in use.
+{
+  const original = Object.getOwnPropertyDescriptor(globalThis, "performance");
+  let now = 1000;
+  Object.defineProperty(globalThis, "performance", { configurable: true, value: { now: () => now, timeOrigin: 0 } });
+  const renderer = new RaceRenderer(makeCanvas(), track, { networkRenderDelay: 0.06, maxExtrapolation: 0.25 });
+  let lastTarget = -Infinity;
+  const frame = (tick, time) => ({ tick, simulationTime: time, time, cars: [], started: true, countdown: 0 });
+  for (let index = 0; index < 80; index++) {
+    now = 1000 + index * 1000 / 30 + (index % 4 === 0 ? 20 : 0);
+    renderer.pushSnapshot(frame(index * 2, index / 30)); renderer.render(now);
+    assert.ok(renderer.playbackTargetTime >= lastTarget);
+    lastTarget = renderer.playbackTargetTime;
+  }
+  assert.ok(renderer.networkRenderDelay > 0.065 && renderer.networkRenderDelay <= 0.18);
+  renderer.setNetworkTiming({ clockOffset: 1, rttMs: 80 });
+  now += 3000;
+  renderer.pushSnapshot(frame(162, 2.7));
+  assert.equal(renderer.networkTiming, null);
+  assert.ok(renderer.playbackClockOffset > 3);
+  renderer.destroy();
+  Object.defineProperty(globalThis, "performance", original);
+}
 
 console.log("renderer-tests: ok");

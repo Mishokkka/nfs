@@ -7,7 +7,7 @@ import {
   wallBoundaryPoint,
   wallSegmentActiveRange
 } from "./track.js";
-import { applyDriveModel } from "./physics/drive-model.js";
+import { LocalPrediction } from "./netcode/local-prediction.js";
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 const angleDelta = (target, current) => Math.atan2(Math.sin(target - current), Math.cos(target - current));
 const smoothingFactor = (dt, timeConstant) => 1 - Math.exp(-Math.max(0, dt) / Math.max(0.001, timeConstant));
@@ -84,8 +84,15 @@ export class RaceRenderer {
     this.playbackTargetAt = 0;
     this.playbackOffsetSample = null;
     this.enableLocalPrediction = Boolean(enableLocalPrediction);
-    this.networkRenderDelay = Number.isFinite(Number(networkRenderDelay)) ? clamp(Number(networkRenderDelay), 0, 0.5) : 0.11;
-    this.maxExtrapolation = Number.isFinite(Number(maxExtrapolation)) ? clamp(Number(maxExtrapolation), 0.02, 0.6) : 0.34;
+    this.predictor = new LocalPrediction();
+    this.networkTiming = null;
+    this.networkRenderDelay = Number.isFinite(networkRenderDelay) ? clamp(Number(networkRenderDelay), 0, 0.5) : 0.11;
+    this.baseRenderDelay = this.networkRenderDelay;
+    this.jitterSamples = [];
+    this.clockSamples = [];
+    this.presentationExtrapolated = false;
+    this.presentationRecoveryUntil = 0;
+    this.maxExtrapolation = Number.isFinite(maxExtrapolation) ? clamp(Number(maxExtrapolation), 0.02, 0.6) : 0.34;
     this.smoothAuthoritativePresentation = Boolean(smoothAuthoritativePresentation);
     this.lastDrawAt = performance.now();
     this.lastRenderedAt = 0;
@@ -153,7 +160,6 @@ export class RaceRenderer {
     this.localInputSequence = 0;
     this.predictionState = null;
     this.predictionBlocked = false;
-    this.predictionClearSince = 0;
     this.predictionError = 0;
     this.predictionCorrection = 0;
     this.trackTiles = new Map();
@@ -241,9 +247,9 @@ export class RaceRenderer {
     const next = id == null ? null : String(id);
     if (next === this.localCarId) return;
     this.localCarId = next;
+    this.predictor.reset();
     this.predictionState = null;
     this.predictionBlocked = false;
-    this.predictionClearSince = 0;
   }
 
   setLocalInput(input, sequence = 0) {
@@ -257,6 +263,7 @@ export class RaceRenderer {
       drift: Boolean(input?.drift)
     };
     this.localInputSequence = Math.max(this.localInputSequence, Math.floor(Number(sequence) || 0));
+    this.predictor.submit(this.localInput, this.localInputSequence);
   }
 
   setCameraMode(mode) {
@@ -304,6 +311,11 @@ export class RaceRenderer {
       predictionError: this.predictionError,
       predictionCorrection: this.predictionCorrection,
       predictionBlocked: this.predictionBlocked,
+      predictionHorizonMs: this.predictor.horizon * 1000,
+      pendingInputs: this.predictor.history.filter(command => command.sequence > (this.predictor.state?.inputSequence ?? -1)).length,
+      renderDelayMs: this.networkRenderDelay * 1000,
+      rttMs: this.networkTiming?.rttMs ?? null,
+      snapshotAgeMs: Math.max(0, performance.now() - this.snapshotAt),
       labelCacheSize: this.labelCache.size,
       labelCacheHits: this.labelCacheHits,
       labelCacheMisses: this.labelCacheMisses,
@@ -406,7 +418,7 @@ export class RaceRenderer {
     }
     this.currentSnapshot = snapshot;
     this.snapshotAt = now;
-    const generatedEpoch = Number(generatedAt);
+    const generatedEpoch = Number.isFinite(generatedAt) ? generatedAt : NaN;
     const generatedMainTime = Number.isFinite(generatedEpoch)
       ? generatedEpoch - Number(performance.timeOrigin || 0)
       : now;
@@ -420,16 +432,31 @@ export class RaceRenderer {
       this.playbackTargetTime = null;
       this.playbackTargetAt = 0;
       this.playbackOffsetSample = null;
+      this.clockSamples.length = 0;
+      this.jitterSamples.length = 0;
+    }
+    if (last && (now - last.receivedAt) / 1000 - (clock - last.time) > 0.5) {
+      this.clockSamples.length = 0;
+      this.networkTiming = null;
     }
     const offsetSample = presentationAt / 1000 - clock;
     if (Number.isFinite(offsetSample)) {
-      this.playbackOffsetSample = offsetSample;
-      // Packet latency can only increase this sample. Retaining the lowest
-      // observed value estimates the stable clock offset without letting a late
-      // packet rewind the scene. Worker production timestamps use the same path.
-      if (!Number.isFinite(this.playbackClockOffset) || offsetSample < this.playbackClockOffset) {
-        this.playbackClockOffset = offsetSample;
+      this.clockSamples.push({ at: now, offset: offsetSample });
+      while (this.clockSamples.length > 90 || (this.clockSamples[0]?.at < now - 3000)) this.clockSamples.shift();
+      // A rolling minimum can follow a stalled host clock; an all-time minimum
+      // permanently extrapolated ahead after even one simulation pause.
+      this.playbackClockOffset = Math.min(...this.clockSamples.map(sample => sample.offset));
+      if (last) {
+        const variation = Math.abs((now - last.receivedAt) / 1000 - (clock - last.time));
+        this.jitterSamples.push(Math.min(0.25, variation));
+        if (this.jitterSamples.length > 60) this.jitterSamples.shift();
+        const sorted = this.jitterSamples.slice().sort((a, b) => a - b);
+        const jitter = sorted[Math.floor((sorted.length - 1) * 0.9)] || 0;
+        const target = clamp(this.baseRenderDelay + jitter, this.baseRenderDelay, sourceName === "worker" ? 0.08 : 0.18);
+        this.networkRenderDelay += (target - this.networkRenderDelay) * (target > this.networkRenderDelay ? 0.3 : 0.02);
       }
+      this.playbackOffsetSample = offsetSample;
+
     }
     this.snapshotBuffer.push({ snapshot, receivedAt: now, presentationAt, time: clock, source: sourceName });
     if (this.snapshotBuffer.length > 36) this.snapshotBuffer.splice(0, this.snapshotBuffer.length - 36);
@@ -673,8 +700,10 @@ export class RaceRenderer {
     this.retainedTrackTileKeys.clear();
     this.predictionState = null;
     this.predictionBlocked = false;
-    this.predictionClearSince = 0;
     this.snapshotBuffer.length = 0;
+    this.predictor.reset();
+    this.jitterSamples.length = 0;
+    this.clockSamples.length = 0;
     this.rafIntervals.length = 0;
     this.renderIntervals.length = 0;
     this.renderCosts.length = 0;
@@ -726,9 +755,9 @@ export class RaceRenderer {
     // fill-rate and VRAM without bound.
     const cssPixels = Math.max(1, rect.width * rect.height);
     const pixelBudgetScale = Math.sqrt(MAX_CANVAS_PIXELS / cssPixels);
-    const requestedScale = clamp(Math.min(window.devicePixelRatio || 1, MAX_OUTPUT_SCALE, pixelBudgetScale), 1, MAX_OUTPUT_SCALE);
-    const width = Math.max(320, Math.round(rect.width * requestedScale));
-    const height = Math.max(240, Math.round(rect.height * requestedScale));
+    const requestedScale = Math.max(0.01, Math.min(window.devicePixelRatio || 1, MAX_OUTPUT_SCALE, pixelBudgetScale));
+    const width = Math.max(1, Math.floor(rect.width * requestedScale));
+    const height = Math.max(1, Math.floor(rect.height * requestedScale));
     if (this.canvas.width !== width || this.canvas.height !== height) {
       this.canvas.width = width;
       this.canvas.height = height;
@@ -1057,8 +1086,17 @@ export class RaceRenderer {
       const indexed = previousCars[index];
       const old = indexed?.id === car.id ? indexed : previousCars.find((entry) => entry.id === car.id);
       if (!old) continue;
-      target.x = old.x + (car.x - old.x) * t;
-      target.y = old.y + (car.y - old.y) * t;
+      const span = Math.max(0, this.#snapshotClock(current) - this.#snapshotClock(previous));
+      const continuous = span <= 0.15 && car.pitState === old.pitState && !car.wallContactTimer
+        && Math.hypot(car.x - old.x, car.y - old.y) < 160;
+      for (const [position, velocity] of [["x", "vx"], ["y", "vy"]]) {
+        const linear = old[position] + (car[position] - old[position]) * t;
+        if (!continuous) { target[position] = linear; continue; }
+        const t2 = t * t, t3 = t2 * t;
+        const hermite = (2 * t3 - 3 * t2 + 1) * old[position] + (t3 - 2 * t2 + t) * old[velocity] * span
+          + (-2 * t3 + 3 * t2) * car[position] + (t3 - t2) * car[velocity] * span;
+        target[position] = clamp(hermite, Math.min(old[position], car[position]) - 4, Math.max(old[position], car[position]) + 4);
+      }
       target.vx = old.vx + (car.vx - old.vx) * t;
       target.vy = old.vy + (car.vy - old.vy) * t;
       target.angle = old.angle + angleDelta(car.angle, old.angle) * t;
@@ -1087,7 +1125,7 @@ export class RaceRenderer {
     const buffer = this.snapshotBuffer;
     if (!buffer.length) return this.currentSnapshot;
     const latest = buffer[buffer.length - 1];
-    const offset = Number(this.playbackClockOffset);
+    const offset = this.networkTiming?.clockOffset ?? this.playbackClockOffset;
     const fallbackSourceAt = Number.isFinite(latest.presentationAt) ? latest.presentationAt : latest.receivedAt;
     const rawTargetTime = Number.isFinite(offset)
       ? now / 1000 - offset - this.networkRenderDelay
@@ -1112,10 +1150,13 @@ export class RaceRenderer {
       const b = buffer[index + 1];
       if (targetTime < a.time || targetTime > b.time) continue;
       const span = Math.max(0.0001, b.time - a.time);
+      if (this.presentationExtrapolated) this.presentationRecoveryUntil = now + 120;
+      this.presentationExtrapolated = false;
       return this.#blendSnapshots(a.snapshot, b.snapshot, (targetTime - a.time) / span);
     }
 
     if (targetTime <= buffer[0].time) return buffer[0].snapshot;
+    this.presentationExtrapolated = true;
     return this.#extrapolateSnapshot(latest.snapshot, Math.min(this.maxExtrapolation, targetTime - latest.time));
   }
 
@@ -1162,7 +1203,8 @@ export class RaceRenderer {
         this.presentationCars.set(car.id, displayed);
       } else {
         const distance = Math.hypot(car.x - displayed.x, car.y - displayed.y);
-        const factor = distance > 520 ? 1 : smoothingFactor(dt, car.id === this.localCarId ? 0.045 : 0.065);
+        const recovering = this.presentationExtrapolated || performance.now() < this.presentationRecoveryUntil;
+        const factor = distance > 520 || !recovering ? 1 : smoothingFactor(dt, 0.04);
         const x = displayed.x + (car.x - displayed.x) * factor;
         const y = displayed.y + (car.y - displayed.y) * factor;
         const vx = displayed.vx + (car.vx - displayed.vx) * factor;
@@ -1261,223 +1303,25 @@ export class RaceRenderer {
   }
 
 
-  #applyLocalPrediction(snapshot, now, dt) {
+  setNetworkTiming(timing) {
+    this.networkTiming = timing;
+  }
+
+  #applyLocalPrediction(snapshot, now) {
     if (!snapshot || !this.localCarId || this.simulationFrame || !this.enableLocalPrediction) return snapshot;
-    const authoritative = this.currentSnapshot?.cars?.find((car) => car.id === this.localCarId)
-      ?? snapshot.cars?.find((car) => car.id === this.localCarId);
-    if (!authoritative) {
-      this.predictionState = null;
-      return snapshot;
-    }
-
-    const surfaceSeverity = Number(authoritative.surfaceSeverity) || 0;
-    const wallContactTimer = Number(authoritative.wallContactTimer) || 0;
-    // Terrain is a normal driving state, not a reason to disable local prediction.
-    // The previous surfaceSeverity gate returned the client to the delayed
-    // authoritative presentation buffer for roughly 160 ms, then restored the
-    // predicted pose. Only remote players therefore appeared to jump backwards
-    // on entering grass, sand or gravel and immediately spring forwards again.
-    const unsafeContact = wallContactTimer > 0.02;
-    const contactCleared = wallContactTimer < 0.005;
-    if (unsafeContact) {
-      this.predictionBlocked = true;
-      this.predictionClearSince = 0;
-    } else if (this.predictionBlocked) {
-      if (contactCleared) {
-        if (!this.predictionClearSince) this.predictionClearSince = now;
-        if (now - this.predictionClearSince >= 120) {
-          this.predictionBlocked = false;
-          this.predictionClearSince = 0;
-        }
-      } else this.predictionClearSince = 0;
-    }
-
-    if (authoritative.finished || authoritative.disabled || authoritative.pitState === "service"
-      || this.predictionBlocked || !snapshot.started) {
-      this.predictionState = {
-        ...authoritative,
-        angularVelocity: 0,
-        driftAmount: 0,
-        driftDirection: 0,
-        slipAngle: 0,
-        lastSteer: 0,
-        lastAt: now,
-        sourceTick: Number(this.currentSnapshot?.tick ?? snapshot.tick)
-      };
-      this.predictionError = 0;
-      this.predictionCorrection = 0;
-      return snapshot;
-    }
-
-    const sourceTick = Number(this.currentSnapshot?.tick ?? snapshot.tick) || 0;
-    const p = authoritative.prediction ?? {};
-    let state = this.predictionState;
-    if (!state) {
-      state = {
-        ...authoritative,
-        angularVelocity: 0,
-        driftAmount: 0,
-        driftDirection: 0,
-        slipAngle: 0,
-        lastSteer: 0,
-        correctionX: 0,
-        correctionY: 0,
-        correctionVx: 0,
-        correctionVy: 0,
-        correctionAngle: 0,
-        correctionTime: 0.18,
-        lastAt: now,
-        sourceTick
-      };
-      this.predictionState = state;
-    } else if (state.sourceTick !== sourceTick) {
-      const errorX = authoritative.x - state.x;
-      const errorY = authoritative.y - state.y;
-      const error = Math.hypot(errorX, errorY);
-      this.predictionError = error;
-      if (error > 260 || authoritative.pitState !== state.pitState) {
-        Object.assign(state, authoritative, {
-          angularVelocity: 0,
-          driftAmount: 0,
-          driftDirection: 0,
-          slipAngle: 0,
-            lastSteer: 0,
-          correctionX: 0,
-          correctionY: 0,
-          correctionVx: 0,
-          correctionVy: 0,
-          correctionAngle: 0
-        });
-      } else {
-        const acknowledged = Number(authoritative.inputSequence) >= this.localInputSequence;
-        const motion = {
-          x: state.x,
-          y: state.y,
-          vx: state.vx,
-          vy: state.vy,
-          angle: state.angle,
-          angularVelocity: state.angularVelocity ?? 0,
-          driftAmount: state.driftAmount ?? 0,
-          driftDirection: state.driftDirection ?? 0,
-          slipAngle: state.slipAngle ?? 0,
-          lastSteer: state.lastSteer ?? 0
-        };
-        Object.assign(state, authoritative, motion, {
-          // Reconciliation is stored as a decaying error rather than applied as
-          // an instant position jump every network tick.
-          correctionX: clamp(errorX, -180, 180),
-          correctionY: clamp(errorY, -180, 180),
-          correctionVx: clamp(authoritative.vx - state.vx, -220, 220),
-          correctionVy: clamp(authoritative.vy - state.vy, -220, 220),
-          correctionAngle: clamp(angleDelta(authoritative.angle, state.angle), -0.7, 0.7),
-          correctionTime: acknowledged ? 0.14 : 0.24
-        });
-      }
-      state.sourceTick = sourceTick;
-    }
-
-    const step = clamp(dt, 0, 0.05);
-    if (step > 0) {
-      const reconcile = smoothingFactor(step, Number(state.correctionTime) || 0.18);
-      const correctionX = Number(state.correctionX) || 0;
-      const correctionY = Number(state.correctionY) || 0;
-      const correctionVx = Number(state.correctionVx) || 0;
-      const correctionVy = Number(state.correctionVy) || 0;
-      const correctionAngle = Number(state.correctionAngle) || 0;
-      state.x += correctionX * reconcile;
-      state.y += correctionY * reconcile;
-      state.vx += correctionVx * reconcile;
-      state.vy += correctionVy * reconcile;
-      state.angle += correctionAngle * reconcile;
-      state.correctionX = correctionX * (1 - reconcile);
-      state.correctionY = correctionY * (1 - reconcile);
-      state.correctionVx = correctionVx * (1 - reconcile);
-      state.correctionVy = correctionVy * (1 - reconcile);
-      state.correctionAngle = correctionAngle * (1 - reconcile);
-      this.predictionCorrection = Math.hypot(state.correctionX, state.correctionY);
-
-      const input = this.localInput;
-      const maxSpeed = Math.max(80, Number(p.maxSpeed) || 420);
-      const maxHealth = Math.max(1, Number(state.maxHealth) || 100);
-      const heat = Math.max(0, Number(state.heat) || 0);
-      if (state.overheated && heat <= 48) state.overheated = false;
-      const heatStress = clamp((heat - 68) / 32, 0, 1);
-      const thermalAcceleration = state.overheated ? 0.58 : 1 - heatStress * 0.28;
-      const thermalSteering = state.overheated ? 0.72 : 1 - heatStress * 0.13;
-      const thermalTopSpeed = state.overheated ? 0.78 : 1 - heatStress * 0.08;
-      const terrainSeverity = clamp(surfaceSeverity / Math.max(1, Number(p.offroadGrip) || 1), 0, 1);
-      const terrainAcceleration = 1 - terrainSeverity * 0.68;
-      const terrainSteering = 1 - terrainSeverity * 0.48;
-      const terrainTopSpeed = 1 - terrainSeverity * 0.58;
-      const terrainGrip = 1 - terrainSeverity * 0.78;
-      const healthPenalty = Number(state.health) < maxHealth * 0.25 ? 0.78 : 1;
-      const lastLapBoost = p.lastLap && Number(state.lap) === Number(snapshot.laps) - 1 ? 1.04 : 1;
-      const lowHealthBoost = Number(state.health) < maxHealth * 0.3 ? Math.max(1, Number(p.lowHealthBoost) || 1) : 1;
-
-      const boostDrain = Math.max(0.01, Number(p.boostDrain) || 25);
-      const requestedCharge = boostDrain * step;
-      const boostRequested = state.pitState === "track"
-        && input.boost && input.throttle > 0 && !state.overheated && Number(state.charge) > 0.001;
-      const boostFraction = boostRequested
-        ? clamp(Number(state.charge) / Math.max(0.0001, requestedCharge), 0, 1)
-        : 0;
-      let boostActive = boostFraction > 0.001;
-      if (boostActive) {
-        state.charge = Math.max(0, Number(state.charge) - requestedCharge * boostFraction);
-        state.heat = Math.min(112, heat + Math.max(0, Number(p.heatRate) || 40) * step * boostFraction);
-      } else {
-        state.heat = Math.max(0, heat - Math.max(0, Number(p.cooling) || 5) * step);
-      }
-      if (state.heat >= 100) {
-        state.overheated = true;
-        boostActive = false;
-      }
-
-      const drive = applyDriveModel(state, input, {
-        maxSpeed,
-        acceleration: Math.max(20, Number(p.acceleration) || 240),
-        reverseAcceleration: Math.max(20, Number(p.reverseAcceleration) || 95),
-        braking: Math.max(20, Number(p.braking) || 300),
-        steerRate: Math.max(0.1, Number(p.steerRate) || 1.5),
-        lateralGrip: Math.max(0.01, Number(p.lateralGrip) || 2.8),
-        longitudinalDrag: Math.max(0, Number(p.longitudinalDrag) || 0.25),
-        rollingDrag: Math.max(0, Number(p.rollingDrag) || 20),
-        spinResistance: Math.max(0.01, Number(p.spinResistance) || 1),
-        recovery: Math.max(0.2, Number(p.recovery) || 1)
-      }, step, {
-        accelerationMultiplier: healthPenalty * thermalAcceleration * terrainAcceleration * lastLapBoost,
-        steeringMultiplier: (input.ram ? Math.max(0.01, Number(p.ramSteerPenalty) || 0.55) : 1)
-          * thermalSteering * terrainSteering * (p.precision ? 1.04 : 1),
-        topSpeedMultiplier: thermalTopSpeed * terrainTopSpeed * lastLapBoost,
-        gripMultiplier: terrainGrip,
-        brakeGripMultiplier: p.lateBrake ? 1.22 : 1,
-        driftEnabled: state.pitState === "track" && terrainSeverity < 0.035,
-        driftAssist: Math.max(0.75, Number(p.drift) || 1),
-        driftControl: Math.max(0.45, Math.sqrt(
-          Math.max(0.01, Number(p.spinResistance) || 1)
-          * Math.max(0.01, Number(p.recovery) || 1)
-        ) * (1 + (Math.max(0.75, Number(p.drift) || 1) - 1) * 0.75)),
-        boostAccelerationMultiplier: boostFraction > 0
-          ? 0.95 * Math.max(0.3, Number(p.boostPower) || 1) * lowHealthBoost * boostFraction
-          : 0,
-        boostTopSpeedMultiplier: boostActive ? 1.17 * Math.max(0.3, Number(p.boostPower) || 1) : 1,
-        speedLimit: state.pitState !== "track" ? Number(this.track.pit?.speedLimit ?? Infinity) : Infinity,
-        speedLimitDeceleration: state.pitState !== "track" ? Number(this.track.pit?.speedLimitDeceleration ?? 96) : 0,
-        previousSteer: state.lastSteer,
-        smoothSteer: Boolean(p.smoothSteer)
-      });
-      state.lastAt = now;
-    }
-
-    const cars = snapshot.cars.map((car) => car.id === this.localCarId ? {
-      ...car,
-      x: state.x, y: state.y, vx: state.vx, vy: state.vy, angle: state.angle,
-      driftAmount: state.driftAmount, slipAngle: state.slipAngle,
-      surfaceSeverity: state.surfaceSeverity,
-      surfaceType: state.surfaceType,
-      surfaceSide: state.surfaceSide
-    } : car);
-    return { ...snapshot, cars };
+    const authoritative = this.currentSnapshot?.cars?.find(car => car.id === this.localCarId);
+    if (!authoritative) return snapshot;
+    const source = this.currentSnapshot;
+    const local = this.predictor.sample(authoritative, source, {
+      now, receivedAt: this.snapshotAt,
+      clockOffset: this.networkTiming?.clockOffset ?? this.playbackClockOffset,
+      maxHorizon: 0.25, pit: this.track.pit
+    });
+    this.predictionState = this.predictor.state;
+    this.predictionError = this.predictor.error;
+    this.predictionCorrection = Math.hypot(this.predictor.offset.x, this.predictor.offset.y);
+    this.predictionBlocked = this.predictor.blocked;
+    return { ...snapshot, cars: snapshot.cars.map(car => car.id === this.localCarId ? { ...car, ...local } : car) };
   }
 
   #trackTileKey(tileX, tileY) {
@@ -1776,7 +1620,7 @@ export class RaceRenderer {
       snapshot = this.#smoothNetworkSnapshot(snapshot, presentationDt);
     }
     if (!this.simulationFrame) {
-      snapshot = this.#applyLocalPrediction(snapshot, now, rawDt);
+      snapshot = this.#applyLocalPrediction(snapshot, now);
     }
     snapshot = this.#stabilizeRaceOrder(snapshot, now);
 
@@ -2422,8 +2266,8 @@ export class RaceRenderer {
     const timingY = margin + panelHeight + gap;
     const timingValues = [
       ["Текущий круг", formatRaceTime(Number(car.currentLapTime))],
-      ["Последний", formatRaceTime(Number(car.lastLapTime))],
-      ["Лучший", formatRaceTime(Number(car.bestLapTime))]
+      ["Последний", formatRaceTime(car.lastLapTime)],
+      ["Лучший", formatRaceTime(car.bestLapTime)]
     ];
     for (let index = 0; index < timingValues.length; index += 1) {
       const [label, value] = timingValues[index];

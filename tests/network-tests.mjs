@@ -161,7 +161,8 @@ const message = (payload) => ({
   const compactCar = (id, x, y, place, { driftAmount = 0, pitInServiceZone = false } = {}) => [
     id, x, y, 0, 0, 0, 100, 100, 0, 0,
     0, 0, 0, 0, 0, null, null, place, null,
-    0, 0, 0, null, null, 0, 0, 0, driftAmount, pitInServiceZone ? 1 : 0
+    0, 0, 0, null, null, 0, 0, 0, driftAmount, pitInServiceZone ? 1 : 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0
   ];
   socketHandler(message({
     type: "race-frame", senderId: "host", lobbyId: "lobby-a", raceId: "race-a",
@@ -171,7 +172,7 @@ const message = (payload) => ({
       v: [compactCar("car-player", 5, 6, 1, { driftAmount: 0.73, pitInServiceZone: true }), compactCar("car-host", 7, 8, 2)]
     }
   }));
-  assert.equal(snapshots, 3, "valid 29-field compact race frame was rejected");
+  assert.equal(snapshots, 3, "valid 39-field compact race frame was rejected");
   assert.equal(network.lastSnapshot.cars[0].x, 5);
   assert.equal(network.lastSnapshot.cars[0].driftAmount, 0.73, "remote drift HUD state was lost");
   assert.equal(network.lastSnapshot.cars[0].pitInServiceZone, true, "remote pit service-zone state was lost");
@@ -321,7 +322,7 @@ const message = (payload) => ({
   assert.ok(sentFrame, "host did not emit compact race-frame");
   assert.ok(Array.isArray(sentFrame.frame.v));
   assert.equal(sentFrame.frame.v[0][1], 1.23);
-  assert.equal(sentFrame.frame.v[0].length, 29);
+  assert.equal(sentFrame.frame.v[0].length, 39);
   assert.equal(sentFrame.frame.v[0][27], 0.457);
   assert.equal(sentFrame.frame.v[0][28], 1);
   assert.equal(sentFrame.frame.v[0].includes("must-not-repeat"), false);

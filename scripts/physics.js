@@ -12,7 +12,7 @@ import {
   WALL_COLLISION_ALPHA
 } from "./track.js";
 import { computeBotInput, shouldBotPit } from "./physics/bot-controller.js";
-import { applyDriveModel } from "./physics/drive-model.js";
+import { advanceCarMotion, terrainModifiers } from "./physics/car-motion.js";
 
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 const dot = (ax, ay, bx, by) => ax * bx + ay * by;
@@ -115,46 +115,6 @@ function velocityAtPoint(car, x, y) {
 const GLOBAL_SPEED_SCALE = 1.25;
 const GLOBAL_ACCELERATION_SCALE = 1.0;
 
-const TERRAIN_PROFILES = Object.freeze({
-  road: Object.freeze({ accelerationLoss: 0, steeringLoss: 0, topSpeedLoss: 0, gripLoss: 0, yawGain: 0, dampingShift: 0, dragBase: 0, dragStrength: 0 }),
-  grass: Object.freeze({ accelerationLoss: 0.45, steeringLoss: 0.34, topSpeedLoss: 0.42, gripLoss: 0.72, yawGain: 0.48, dampingShift: -0.68, dragBase: 0.18, dragStrength: 1.38 }),
-  gravel: Object.freeze({ accelerationLoss: 0.64, steeringLoss: 0.42, topSpeedLoss: 0.64, gripLoss: 0.66, yawGain: 0.22, dampingShift: -0.34, dragBase: 0.42, dragStrength: 2.82 }),
-  sand: Object.freeze({ accelerationLoss: 0.86, steeringLoss: 0.46, topSpeedLoss: 0.82, gripLoss: 0.34, yawGain: -0.18, dampingShift: 1.18, dragBase: 0.70, dragStrength: 5.20 })
-});
-
-function terrainModifiers(car, physics, speed = null) {
-  const p = physics ?? car?.physics ?? {};
-  const rawSeverity = clamp(Number(car?.surfaceSeverity) || 0, 0, 1);
-  const effective = clamp(rawSeverity / Math.max(1, Number(p.offroadGrip) || 1), 0, 1);
-  const currentSpeed = speed == null ? Math.hypot(Number(car?.vx) || 0, Number(car?.vy) || 0) : Math.abs(Number(speed) || 0);
-  const speedRatio = clamp(currentSpeed / Math.max(1, Number(p.maxSpeed) || 420), 0, 1.4);
-  const type = TERRAIN_PROFILES[car?.surfaceType] ? car.surfaceType : (effective > 0.001 ? "grass" : "road");
-  const profile = TERRAIN_PROFILES[type];
-  const highSpeed = clamp((speedRatio - 0.22) / 0.88, 0, 1);
-  const gripLoss = type === "grass"
-    ? profile.gripLoss * (0.52 + highSpeed * 0.72)
-    : profile.gripLoss * (0.82 + highSpeed * 0.18);
-  const sandCrawlAssist = type === "sand"
-    ? effective * 0.52 * (1 - clamp(speedRatio / 0.20, 0, 1))
-    : 0;
-  return {
-    type,
-    severity: effective,
-    speedRatio,
-    // Deep sand still destroys pace, but a stationary car must retain enough
-    // tractive effort to crawl back toward the asphalt. The extra low-speed
-    // term fades completely before the car reaches racing speed.
-    acceleration: Math.max(0.08, 1 - effective * profile.accelerationLoss + sandCrawlAssist),
-    steering: Math.max(0.18, 1 - effective * profile.steeringLoss * (0.78 + highSpeed * 0.32)),
-    topSpeed: Math.max(0.12, 1 - effective * profile.topSpeedLoss),
-    grip: Math.max(0.06, 1 - effective * gripLoss),
-    yawResponse: Math.max(0.28, 1 + effective * profile.yawGain * (0.42 + highSpeed * 0.78)),
-    angularDamping: Math.max(0.16, 1 + effective * profile.dampingShift * (0.45 + highSpeed * 0.75)),
-    dragRate: effective > 0.001
-      ? profile.dragBase * effective + profile.dragStrength * Math.pow(effective, 1.28) * (0.54 + speedRatio * 0.52)
-      : 0
-  };
-}
 const PIT_WORDS = Object.freeze([
   "кристалл", "болид", "вираж", "скорость", "поршень", "шестерня", "искрение", "гонщик",
   "питстоп", "разряд", "трасса", "Аллантре", "турбина", "механик", "форсаж", "сцепление",
@@ -221,6 +181,8 @@ export function buildRaceCarMeta(entry, index = 0) {
     maxCharge: physics.maxCharge,
     heatWarning: Boolean(resolved.traits.heatWarning),
     prediction: {
+      mass: physics.mass,
+      recuperation: resolved.traits.recuperation || 0,
       maxSpeed: physics.maxSpeed,
       acceleration: physics.acceleration,
       reverseAcceleration: physics.reverseAcceleration,
@@ -287,6 +249,7 @@ export class RaceSimulation {
       build: entry.build,
       resolved,
       physics,
+      prediction: buildRaceCarMeta(entry, index).prediction,
       color: entry.color ?? CAR_COLORS[index % CAR_COLORS.length],
       isBot: Boolean(entry.isBot),
       botSkill,
@@ -334,6 +297,7 @@ export class RaceSimulation {
       rng: seededRng(entry.botSeed ?? `${this.track.seed}:${entry.id}:${index}`),
       cornerAccumulator: 0,
       lastSteer: 0,
+      steeringPosition: 0,
       burstTimer: 0,
       startBoostTimer: 0,
       pitState: "track",
@@ -576,98 +540,13 @@ export class RaceSimulation {
     input = sanitizeInput(input);
     const p = car.physics;
     const previousPosition = { x: car.x, y: car.y };
-    const forwardX = Math.cos(car.angle);
-    const forwardY = Math.sin(car.angle);
-    let forwardSpeed = dot(car.vx, car.vy, forwardX, forwardY);
-
-    const terrain = terrainModifiers(car, p, Math.abs(forwardSpeed));
-
-    if (car.overheated && car.heat <= 48) car.overheated = false;
-    const heatStress = clamp((car.heat - 68) / 32, 0, 1);
-    const thermalAcceleration = car.overheated ? 0.58 : 1 - heatStress * 0.28;
-    const thermalSteering = car.overheated ? 0.72 : 1 - heatStress * 0.13;
-    const thermalTopSpeed = car.overheated ? 0.78 : 1 - heatStress * 0.08;
-
-    const ramSteerPenalty = input.ram ? (car.resolved.traits.ramSteerPenalty || 0.55) : 1;
-    const healthPenalty = car.health < p.maxHealth * 0.25 && !car.criticalGrace ? 0.78 : 1;
-    const lastLapBoost = car.resolved.traits.lastLap && car.lap === this.laps - 1 ? 1.04 : 1;
-    const lowHealthBoost = car.resolved.traits.lowHealthBoost && car.health < p.maxHealth * 0.3 ? car.resolved.traits.lowHealthBoost : 1;
-
-    let extraAcceleration = 0;
     const draft = car.pitState === "track" ? this.#draftEffect(car, dt) : { acceleration: 0, pursuit: false };
-    extraAcceleration += draft.acceleration;
-    if (draft.pursuit) extraAcceleration += p.acceleration * 0.07;
-
-    const wantsReverse = input.reverse || input.throttle < 0;
-    const brakingForReverse = wantsReverse && forwardSpeed > 7;
-    if (input.brake || brakingForReverse) {
-      if (car.resolved.traits.recuperation && car.charge < p.maxCharge && Math.abs(forwardSpeed) > 8) {
-        car.charge = Math.min(p.maxCharge, car.charge + Math.abs(forwardSpeed) * 0.018 * car.resolved.traits.recuperation * dt);
-      }
-    }
-
-    car.boostActive = false;
-    const requestedBoost = car.pitState === "track"
-      && input.boost && input.throttle > 0 && !car.overheated && car.charge > 0.001;
-    let boostAccelerationMultiplier = 0;
-    let boostTopSpeedMultiplier = 1;
-    if (requestedBoost) {
-      const requestedCharge = p.boostDrain * dt;
-      const boostFraction = clamp(car.charge / Math.max(0.0001, requestedCharge), 0, 1);
-      if (boostFraction > 0.001) {
-        car.boostActive = true;
-        boostAccelerationMultiplier = 0.95 * p.boostPower * lowHealthBoost * boostFraction;
-        boostTopSpeedMultiplier = 1.17 * p.boostPower;
-        car.charge = Math.max(0, car.charge - requestedCharge * boostFraction);
-        car.heat = Math.min(112, car.heat + p.heatRate * dt * boostFraction);
-      }
-    }
-    if (!car.boostActive) car.heat = Math.max(0, car.heat - p.cooling * dt);
-    if (car.heat >= 100) {
-      car.overheated = true;
-      car.boostActive = false;
-      boostTopSpeedMultiplier = 1;
-    }
-
-    if (car.startBoostTimer > 0) {
-      car.startBoostTimer -= dt;
-      extraAcceleration += p.acceleration * 0.3;
-    }
-    if (car.burstTimer > 0) {
-      car.burstTimer -= dt;
-      extraAcceleration += p.acceleration * 0.35;
-    }
-
-    const pitLimit = car.pitState !== "track" ? this.track.pit.speedLimit : Infinity;
-    const drive = applyDriveModel(car, input, p, dt, {
-      accelerationMultiplier: healthPenalty * thermalAcceleration * terrain.acceleration * lastLapBoost,
-      steeringMultiplier: ramSteerPenalty * thermalSteering * terrain.steering * (car.resolved.traits.precision ? 1.04 : 1),
-      topSpeedMultiplier: thermalTopSpeed * terrain.topSpeed * lastLapBoost,
-      gripMultiplier: terrain.grip,
-      yawResponseMultiplier: terrain.yawResponse,
-      angularDampingMultiplier: terrain.angularDamping,
-      brakeGripMultiplier: car.resolved.traits.lateBrake ? 1.22 : 1,
-      driftEnabled: car.pitState === "track" && terrain.type === "road" && !car.isBot && !car.temporaryAutopilot,
-      driftAssist: Math.max(0.75, Number(car.resolved.traits.drift) || 1),
-      driftControl: Math.max(0.45, Math.sqrt(p.spinResistance * p.recovery)
-        * (1 + (Number(car.resolved.traits.drift) || 1) - 1) * 0.75),
-      extraAcceleration,
-      boostAccelerationMultiplier,
-      boostTopSpeedMultiplier,
-      speedLimit: pitLimit,
-      speedLimitDeceleration: car.pitState !== "track" ? Number(this.track.pit.speedLimitDeceleration ?? 96) : 0,
-      previousSteer: car.lastSteer,
-      smoothSteer: Boolean(car.resolved.traits.smoothSteer)
+    const drive = advanceCarMotion(car, input, p, dt, {
+      traits: car.resolved.traits, laps: this.laps, pit: this.track.pit,
+      extraAcceleration: draft.acceleration + (draft.pursuit ? p.acceleration * 0.07 : 0)
     });
-    forwardSpeed = drive.forwardSpeed;
+    let forwardSpeed = drive.forwardSpeed;
     const steering = drive.steering;
-    if (terrain.type !== "road" || car.pitState !== "track") {
-      car.driftAmount = Math.max(0, Number(car.driftAmount || 0) - dt * 2.8);
-      if (car.driftAmount <= 0.01) {
-        car.driftAmount = 0;
-        car.driftDirection = 0;
-      }
-    }
 
     // Measure the route after movement. The result is reused by bot steering on
     // the next fixed step, so every car performs one geometry query per tick
@@ -1649,6 +1528,16 @@ export class RaceSimulation {
         vx: car.vx,
         vy: car.vy,
         angle: car.angle,
+        angularVelocity: car.angularVelocity,
+        steeringPosition: car.steeringPosition,
+        lastSteer: car.lastSteer,
+        driftDirection: car.driftDirection,
+        surfaceType: car.surfaceType,
+        surfaceSide: car.surfaceSide,
+        criticalGrace: car.criticalGrace,
+        startBoostTimer: car.startBoostTimer,
+        burstTimer: car.burstTimer,
+        prediction: car.prediction,
         health: car.health,
         maxHealth: car.physics.maxHealth,
         charge: car.charge,

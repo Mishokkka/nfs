@@ -26,6 +26,7 @@ function messageId() {
 }
 
 const MESSAGE_SIZE_LIMITS = Object.freeze({
+  "session-offer": 512_000,
   "race-input": 8_192,
   "race-ready": 8_192,
   "control-assignment": 8_192,
@@ -96,7 +97,8 @@ const LEGACY_RACE_CAR_FIELDS = new Set([
   "finishTime", "finishBlocked", "disabled", "isBot", "temporaryAutopilot",
   "abandoned", "ram", "boost", "pitState", "pitProgress", "pitStopsCompleted",
   "pitWord", "pitAttemptId", "inputSequence", "surfaceSeverity", "wallContactTimer",
-  "driftAmount", "pitInServiceZone"
+  "driftAmount", "pitInServiceZone", "angularVelocity", "steeringPosition", "lastSteer",
+  "driftDirection", "slipAngle", "surfaceType", "surfaceSide", "criticalGrace", "startBoostTimer", "burstTimer"
 ]);
 
 function hasOnlyKeys(value, allowed) {
@@ -115,7 +117,7 @@ function boundedStringArray(value, limit = 80) {
 }
 
 function compactRaceRowFitsSchema(row) {
-  if (!Array.isArray(row) || row.length !== 29 || !boundedString(row[0], 80)) return false;
+  if (!Array.isArray(row) || row.length !== 39 || !boundedString(row[0], 80)) return false;
   for (let index = 1; index < row.length; index += 1) {
     if (index === 22 || index === 23) {
       if (!boundedString(row[index], 80, true)) return false;
@@ -147,6 +149,10 @@ function legacyRaceCarFitsSchema(car) {
   if (!hasOnlyKeys(car, LEGACY_RACE_CAR_FIELDS) || !boundedString(car.id, 80)) return false;
   for (const [key, value] of Object.entries(car)) {
     if (key === "id") continue;
+    if (key === "surfaceType") {
+      if (!["road", "grass", "gravel", "sand"].includes(value)) return false;
+      continue;
+    }
     if (key === "pitState") {
       if (!boundedString(value, 16)) return false;
       continue;
@@ -212,7 +218,7 @@ function messageFitsLimit(message) {
   // Compact race frames have a fixed, shallow shape whose maximum encoded size
   // is bounded by the participant count and two 80-character nullable fields per
   // row. Validate that structure directly instead of JSON.stringify-ing every
-  // 10 Hz snapshot again on every receiving client.
+  // 30 Hz snapshot again on every receiving client.
   if (message.type === "race-frame") return raceFrameMessageFitsSchema(message);
   if (message.type === "race-input") {
     const allowed = new Set(["type", "lobbyId", "raceId", "userId", "carId", "input", "sequence", "protocolVersion", "id", "senderId", "sentAt"]);
@@ -324,6 +330,8 @@ function normalizeCarMeta(rawMeta, entries) {
       maxCharge: rounded(source?.maxCharge, 2, fallback.maxCharge, 1, 100000),
       heatWarning: Boolean(source?.heatWarning ?? fallback.heatWarning),
       prediction: {
+        mass: rounded(source?.prediction?.mass, 2, fallback.prediction.mass, 100, 10000),
+        recuperation: rounded(source?.prediction?.recuperation, 4, fallback.prediction.recuperation, 0, 10),
         maxSpeed: rounded(source?.prediction?.maxSpeed, 2, fallback.prediction.maxSpeed, 1, 100000),
         acceleration: rounded(source?.prediction?.acceleration, 2, fallback.prediction.acceleration, 1, 100000),
         reverseAcceleration: rounded(source?.prediction?.reverseAcceleration, 2, fallback.prediction.reverseAcceleration, 1, 100000),
@@ -395,11 +403,21 @@ function normalizeRaceFrame(raw, race) {
       pitStopsCompleted: Math.max(0, Math.floor(finite(source.pitStopsCompleted, 0, 0, 20))),
       pitWord: pitState === "service" ? String(source.pitWord ?? "").slice(0, 80) || null : null,
       pitAttemptId: pitState === "service" ? String(source.pitAttemptId ?? "").slice(0, 80) || null : null,
-      inputSequence: Math.max(0, Math.floor(finite(source.inputSequence, 0, 0, Number.MAX_SAFE_INTEGER))),
+      inputSequence: Math.max(-1, Math.floor(finite(source.inputSequence, -1, -1, Number.MAX_SAFE_INTEGER))),
       surfaceSeverity: rounded(source.surfaceSeverity, 3, 0, 0, 1),
       wallContactTimer: rounded(source.wallContactTimer, 3, 0, 0, 10),
       driftAmount: rounded(source.driftAmount, 3, 0, 0, 1),
-      pitInServiceZone: Boolean(source.pitInServiceZone)
+      pitInServiceZone: Boolean(source.pitInServiceZone),
+      angularVelocity: rounded(source.angularVelocity, 5, 0, -100, 100),
+      steeringPosition: rounded(source.steeringPosition, 5, 0, -1, 1),
+      lastSteer: rounded(source.lastSteer, 5, 0, -1, 1),
+      driftDirection: rounded(source.driftDirection, 0, 0, -1, 1),
+      slipAngle: rounded(source.slipAngle, 5, 0, -4, 4),
+      surfaceType: ["road", "grass", "gravel", "sand"].includes(source.surfaceType) ? source.surfaceType : "road",
+      surfaceSide: rounded(source.surfaceSide, 3, 0, -1, 1),
+      criticalGrace: Boolean(source.criticalGrace),
+      startBoostTimer: rounded(source.startBoostTimer, 4, 0, 0, 10),
+      burstTimer: rounded(source.burstTimer, 4, 0, 0, 10)
     });
   }
   if (!cars.length || cars.length !== known.size) return null;
@@ -472,7 +490,10 @@ function encodeNormalizedFrame(frame) {
         car.surfaceSeverity,
         car.wallContactTimer,
         car.driftAmount,
-        car.pitInServiceZone ? 1 : 0
+        car.pitInServiceZone ? 1 : 0,
+        car.angularVelocity, car.steeringPosition, car.lastSteer, car.driftDirection,
+        car.slipAngle, ["road", "grass", "gravel", "sand"].indexOf(car.surfaceType),
+        car.surfaceSide, car.criticalGrace ? 1 : 0, car.startBoostTimer, car.burstTimer
       ];
     })
   };
@@ -531,7 +552,12 @@ function decodeRaceFrame(raw, race) {
         surfaceSeverity: values[25],
         wallContactTimer: values[26],
         driftAmount: values[27],
-        pitInServiceZone: Boolean(values[28])
+        pitInServiceZone: Boolean(values[28]),
+        angularVelocity: values[29], steeringPosition: values[30], lastSteer: values[31],
+        driftDirection: values[32], slipAngle: values[33],
+        surfaceType: ["road", "grass", "gravel", "sand"][values[34]] ?? "road",
+        surfaceSide: values[35], criticalGrace: Boolean(values[36]),
+        startBoostTimer: values[37], burstTimer: values[38]
       };
     }).filter(Boolean)
   };
@@ -625,7 +651,21 @@ export class RaceNetwork {
     this.initialized = false;
     this.lastRequestAcceptedAt = new Map();
     this.lastRateLimitPruneAt = 0;
+    this.pendingInputs = new Map();
+    this.inputSequences = new Map();
+    this.recoveryRequired = false;
+    this.discoveredRaceId = null;
+    this.pendingDiscovery = null;
+    this.pendingProbes = new Map();
+    this.probeCounter = 0;
+    this.lastProbeAt = -Infinity;
+    this.lastSnapshotAt = 0;
+    this.timing = null;
+    this.retiredRaceIds = new Set();
+    this.closedLobbyIds = new Set();
+    this.lastStartedRaceId = null;
     this.handlers = {
+      timing: new Set(),
       lobby: new Set(),
       start: new Set(),
       raceState: new Set(),
@@ -665,6 +705,7 @@ export class RaceNetwork {
     this.socketHandler = null;
     this.initialized = false;
     this.seen.clear();
+    this.#clearPendingInputs();
     this.lastRequestAcceptedAt.clear();
     this.lastRateLimitPruneAt = 0;
   }
@@ -675,7 +716,7 @@ export class RaceNetwork {
   }
 
   get isHost() {
-    return this.lobby?.hostId === game.user.id;
+    return !this.recoveryRequired && this.lobby?.hostId === game.user.id;
   }
 
   get participant() {
@@ -721,7 +762,13 @@ export class RaceNetwork {
   }
 
   requestState() {
-    this.#send({ type: "state-request", requesterId: game.user.id });
+    const now = performance.now();
+    // Opening the app and its Lobby tab can request state in the same RTT.
+    // Keep the correlation ID while the first (rate-limited) answer is in flight.
+    const discoveryId = this.pendingDiscovery && now - this.pendingDiscovery.at < 1000
+      ? this.pendingDiscovery.id : MESSAGE_SESSION + ":" + (++this.probeCounter);
+    if (discoveryId !== this.pendingDiscovery?.id) this.pendingDiscovery = { id: discoveryId, at: now };
+    this.#send({ type: "state-request", requesterId: game.user.id, discoveryId });
   }
 
   join(build) {
@@ -811,6 +858,7 @@ export class RaceNetwork {
     this.lastSnapshot = null;
     this.lastFrame = null;
     this.lastResults = null;
+    this.#clearPendingInputs();
     this.lastRequestAcceptedAt.clear();
     this.activeRace = {
       protocolVersion: PROTOCOL_VERSION,
@@ -875,13 +923,15 @@ export class RaceNetwork {
     });
   }
 
-  sendSnapshot(snapshot) {
+  sendSnapshot(snapshot, { generatedAt = null } = {}) {
     if (!this.isHost || !this.activeRace || !snapshot) return;
     const normalizedFrame = normalizeRaceFrame(snapshot, this.activeRace);
     if (!normalizedFrame) return;
     const frame = encodeNormalizedFrame(normalizedFrame);
     this.snapshotSequence += 1;
     this.lastSnapshot = snapshot;
+    const producedAt = Number.isFinite(generatedAt) ? generatedAt - performance.timeOrigin : performance.now();
+    this.lastSnapshotAt = Math.abs(producedAt - performance.now()) < 5000 ? producedAt : performance.now();
     this.lastFrame = frame;
     this.#send({
       type: "race-frame",
@@ -917,6 +967,7 @@ export class RaceNetwork {
     this.lastSnapshot = null;
     this.lastFrame = null;
     this.lastResults = null;
+    this.#clearPendingInputs();
     this.lastRequestAcceptedAt.clear();
     this.#send({ type: "stop-race", lobbyId: this.lobby.id, raceId });
     this.#broadcastLobby();
@@ -926,11 +977,14 @@ export class RaceNetwork {
     if (!this.isHost || !this.lobby) return;
     const lobbyId = this.lobby.id;
     const raceId = this.activeRace?.raceId ?? null;
+    this.#rememberRetired(this.closedLobbyIds, lobbyId);
+    this.#rememberRetired(this.retiredRaceIds, raceId);
     this.lobby = null;
     this.activeRace = null;
     this.lastSnapshot = null;
     this.lastFrame = null;
     this.lastResults = null;
+    this.#clearPendingInputs();
     this.lastRequestAcceptedAt.clear();
     this.#send({ type: "lobby-closed", lobbyId, raceId });
   }
@@ -943,7 +997,7 @@ export class RaceNetwork {
   recoverOrphanedSession() {
     if (!this.lobby || !this.hostOffline || !game.user.isGM) return false;
     const now = Date.now();
-    const wasRacing = this.lobby.phase === "race";
+    const wasRacing = this.lobby.phase === "race" || (this.recoveryRequired && this.lobby.phase === "results");
     const claimedLobby = clone(this.lobby);
     claimedLobby.hostId = game.user.id;
     claimedLobby.hostName = game.user.name;
@@ -955,12 +1009,13 @@ export class RaceNetwork {
       type: "host-claim",
       lobby: claimedLobby,
       abortRace: wasRacing,
-      abortedRaceId: wasRacing ? this.activeRace?.raceId ?? null : null
+      abortedRaceId: wasRacing ? this.activeRace?.raceId ?? this.discoveredRaceId : null
     });
     return true;
   }
 
   #broadcastLobby(targetId = null) {
+    if (this.lobby && this.isHost) this.lobby.revision = (Number(this.lobby.revision) || 0) + 1;
     this.#send({ type: "lobby-state", lobby: this.lobby, targetId });
   }
 
@@ -1006,12 +1061,14 @@ export class RaceNetwork {
   #acceptLobby(message) {
     const incoming = message.lobby;
     if (!incoming || typeof incoming !== "object") return false;
+    if (this.closedLobbyIds.has(incoming.id)) return false;
     if (message.senderId !== incoming.hostId) return false;
     if (!this.lobby) return true;
 
     if (this.lobby.id === incoming.id) {
       const ownership = this.#compareLobbyOwnership(incoming, this.lobby);
       if (ownership !== 0) return ownership > 0;
+      if ((Number(incoming.revision) || 0) < (Number(this.lobby.revision) || 0)) return false;
       return String(incoming.hostId) === String(this.lobby.hostId);
     }
 
@@ -1051,6 +1108,7 @@ export class RaceNetwork {
       .slice(0, MAX_RACE_ENTRIES)
       .map(([id, participant]) => [id, normalizeParticipant(participant, id, participant?.userName)]));
     incoming.hostEpoch = Math.max(0, Math.floor(Number(incoming.hostEpoch) || 0));
+    incoming.revision = Math.max(0, Math.floor(Number(incoming.revision) || 0));
     incoming.hostClaimedAt = Number(incoming.hostClaimedAt) || Number(incoming.createdAt) || 0;
     incoming.hostClaimId = String(incoming.hostClaimId || incoming.hostId || "");
     return incoming;
@@ -1081,6 +1139,8 @@ export class RaceNetwork {
   }
 
   #markHostAlive() {
+    this.recoveryRequired = false;
+    this.discoveredRaceId = null;
     this.lastHostHeartbeat = Date.now();
     this.#setHostOffline(false);
   }
@@ -1100,6 +1160,60 @@ export class RaceNetwork {
     return true;
   }
 
+  #clearPendingInputs(carId = null) {
+    for (const [id, pending] of this.pendingInputs) {
+      if (carId != null && id !== carId) continue;
+      clearTimeout(pending.timer);
+      this.pendingInputs.delete(id);
+    }
+    if (carId == null) {
+      this.inputSequences.clear();
+      this.pendingProbes.clear();
+      this.timing = null;
+      this.lastProbeAt = -Infinity;
+    } else this.inputSequences.delete(carId);
+  }
+
+  #rememberRetired(set, id) {
+    if (!id) return;
+    set.add(String(id));
+    if (set.size > 32) set.delete(set.values().next().value);
+  }
+
+  #queueInput(message) {
+    const sequence = Math.max(0, Math.floor(finite(message.sequence, 0, 0, Number.MAX_SAFE_INTEGER)));
+    if (sequence <= (this.inputSequences.get(message.carId) ?? -1)) return;
+    this.inputSequences.set(message.carId, sequence);
+    const latest = { ...message, sequence, input: sanitizeInput(message.input) };
+    const key = "input:" + message.senderId + ":" + message.carId;
+    const pending = this.pendingInputs.get(message.carId);
+    if (pending) { pending.message = latest; return; }
+    const remaining = 8 - (performance.now() - (this.lastRequestAcceptedAt.get(key) ?? -Infinity));
+    if (remaining <= 0) {
+      this.lastRequestAcceptedAt.set(key, performance.now());
+      this.#emit("input", latest);
+      return;
+    }
+    const record = { message: latest, timer: null };
+    record.timer = setTimeout(() => {
+      this.pendingInputs.delete(message.carId);
+      if (!this.isHost || this.activeRace?.raceId !== record.message.raceId) return;
+      this.lastRequestAcceptedAt.set(key, performance.now());
+      this.#emit("input", record.message);
+    }, remaining);
+    this.pendingInputs.set(message.carId, record);
+  }
+
+  #probeTiming() {
+    const now = performance.now();
+    if (this.isHost || !this.activeRace || this.activeRace.phase !== "race" || now - this.lastProbeAt < 1000) return;
+    this.lastProbeAt = now;
+    const nonce = MESSAGE_SESSION + ":" + (++this.probeCounter);
+    for (const [id, at] of this.pendingProbes) if (now - at > 5000) this.pendingProbes.delete(id);
+    this.pendingProbes.set(nonce, now);
+    this.#send({ type: "race-ping", nonce, lobbyId: this.lobby.id, raceId: this.raceId }, false);
+  }
+
   #receive(message) {
     try {
     if (!message?.id || this.seen.has(message.id)) return;
@@ -1116,11 +1230,60 @@ export class RaceNetwork {
 
     switch (message.type) {
       case "state-request":
-        if (this.isHost && this.lobby && message.senderId === message.requesterId) {
+        if (message.senderId !== message.requesterId || !game.users?.get(message.senderId)?.active) break;
+        if (!this.#acceptRate("state:" + message.senderId, 250)) break;
+        if (this.isHost && this.lobby) {
           this.#broadcastLobby(message.requesterId);
           this.#broadcastRaceState(message.requesterId);
+        } else if (this.lobby && game.users.get(message.senderId)?.isGM && message.discoveryId
+          && (this.hostOffline || message.senderId === this.lobby.hostId)
+          && this.lobby.participants?.[game.user.id]) {
+          this.#send({ type: "session-offer", targetId: message.requesterId, discoveryId: message.discoveryId,
+            lobby: this.lobby, raceId: this.raceId ?? this.discoveredRaceId });
         }
         break;
+
+      case "session-offer": {
+        if (!game.user.isGM || this.lobby || message.targetId !== game.user.id) break;
+        if (!this.pendingDiscovery || message.discoveryId !== this.pendingDiscovery.id
+          || performance.now() - this.pendingDiscovery.at > 10000) break;
+        const lobby = message.lobby;
+        if (!lobby?.id || !lobby.hostId || !["lobby", "race", "results"].includes(lobby.phase)) break;
+        if (!game.users?.get(message.senderId)?.active || !lobby.participants?.[message.senderId]) break;
+        this.lobby = this.#normalizeLobby(lobby);
+        this.recoveryRequired = true;
+        this.discoveredRaceId = boundedString(message.raceId, 120, true) ? message.raceId : null;
+        this.lastHostHeartbeat = 0;
+        this.#setHostOffline(true);
+        this.#emit("lobby", this.lobby);
+        break;
+      }
+
+      case "race-ping": {
+        if (!this.isHost || !this.lastSnapshot || message.lobbyId !== this.lobby?.id || message.raceId !== this.raceId) break;
+        if (!boundedString(message.nonce, 160) || !game.users?.get(message.senderId)?.active) break;
+        if (!this.#acceptRate("ping:" + message.senderId, 500)) break;
+        const age = clamp((performance.now() - this.lastSnapshotAt) / 1000, 0, 0.25);
+        this.#send({ type: "race-pong", targetId: message.senderId, nonce: message.nonce,
+          lobbyId: this.lobby.id, raceId: this.raceId, simulationTime: this.lastSnapshot.simulationTime + age }, false);
+        break;
+      }
+
+      case "race-pong": {
+        if (message.targetId !== game.user.id || !this.#isExpectedHost(message)
+          || message.lobbyId !== this.lobby?.id || message.raceId !== this.raceId) break;
+        const sentAt = this.pendingProbes.get(message.nonce);
+        if (!Number.isFinite(sentAt) || !Number.isFinite(message.simulationTime)) break;
+        this.pendingProbes.delete(message.nonce);
+        const now = performance.now(), rttMs = now - sentAt;
+        if (rttMs < 0 || rttMs > 2000) break;
+        const clockOffset = (sentAt + rttMs * 0.5) / 1000 - message.simulationTime;
+        if (!this.timing || rttMs <= this.timing.rttMs * 1.2 || now - this.timing.at > 10000) {
+          this.timing = { clockOffset, rttMs, at: now };
+          this.#emit("timing", this.timing);
+        }
+        break;
+      }
 
       case "lobby-state": {
         if (message.targetId && message.targetId !== game.user.id) break;
@@ -1141,10 +1304,12 @@ export class RaceNetwork {
         const abortedRaceId = message.abortedRaceId == null ? null : String(message.abortedRaceId);
         this.lobby = incoming;
         if (abortRace) {
+          this.#rememberRetired(this.retiredRaceIds, abortedRaceId);
           this.activeRace = null;
           this.lastSnapshot = null;
           this.lastFrame = null;
           this.lastResults = null;
+          this.#clearPendingInputs();
           this.lastRequestAcceptedAt.clear();
         } else if (this.activeRace) {
           this.activeRace.hostId = incoming.hostId;
@@ -1185,6 +1350,8 @@ export class RaceNetwork {
       case "race-init": {
         if (this.lobby?.id !== message.lobbyId || !this.#isExpectedHost(message)) break;
         if (!message.raceId || message.hostId !== message.senderId) break;
+        if (this.retiredRaceIds.has(message.raceId)) break;
+        if (this.lastStartedRaceId === message.raceId) break;
         const race = this.#normalizeRace({
           raceId: message.raceId,
           lobbyId: message.lobbyId,
@@ -1197,6 +1364,7 @@ export class RaceNetwork {
           startedAt: message.sentAt
         }, message.senderId, message.sentAt);
         if (!race || race.lobbyId !== this.lobby.id) break;
+        this.lastStartedRaceId = race.raceId;
         this.lobby.phase = "race";
         this.activeRace = race;
         this.lastReceivedSnapshotSequence = -1;
@@ -1217,8 +1385,19 @@ export class RaceNetwork {
         if (!race || race.lobbyId !== this.lobby.id) break;
         const restoredResults = race.phase === "results" ? normalizeResults(message.results, race) : null;
         if (race.phase === "results" && !restoredResults) break;
+        const restoredFrame = decodeRaceFrame(message.frame, race);
+        const sameRace = this.activeRace?.raceId === race.raceId;
+        if (this.retiredRaceIds.has(race.raceId)) break;
+        if (sameRace && this.activeRace.phase === "results" && race.phase !== "results") break;
+        if (sameRace && this.lastSnapshot && !restoredFrame && race.phase !== "results") break;
+        if (sameRace && restoredFrame && restoredFrame.tick < this.lastReceivedSimulationTick) break;
+        if (!sameRace) {
+          this.#clearPendingInputs();
+          this.lastReceivedSnapshotSequence = -1;
+          this.lastReceivedSimulationTick = -1;
+        }
         this.activeRace = race;
-        const restoredFrame = decodeRaceFrame(message.frame, this.activeRace);
+        if (restoredFrame) this.lastReceivedSimulationTick = restoredFrame.tick;
         this.lastFrame = encodeNormalizedFrame(restoredFrame);
         this.lastSnapshot = hydrateRaceFrame(restoredFrame, this.activeRace);
         this.lastResults = restoredResults;
@@ -1264,12 +1443,7 @@ export class RaceNetwork {
         if (message.raceId !== this.activeRace.raceId || message.senderId !== message.userId) break;
         const entry = this.activeRace.entries.find((candidate) => candidate.id === message.carId);
         if (!entry || entry.userId !== message.senderId || entry.isBot) break;
-        if (!this.#acceptRate(`input:${message.senderId}:${message.carId}`, 8)) break;
-        this.#emit("input", {
-          ...message,
-          sequence: Math.max(0, Math.floor(finite(message.sequence, 0, 0, Number.MAX_SAFE_INTEGER))),
-          input: sanitizeInput(message.input)
-        });
+        this.#queueInput(message);
         break;
       }
 
@@ -1279,6 +1453,7 @@ export class RaceNetwork {
         const entry = this.activeRace.entries.find((candidate) => candidate.id === message.carId);
         if (!entry || entry.userId !== message.senderId || entry.isBot) break;
         if (!this.#acceptRate(`claim:${message.senderId}:${message.carId}`, 250)) break;
+        this.#clearPendingInputs(message.carId);
         this.#emit("claimControl", message);
         break;
       }
@@ -1310,7 +1485,7 @@ export class RaceNetwork {
       }
 
       case "race-frame": {
-        if (this.isHost || !this.activeRace || !this.#isExpectedHost(message)) break;
+        if (this.isHost || this.activeRace?.phase !== "race" || !this.#isExpectedHost(message)) break;
         if (message.lobbyId !== this.lobby?.id || message.raceId !== this.activeRace.raceId) break;
         const sequence = Math.max(0, Math.floor(finite(message.sequence, -1, -1, Number.MAX_SAFE_INTEGER)));
         const simulationTick = Math.max(0, Math.floor(finite(message.simulationTick, -1, -1, Number.MAX_SAFE_INTEGER)));
@@ -1324,6 +1499,7 @@ export class RaceNetwork {
         this.lastSnapshot = hydrateRaceFrame(frame, this.activeRace);
         this.#markHostAlive();
         this.#emit("snapshot", this.lastSnapshot);
+        this.#probeTiming();
         break;
       }
 
@@ -1343,11 +1519,13 @@ export class RaceNetwork {
       case "stop-race":
         if (this.lobby?.id !== message.lobbyId || !this.#isExpectedHost(message)) break;
         if (message.raceId && this.activeRace?.raceId && message.raceId !== this.activeRace.raceId) break;
+        this.#rememberRetired(this.retiredRaceIds, message.raceId);
         if (this.lobby) this.lobby.phase = "lobby";
         this.activeRace = null;
         this.lastSnapshot = null;
         this.lastFrame = null;
         this.lastResults = null;
+        this.#clearPendingInputs();
         this.lastRequestAcceptedAt.clear();
         this.#markHostAlive();
         this.#emit("stop", message);
@@ -1355,11 +1533,14 @@ export class RaceNetwork {
 
       case "lobby-closed":
         if (this.lobby?.id !== message.lobbyId || !this.#isExpectedHost(message)) break;
+        this.#rememberRetired(this.closedLobbyIds, message.lobbyId);
+        this.#rememberRetired(this.retiredRaceIds, message.raceId);
         this.lobby = null;
         this.activeRace = null;
         this.lastSnapshot = null;
         this.lastFrame = null;
         this.lastResults = null;
+        this.#clearPendingInputs();
         this.lastRequestAcceptedAt.clear();
         this.#emit("lobby", null);
         this.#emit("stop", message);
@@ -1379,7 +1560,8 @@ export class RaceNetwork {
   }
 
   #heartbeat() {
-    if (!this.lobby) return;
+    if (!this.lobby || this.recoveryRequired) return;
+    this.#probeTiming();
     if (this.isHost) {
       this.lastHostHeartbeat = Date.now();
       this.#send({

@@ -1,0 +1,47 @@
+name: Checks and module package
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  check:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          package-manager-cache: false
+      - run: npm run test:all
+      - run: npm run build
+      - uses: actions/upload-artifact@v7
+        with:
+          name: module-${{ runner.os }}
+          path: dist/
+  release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          package-manager-cache: false
+      - name: Verify tag matches manifest
+        run: node -e "if (process.env.GITHUB_REF_NAME !== 'v' + JSON.parse(require('fs').readFileSync('package.json')).version) process.exit(1)"
+      - uses: actions/download-artifact@v8
+        with:
+          name: module-Linux
+          path: dist/
+      - name: Publish tested module archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release create "$GITHUB_REF_NAME" dist/*.zip dist/SHA256SUMS.txt --verify-tag --title "$GITHUB_REF_NAME" --generate-notes

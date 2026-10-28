@@ -46,7 +46,9 @@ export function applyDriveModel(state, input, physics, dt, modifiers = {}) {
   const forwardSpeedBeforeAcceleration = forwardSpeed;
 
   const speedRatio = clamp(Math.abs(forwardSpeed) / maxSpeed, 0, 1.4);
-  const lowSpeedAuthority = clamp(Math.abs(forwardSpeed) / 72, 0.22, 1.04);
+  // Tyres need forward/reverse motion to turn the chassis. A parked car cannot
+  // rotate on the spot just because a steering key is held.
+  const lowSpeedAuthority = clamp(Math.abs(forwardSpeed) / 72, 0, 1.04);
   // High-speed cornering should demand commitment. The raw steer rate still
   // defines how lively a chassis feels, but as speed climbs the available yaw
   // authority now falls off in a way that better rewards handling and control.
@@ -86,6 +88,8 @@ export function applyDriveModel(state, input, physics, dt, modifiers = {}) {
   }
 
   forwardSpeed += acceleration * step;
+  if ((input.brake || brakingForReverse)
+    && (forwardSpeedBeforeAcceleration === 0 || forwardSpeed * forwardSpeedBeforeAcceleration < 0)) forwardSpeed = 0;
   const maxForward = maxSpeed * topSpeedMultiplier * boostTopSpeedMultiplier;
   const speedLimit = Number.isFinite(Number(modifiers.speedLimit)) ? Math.max(0, Number(modifiers.speedLimit)) : Infinity;
   const speedLimitDeceleration = Math.max(0, Number(modifiers.speedLimitDeceleration) || 0);
@@ -103,11 +107,17 @@ export function applyDriveModel(state, input, physics, dt, modifiers = {}) {
   }
   forwardSpeed = Math.max(-maxSpeed * reverseSpeedMultiplier, forwardSpeed);
 
-  let steering = clamp(Number(input.steer) || 0, -1, 1);
+  const requestedSteering = clamp(Number(input.steer) || 0, -1, 1);
+  const rackResponse = (0.045 + speedRatio * 0.035)
+    * Math.pow(clamp((Number(p.mass) || 1200) / 1200, 0.5, 2), 0.25)
+    * (modifiers.smoothSteer ? 0.85 : 1);
+  const rack = Number(state.steeringPosition) || 0;
+  let steering = rack + (requestedSteering - rack) * (1 - Math.exp(-step / rackResponse));
+  state.steeringPosition = steering;
   if (Math.abs(steering) < 0.025) steering = 0;
   const previousSteer = Number(modifiers.previousSteer ?? state.lastSteer) || 0;
-  const changedDirection = Math.sign(steering) !== Math.sign(previousSteer)
-    && Math.abs(previousSteer) > 0.42 && Math.abs(steering) > 0.42;
+  const changedDirection = Math.sign(requestedSteering) !== Math.sign(previousSteer)
+    && Math.abs(previousSteer) > 0.42 && Math.abs(requestedSteering) > 0.42;
 
   const driftEnabled = modifiers.driftEnabled !== false;
   const driftAssist = clamp(Number(modifiers.driftAssist) || 1, 0.75, 1.8);
@@ -174,6 +184,14 @@ export function applyDriveModel(state, input, physics, dt, modifiers = {}) {
   const driftDampingScale = 1 - driftAmount * 0.48;
   const counterDamping = counterSteering ? (1.9 + driftControl * 2.25) * driftAmount : 0;
   state.angularVelocity *= Math.exp(-(baseAngularDamping * driftDampingScale + counterDamping) * step);
+  // A finite tyre-force budget makes fast corners open out. Acceleration and
+  // braking consume part of that budget, so slowing before a turn matters.
+  const longitudinalLoad = clamp(Math.abs(acceleration) / Math.max(1, brakingPower * 1.5), 0, 0.98);
+  const combinedGrip = Math.sqrt(Math.max(0.18, 1 - longitudinalLoad * longitudinalLoad));
+  const lateralAccelerationLimit = (160 + lateralGrip * 65) * gripMultiplier * combinedGrip;
+  const yawLimit = lateralAccelerationLimit / Math.max(32, Math.abs(forwardSpeed)) * (1 + driftAmount * 0.65);
+  const supportedYaw = clamp(state.angularVelocity, -yawLimit, yawLimit);
+  state.angularVelocity += (supportedYaw - state.angularVelocity) * (1 - Math.exp(-step * 12));
   const inertialVx = forwardX * forwardSpeed + rightX * lateralSpeed;
   const inertialVy = forwardY * forwardSpeed + rightY * lateralSpeed;
   state.angle = angleWrap((Number(state.angle) || 0) + state.angularVelocity * step);
@@ -201,9 +219,10 @@ export function applyDriveModel(state, input, physics, dt, modifiers = {}) {
   const gripBase = lateralGrip * gripMultiplier;
   const driftGripRetention = 1 - driftAmount * (counterSteering ? 0.28 : 0.52);
   const controlledGrip = gripBase * Math.max(0.12, driftGripRetention)
-    * (counterSteering ? 1 + (driftControl - 1) * 0.34 : 1);
+    * (counterSteering ? 1.15 + (driftControl - 1) * 0.34 : 1);
   const lateralDamping = 1 - Math.exp(-controlledGrip * brakeGripMultiplier * step);
-  lateralSpeed *= 1 - lateralDamping;
+  const lateralCorrection = clamp(lateralSpeed * lateralDamping, -lateralAccelerationLimit * step, lateralAccelerationLimit * step);
+  lateralSpeed -= lateralCorrection;
 
   const transferFactor = modifiers.smoothSteer && changedDirection ? 0.68 : 1;
   const driftCornerRelief = 1 - driftAmount * 0.34;

@@ -293,7 +293,9 @@
       <button type="button" data-action="recover-host" class="nfs-btn nfs-btn--danger"><i class="fas fa-screwdriver-wrench"></i> {{recoverHostLabel}}</button>
       {{/if}}
       {{#if isLobbyRacing}}
+      {{#if canResumeRace}}
       <button type="button" data-action="resume-race" class="nfs-btn nfs-btn--primary"><i class="fas fa-eye"></i> Вернуться к гонке</button>
+      {{/if}}
       {{else}}
         {{#if isLobbyResults}}
         <button type="button" data-action="resume-race" class="nfs-btn nfs-btn--primary"><i class="fas fa-trophy"></i> Открыть результаты</button>
@@ -316,6 +318,7 @@
 
   {{#if isRace}}
   <main class="nfs-race-stage">
+    <div class="nfs-network-status" data-network-status role="status" aria-live="polite" hidden></div>
     <canvas data-race-canvas tabindex="0" aria-label="Гоночная трасса"></canvas>
     <div class="nfs-input-status" data-race-focus role="button" tabindex="-1" aria-hidden="true"><i class="fas fa-keyboard"></i><span>Управление неактивно. Щёлкните, чтобы продолжить</span></div>
 
@@ -387,7 +390,7 @@
       <span><i class="fas fa-wrench"></i> пит-лейн: 60 км/ч, остановитесь в голубой зоне</span>
     </div>
 
-    <button type="button" class="nfs-race-exit" data-action="abandon-race"><i class="fas fa-flag"></i> Завершить</button>
+    <button type="button" class="nfs-race-exit" data-action="abandon-race"><i class="fas fa-flag"></i> {{raceExitLabel}}</button>
   </main>
   {{/if}}
 

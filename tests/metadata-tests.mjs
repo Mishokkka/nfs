@@ -22,8 +22,6 @@ assert.match(readme, new RegExp(`${constants.INPUT_KEEPALIVE_MS} мс`));
 assert.match(readme, /0,8 секунды/);
 assert.match(readme, new RegExp(`Протокол версии ${constants.PROTOCOL_VERSION}`));
 assert.doesNotMatch(css, /padding:\s*0\s*!important|overflow:\s*hidden\s*!important/);
-assert.ok((runtime.match(/!this\.practice\s*&&\s*this\.network\.isHost\s*&&/g) ?? []).length >= 3,
-  "authoritative snapshot sends must explicitly check network.isHost");
 assert.match(worker, /postMessage\(\s*\{\s*type:\s*"finished"[\s\S]*?clearClockTimer\(\)/,
   "worker must stop its clock after publishing the final snapshot");
 
