@@ -8,7 +8,7 @@ import {
   wallSegmentActiveRange
 } from "./track.js";
 import { LocalPrediction } from "./netcode/local-prediction.js";
-import { VehicleSprites } from "./rendering/vehicle-sprites.js";
+import { VehicleSprites, REAR_CORE_X } from "./rendering/vehicle-sprites.js";
 import { TrackArt } from "./rendering/track-art.js";
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 const angleDelta = (target, current) => Math.atan2(Math.sin(target - current), Math.cos(target - current));
@@ -1982,15 +1982,17 @@ export class RaceRenderer {
   /** Draw cached chassis art; only temporary boost, heat and ram stay dynamic. */
   #drawCar(ctx, car, now) {
     ctx.save(); ctx.translate(car.x, car.y); ctx.rotate(car.angle);
+    const bodyScale = clamp(Number(car.appearance?.halfLength) || 26, 18, 36) / 28;
+    const coreX = REAR_CORE_X * bodyScale;
     if (car.id === this.localCarId) ctx.drawImage(this.vehicleSprites.halo, -38, -28, 76, 56);
     if (car.boost && !car.disabled) {
       const length = 44 + (0.5 + 0.5 * Math.sin(now * 0.026)) * 14;
-      ctx.drawImage(this.vehicleSprites.flame, -23 - length, -13, length, 26);
+      ctx.drawImage(this.vehicleSprites.flame, coreX - 4 * bodyScale - length, -13, length, 26);
     }
     ctx.drawImage(this.vehicleSprites.get(car), -44, -32, 88, 64);
     if (car.heat > 82 && !car.disabled) {
-      const coreX = -15 * (car.appearance?.halfLength ?? 26) / 28;
-      ctx.drawImage(this.vehicleSprites.hotCore, coreX - 9, -9, 18, 18);
+      const glowSize = 18 * bodyScale;
+      ctx.drawImage(this.vehicleSprites.hotCore, coreX - glowSize / 2, -glowSize / 2, glowSize, glowSize);
     }
     if (car.ram && !car.disabled) {
       const x = (car.appearance?.halfLength ?? 26) * 0.85;
