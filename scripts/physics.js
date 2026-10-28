@@ -168,6 +168,9 @@ export function deriveCarPhysics(resolved) {
   };
 }
 
+/** Resolve a build once into static presentation and prediction parameters.
+ * Body proportions use the same physical dimensions as the collision capsule.
+ */
 export function buildRaceCarMeta(entry, index = 0) {
   const resolved = resolveBuild(entry?.build);
   const physics = deriveCarPhysics(resolved);
@@ -177,6 +180,7 @@ export function buildRaceCarMeta(entry, index = 0) {
     name: String(entry?.name || `Болид ${index + 1}`).trim().slice(0, 80),
     driverName: String(entry?.build?.driver?.name || entry?.name || `Гонщик ${index + 1}`).trim().slice(0, 80),
     color: String(entry?.color || CAR_COLORS[index % CAR_COLORS.length]).slice(0, 32),
+    appearance: { frame: resolved.build.frame, number: index + 1, halfLength: physics.collisionHalfLength, halfWidth: physics.collisionHalfWidth },
     maxHealth: physics.maxHealth,
     maxCharge: physics.maxCharge,
     heatWarning: Boolean(resolved.traits.heatWarning),
@@ -250,6 +254,7 @@ export class RaceSimulation {
       resolved,
       physics,
       prediction: buildRaceCarMeta(entry, index).prediction,
+      appearance: { frame: resolved.build.frame, number: index + 1, halfLength: physics.collisionHalfLength, halfWidth: physics.collisionHalfWidth },
       color: entry.color ?? CAR_COLORS[index % CAR_COLORS.length],
       isBot: Boolean(entry.isBot),
       botSkill,
@@ -1538,6 +1543,7 @@ export class RaceSimulation {
         startBoostTimer: car.startBoostTimer,
         burstTimer: car.burstTimer,
         prediction: car.prediction,
+        appearance: car.appearance,
         health: car.health,
         maxHealth: car.physics.maxHealth,
         charge: car.charge,

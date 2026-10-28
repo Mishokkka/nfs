@@ -22,6 +22,7 @@ const crcTable = Array.from({ length: 256 }, (_, index) => {
   for (let i = 0; i < 8; i++) value = value & 1 ? 0xedb88320 ^ (value >>> 1) : value >>> 1;
   return value >>> 0;
 });
+/** Return the unsigned ZIP CRC-32 for uncompressed file bytes. */
 const crc32 = (data) => {
   let crc = 0xffffffff;
   for (const byte of data) crc = crcTable[(crc ^ byte) & 255] ^ (crc >>> 8);

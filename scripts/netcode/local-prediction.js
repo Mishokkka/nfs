@@ -24,8 +24,12 @@ export class LocalPrediction {
     this.horizon = 0;
     this.blocked = false;
     this.state = null;
+    this.displayedState = null;
+    this.contactBlocked = false;
+    this.contactClearAt = null;
   }
 
+  /** Record an owning client's command on its monotonic clock; cap outage memory. */
   submit(input, sequence, at = performance.now()) {
     const last = this.history.at(-1);
     if (last && sequence <= last.sequence) return;
@@ -33,6 +37,7 @@ export class LocalPrediction {
     if (this.history.length > MAX_HISTORY) this.history.splice(0, this.history.length - MAX_HISTORY);
   }
 
+  /** Rebuild physical state from a snapshot, replaying only input beyond its ACK. */
   #replay(authority, snapshot, now, clockOffset, receivedAt, maxHorizon, pit) {
     const sourceTime = Number(snapshot.simulationTime ?? snapshot.time) || 0;
     const mapped = Number.isFinite(clockOffset);
@@ -69,36 +74,67 @@ export class LocalPrediction {
     return { state, horizon };
   }
 
+  /** Keep brief wall-contact fluctuations from alternating between two timelines. */
+  #updateContact(timer, now) {
+    if (timer > 0.02) {
+      this.contactBlocked = true;
+      this.contactClearAt = null;
+    } else if (this.contactBlocked) {
+      if (timer < 0.005) {
+        this.contactClearAt ??= now;
+        if (now - this.contactClearAt >= 100) this.contactBlocked = false;
+      } else this.contactClearAt = null;
+    }
+  }
+
+  /** Rebase only the displayed pose; teleports and pit transitions stay authoritative. */
+  #correctVisual(from, target, contact = false) {
+    const errorX = from.x - target.x, errorY = from.y - target.y;
+    this.error = Math.hypot(errorX, errorY);
+    this.correctionTime = contact ? 0.05 : clamp(0.08 + this.error / 550, 0.08, 0.32);
+    const discontinuity = from.pitState !== target.pitState || this.error > 260;
+    this.offset = discontinuity ? { x: 0, y: 0, angle: 0 } : {
+      x: clamp(errorX, -180, 180), y: clamp(errorY, -180, 180),
+      angle: clamp(angleDelta(from.angle, target.angle), -0.7, 0.7)
+    };
+  }
+
+  /** Sample local presentation without feeding its correction back into physics.
+   * Wall contact switches smoothly in both directions; terminal states snap to
+   * authority so service, retirement and respawn do not retain speculative motion.
+   */
   sample(authority, snapshot, { now, clockOffset, receivedAt = now, maxHorizon = 0.25, pit = {} }) {
     const dt = this.lastAt == null ? 0 : clamp((now - this.lastAt) / 1000, 0, 0.25);
     const sourceTick = Number(snapshot.tick) || 0;
-    this.blocked = !snapshot.started || authority.finished || authority.disabled || authority.abandoned
-      || authority.isBot || authority.pitState === "service" || Number(authority.wallContactTimer) > 0.02;
-    if (this.blocked || !authority.prediction) {
+    const wasContactBlocked = this.contactBlocked;
+    this.#updateContact(Number(authority.wallContactTimer) || 0, now);
+    const terminal = !snapshot.started || authority.finished || authority.disabled || authority.abandoned
+      || authority.isBot || authority.pitState === "service";
+    this.blocked = Boolean(terminal || this.contactBlocked);
+    if (terminal || !authority.prediction) {
       this.authority = null;
       this.offset = { x: 0, y: 0, angle: 0 };
       this.state = { ...authority };
+      this.displayedState = this.state;
+      this.contactBlocked = false;
+      this.contactClearAt = null;
       this.lastAt = now;
       this.horizon = 0;
       this.error = 0;
       return this.state;
     }
-    const replay = this.#replay(authority, snapshot, now, clockOffset, receivedAt, maxHorizon, pit);
-    if (this.authority && sourceTick !== this.sourceTick) {
+    const replay = this.contactBlocked ? { state: { ...authority }, horizon: 0 }
+      : this.#replay(authority, snapshot, now, clockOffset, receivedAt, maxHorizon, pit);
+    if (this.displayedState && (wasContactBlocked !== this.contactBlocked
+      || (this.contactBlocked && sourceTick !== this.sourceTick))) {
+      this.#correctVisual(this.displayedState, replay.state, this.contactBlocked);
+    } else if (this.authority && sourceTick !== this.sourceTick) {
       const prior = this.#replay(this.authority.car, this.authority.snapshot, now, clockOffset, this.authority.receivedAt, maxHorizon, pit).state;
-      const errorX = prior.x + this.offset.x - replay.state.x;
-      const errorY = prior.y + this.offset.y - replay.state.y;
-      this.error = Math.hypot(errorX, errorY);
-      this.correctionTime = clamp(0.08 + this.error / 550, 0.08, 0.32);
-      const discontinuity = authority.pitState !== this.authority.car.pitState || this.error > 260;
-      this.offset = discontinuity ? { x: 0, y: 0, angle: 0 } : {
-        x: clamp(errorX, -180, 180), y: clamp(errorY, -180, 180),
-        angle: clamp(angleDelta(prior.angle + this.offset.angle, replay.state.angle), -0.7, 0.7)
-      };
+      this.#correctVisual({ ...prior, x: prior.x + this.offset.x, y: prior.y + this.offset.y, angle: prior.angle + this.offset.angle }, replay.state);
     }
     const decay = Math.exp(-dt / this.correctionTime);
     for (const key of ["x", "y", "angle"]) this.offset[key] *= decay;
-    this.authority = { car: authority, snapshot, receivedAt };
+    this.authority = this.contactBlocked ? null : { car: authority, snapshot, receivedAt };
     this.sourceTick = sourceTick;
     this.lastAt = now;
     this.horizon = replay.horizon;
@@ -109,6 +145,7 @@ export class LocalPrediction {
     let keep = 0;
     for (let i = 0; i < this.history.length; i++) if (this.history[i].sequence <= ack) keep = i;
     if (keep > 0) this.history.splice(0, keep);
-    return { ...replay.state, x: replay.state.x + this.offset.x, y: replay.state.y + this.offset.y, angle: replay.state.angle + this.offset.angle };
+    this.displayedState = { ...replay.state, x: replay.state.x + this.offset.x, y: replay.state.y + this.offset.y, angle: replay.state.angle + this.offset.angle };
+    return this.displayedState;
   }
 }

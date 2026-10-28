@@ -116,6 +116,7 @@ function boundedStringArray(value, limit = 80) {
     && value.every((entry) => boundedString(entry, limit));
 }
 
+/** Validate the fixed 39-field protocol-14 row before reading positional fields. */
 function compactRaceRowFitsSchema(row) {
   if (!Array.isArray(row) || row.length !== 39 || !boundedString(row[0], 80)) return false;
   for (let index = 1; index < row.length; index += 1) {
@@ -200,6 +201,7 @@ function serializedLengthWithin(message, limit) {
   }
 }
 
+/** Bound control messages by declared keys, required strings and serialized size. */
 function smallMessageFitsSchema(message, schema) {
   const allowed = new Set([...MESSAGE_META_FIELDS, ...schema.required]);
   if (!Object.keys(message).every((key) => allowed.has(key))) return false;
@@ -315,6 +317,9 @@ function normalizeRaceEntries(rawEntries, raceId = "race") {
   return entries;
 }
 
+/** Merge bounded host statistics with validated builds. Appearance and collider
+ * dimensions always come from the build, never from arbitrary cosmetic metadata.
+ */
 function normalizeCarMeta(rawMeta, entries) {
   const byId = new Map((Array.isArray(rawMeta) ? rawMeta.slice(0, MAX_RACE_ENTRIES * 2) : []).map((meta) => [String(meta?.id ?? ""), meta]));
   return entries.map((entry, index) => {
@@ -328,6 +333,7 @@ function normalizeCarMeta(rawMeta, entries) {
       color: String(source?.color ?? fallback.color).slice(0, 32),
       maxHealth: rounded(source?.maxHealth, 2, fallback.maxHealth, 1, 100000),
       maxCharge: rounded(source?.maxCharge, 2, fallback.maxCharge, 1, 100000),
+      appearance: fallback.appearance,
       heatWarning: Boolean(source?.heatWarning ?? fallback.heatWarning),
       prediction: {
         mass: rounded(source?.prediction?.mass, 2, fallback.prediction.mass, 100, 10000),
@@ -359,6 +365,9 @@ function normalizeCarMeta(rawMeta, entries) {
   });
 }
 
+/** Normalize dynamic state only for the current race's known cars; static data
+ * is hydrated separately so repeated snapshots do not carry chassis definitions.
+ */
 function normalizeRaceFrame(raw, race) {
   if (!raw || typeof raw !== "object" || !race) return null;
   const known = new Set((race.carMeta ?? []).map((meta) => meta.id));
@@ -438,6 +447,9 @@ function normalizeRaceFrame(raw, race) {
 const PIT_STATE_TO_CODE = Object.freeze({ track: 0, entering: 1, service: 2, exit: 3 });
 const PIT_CODE_TO_STATE = Object.freeze(["track", "entering", "service", "exit"]);
 
+/** Pack validated state into protocol-14 rows, retaining input ACKs and all
+ * deterministic motion state needed by prediction without duplicating metadata.
+ */
 function encodeNormalizedFrame(frame) {
   if (!frame) return null;
   return {
@@ -499,6 +511,7 @@ function encodeNormalizedFrame(frame) {
   };
 }
 
+/** Decode compact or object-shaped frames through the same race normalization. */
 function decodeRaceFrame(raw, race) {
   if (!raw || typeof raw !== "object") return null;
   if (!Array.isArray(raw.v)) return normalizeRaceFrame(raw, race);

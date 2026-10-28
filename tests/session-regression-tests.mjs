@@ -265,4 +265,37 @@ const setup = () => {
   app.shutdown(); host.destroy(); returning.destroy();
 }
 
-console.log("session-regression-tests: ok (recovery, coalescing, isolation, garage, worker authority, reordered reconnect)");
+// Leaving is a persistent choice while the user browses Garage/Lobby. Only an
+// explicit Resume action may bring the same retired driver back as a spectator.
+{
+  const { host, player } = setup();
+  const beforeUser = game.user;
+  game.user = users.get("player");
+  const simulation = new RaceSimulation({ track: generateTrack(88201, 2), entries: host.activeRace.entries });
+  host.on("leaveRace", message => { simulation.handToBot(message.carId); host.sendSnapshot(simulation.snapshot()); });
+  const app = new BigRacesApp(player);
+  const events = new Map();
+  app.element = { querySelector: () => null, addEventListener: (type, fn) => events.set(type, fn), contains: () => true };
+  for (const fn of player.handlers.start) fn(player.activeRace);
+  await app._onRender({}, {});
+  const click = async action => {
+    const button = { dataset: { action } };
+    events.get("click")({ target: { closest: () => button }, preventDefault() {} });
+    await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+  };
+  const raceId = player.raceId;
+  await click("abandon-race");
+  assert.equal(app.dismissedRaceId, raceId);
+  assert.equal(app.screen, "lobby");
+  await click("show-garage");
+  advance(300);
+  await click("show-lobby");
+  assert.equal(app.screen, "lobby", "a state reply reopened a race the user left");
+  advance(300);
+  await click("resume-race");
+  assert.equal(app.screen, "race");
+  assert.equal(app.runtime.localCarId, null, "resuming an abandoned car restored manual ownership");
+  app.shutdown(); host.destroy(); player.destroy(); game.user = beforeUser;
+}
+
+console.log("session-regression-tests: ok (recovery, coalescing, isolation, garage, worker authority, reordered reconnect, explicit spectator resume)");

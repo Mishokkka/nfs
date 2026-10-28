@@ -8,9 +8,12 @@ import {
   wallSegmentActiveRange
 } from "./track.js";
 import { LocalPrediction } from "./netcode/local-prediction.js";
+import { VehicleSprites } from "./rendering/vehicle-sprites.js";
+import { TrackArt } from "./rendering/track-art.js";
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 const angleDelta = (target, current) => Math.atan2(Math.sin(target - current), Math.cos(target - current));
 const smoothingFactor = (dt, timeConstant) => 1 - Math.exp(-Math.max(0, dt) / Math.max(0.001, timeConstant));
+/** Format nonnegative centiseconds; missing lap times stay visibly unknown. */
 const formatRaceTime = (seconds) => {
   if (!Number.isFinite(seconds)) return "—";
   const totalCentiseconds = Math.max(0, Math.round(seconds * 100));
@@ -208,6 +211,8 @@ export class RaceRenderer {
       initialized: false
     };
 
+    this.art = new TrackArt(this.track);
+    this.vehicleSprites = new VehicleSprites();
     this.trackPath = this.#buildTrackPath(this.track.samples, true);
     this.pitPath = this.#buildTrackPath(this.track.pit?.samples ?? [], false);
     this.runoffSurfacePaths = this.#buildRunoffSurfacePaths(this.track.samples, this.track.width, true);
@@ -316,6 +321,9 @@ export class RaceRenderer {
       renderDelayMs: this.networkRenderDelay * 1000,
       rttMs: this.networkTiming?.rttMs ?? null,
       snapshotAgeMs: Math.max(0, performance.now() - this.snapshotAt),
+      vehicleSpriteCacheSize: this.vehicleSprites.bodies.size,
+      vehicleSpriteHits: this.vehicleSprites.hits,
+      vehicleSpritesGenerated: this.vehicleSprites.generated,
       labelCacheSize: this.labelCache.size,
       labelCacheHits: this.labelCacheHits,
       labelCacheMisses: this.labelCacheMisses,
@@ -664,6 +672,9 @@ export class RaceRenderer {
     }
   }
 
+  /** Cancel presentation work and release static tiles, labels and chassis art.
+   * Repeated teardown is safe when a window closes during an asynchronous resize.
+   */
   destroy() {
     if (this.destroyed) return;
     this.destroyed = true;
@@ -678,6 +689,8 @@ export class RaceRenderer {
     // can leave several 2K textures alive between races in Chromium/Electron.
     // Shrinking every store releases that memory immediately.
     this.#clearLabelCache();
+    this.vehicleSprites.destroy();
+    this.art.destroy();
     this.presentationCars.clear();
     this.activePresentationIds.clear();
     this.blendedCars.length = 0;
@@ -947,9 +960,9 @@ export class RaceRenderer {
   #drawBoundaryWallGeometry(ctx, geometry) {
     if (!geometry) return;
     const layers = [
-      { color: "#292725", width: 10, alpha: 1 },
-      { color: "#aaa497", width: 4, alpha: 1 },
-      { color: "rgba(238, 227, 196, 0.72)", width: 1.5, alpha: 0.92, dash: [18, 12] }
+      { color: "#17252b", width: 10, alpha: 1 },
+      { color: "#9faeaa", width: 4, alpha: 1 },
+      { color: "#e9e9d4bd", width: 1.5, alpha: 0.92, dash: [18, 12] }
     ];
     ctx.save();
     ctx.lineCap = "round";
@@ -1054,10 +1067,13 @@ export class RaceRenderer {
     const ctx = this.backgroundContext;
     if (!ctx) return;
     const gradient = ctx.createRadialGradient(width * 0.5, height * 0.42, 10, width * 0.5, height * 0.5, Math.max(width, height));
-    gradient.addColorStop(0, "#312b24");
-    gradient.addColorStop(1, "#12100e");
+    gradient.addColorStop(0, this.art.palette.light);
+    gradient.addColorStop(1, this.art.palette.ground);
     ctx.fillStyle = gradient;
     ctx.fillRect(0, 0, width, height);
+    if (this.art.ground) {
+      ctx.globalAlpha = 0.18; ctx.fillStyle = this.art.ground; ctx.fillRect(0, 0, width, height); ctx.globalAlpha = 1;
+    }
   }
 
   #blendSnapshots(previous, current, alpha) {
@@ -1698,9 +1714,9 @@ export class RaceRenderer {
     // the committed pit lane its width collapses to zero, so the same perimeter
     // wall visibly converges onto the asphalt edge.
     const surfaceFills = {
-      grass: "#45552f",
-      sand: "#a88a58",
-      gravel: "#706d64"
+      grass: this.art.palette.grass,
+      sand: "#b09a6d",
+      gravel: "#737e78"
     };
     for (const type of ["grass", "sand", "gravel"]) {
       ctx.fillStyle = surfaceFills[type];
@@ -1709,33 +1725,11 @@ export class RaceRenderer {
     }
     this.#drawRunoffTextures(ctx);
 
-    // Paint the branch first. Its shared beginning is hidden by the main road;
-    // as the centreline separates, the pit lane appears as a gradual fork.
-    if (this.track.pit?.samples?.length) {
-      ctx.strokeStyle = "#756d5d";
-      ctx.lineWidth = this.track.pit.width + 8;
-      ctx.stroke(this.pitPath);
-      ctx.strokeStyle = "#9b927f";
-      ctx.lineWidth = this.track.pit.width;
-      ctx.stroke(this.pitPath);
-      ctx.strokeStyle = "rgba(238, 221, 167, 0.68)";
-      ctx.lineWidth = 2;
-      ctx.setLineDash([10, 12]);
-      ctx.stroke(this.pitPath);
-      ctx.setLineDash([]);
-    }
-
-    ctx.strokeStyle = "#5c5246";
-    ctx.lineWidth = this.track.width + 10;
-    ctx.stroke(this.trackPath);
-    ctx.strokeStyle = "#b09a72";
-    ctx.lineWidth = this.track.width;
-    ctx.stroke(this.trackPath);
-    ctx.strokeStyle = "rgba(54, 41, 28, 0.34)";
-    ctx.lineWidth = 3;
-    ctx.setLineDash([18, 22]);
-    ctx.stroke(this.trackPath);
-    ctx.setLineDash([]);
+    // Existing tile caches own all surface detail; paint the branch first so
+    // the main road still masks the shared entry geometry.
+    if (this.track.pit?.samples?.length) this.art.paintRoad(ctx, this.pitPath, this.track.pit.width, true);
+    this.art.paintRoad(ctx, this.trackPath, this.track.width);
+    this.art.paintMarkings(ctx);
 
     // The circuit-side wall opens exactly where the pit branch diverges and
     // rejoins. The outer pit wall replaces it continuously; the inner pit wall
@@ -1748,11 +1742,13 @@ export class RaceRenderer {
       ctx.translate(service.x, service.y);
       ctx.rotate(Math.atan2(service.ty, service.tx));
       const serviceHalfLength = Number(this.track.pit.serviceHalfLength ?? 52);
-      ctx.fillStyle = "rgba(38, 118, 137, 0.45)";
+      ctx.fillStyle = "rgba(38, 118, 137, 0.60)";
       ctx.fillRect(-serviceHalfLength, -this.track.pit.width * 0.48, serviceHalfLength * 2, this.track.pit.width * 0.96);
       ctx.strokeStyle = "rgba(144, 230, 247, 0.85)";
       ctx.lineWidth = 3;
       ctx.strokeRect(-serviceHalfLength, -this.track.pit.width * 0.48, serviceHalfLength * 2, this.track.pit.width * 0.96);
+      ctx.font = "bold 13px Arial, sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+      ctx.fillStyle = "#d7f6efc0"; ctx.fillText("PIT", 0, 0);
       ctx.restore();
     }
 
@@ -1765,16 +1761,15 @@ export class RaceRenderer {
     const half = this.track.width * 0.48;
     const squares = 10;
     const squareWidth = (half * 2) / squares;
-    for (let i = 0; i < squares; i += 1) {
-      const offset = -half + squareWidth * (i + 0.5);
-      ctx.fillStyle = i % 2 === 0 ? "#eee4cb" : "#2a2621";
-      ctx.save();
-      ctx.translate(start.x + start.nx * offset, start.y + start.ny * offset);
-      ctx.rotate(Math.atan2(start.ty, start.tx));
-      ctx.fillRect(-7, -squareWidth / 2, 14, squareWidth);
-      ctx.restore();
+    ctx.save();
+    ctx.translate(start.x, start.y); ctx.rotate(Math.atan2(start.ty, start.tx));
+    for (let row = 0; row < 2; row++) for (let i = 0; i < squares; i++) {
+      ctx.fillStyle = (i + row) % 2 === 0 ? "#eeeede" : "#17242c";
+      ctx.fillRect(-7 + row * 7, -half + i * squareWidth, 7, squareWidth);
     }
+    ctx.restore();
   }
+
 
   #drawScenery(ctx) {
     const obstacles = this.track.scenery ?? [];
@@ -1984,67 +1979,27 @@ export class RaceRenderer {
     if (local) this.#drawCar(ctx, local, now);
   }
 
+  /** Draw cached chassis art; only temporary boost, heat and ram stay dynamic. */
   #drawCar(ctx, car, now) {
-    ctx.save();
-    ctx.translate(car.x, car.y);
-    ctx.rotate(car.angle);
-
-    if (car.id === this.localCarId) {
-      ctx.fillStyle = "rgba(255, 236, 164, 0.14)";
-      ctx.beginPath();
-      ctx.ellipse(0, 0, 31, 22, 0, 0, Math.PI * 2);
-      ctx.fill();
-    }
-
+    ctx.save(); ctx.translate(car.x, car.y); ctx.rotate(car.angle);
+    if (car.id === this.localCarId) ctx.drawImage(this.vehicleSprites.halo, -38, -28, 76, 56);
     if (car.boost && !car.disabled) {
-      const pulse = 0.5 + 0.5 * Math.sin(now * 0.026 + car.x * 0.01);
-      const length = 40 + pulse * 11;
-      ctx.fillStyle = "rgba(75, 205, 243, 0.46)";
-      ctx.beginPath();
-      ctx.moveTo(-15, -9);
-      ctx.lineTo(-15 - length, 0);
-      ctx.lineTo(-15, 9);
-      ctx.closePath();
-      ctx.fill();
-      ctx.fillStyle = "rgba(184, 246, 255, 0.88)";
-      ctx.beginPath();
-      ctx.moveTo(-14, -4);
-      ctx.lineTo(-35 - pulse * 8, 0);
-      ctx.lineTo(-14, 4);
-      ctx.closePath();
-      ctx.fill();
+      const length = 44 + (0.5 + 0.5 * Math.sin(now * 0.026)) * 14;
+      ctx.drawImage(this.vehicleSprites.flame, -23 - length, -13, length, 26);
     }
-
-    ctx.fillStyle = car.disabled ? "#393633" : car.color;
-    ctx.strokeStyle = car.ram ? "#fff0aa" : "#171411";
-    ctx.lineWidth = car.ram ? 4 : 3;
-    ctx.beginPath();
-    ctx.moveTo(24, 0);
-    ctx.lineTo(9, -13);
-    ctx.lineTo(-15, -12);
-    ctx.lineTo(-23, -6);
-    ctx.lineTo(-23, 6);
-    ctx.lineTo(-15, 12);
-    ctx.lineTo(9, 13);
-    ctx.closePath();
-    ctx.fill();
-    ctx.stroke();
-
-    ctx.fillStyle = car.heat > 82 ? "#ff754d" : "#a8ebff";
-    ctx.beginPath();
-    ctx.arc(-1, 0, 6, 0, Math.PI * 2);
-    ctx.fill();
-
-    ctx.fillStyle = "#15120f";
-    ctx.fillRect(-12, -15, 8, 5);
-    ctx.fillRect(9, -15, 8, 5);
-    ctx.fillRect(-12, 10, 8, 5);
-    ctx.fillRect(9, 10, 8, 5);
+    ctx.drawImage(this.vehicleSprites.get(car), -44, -32, 88, 64);
+    if (car.heat > 82 && !car.disabled) {
+      const coreX = -15 * (car.appearance?.halfLength ?? 26) / 28;
+      ctx.drawImage(this.vehicleSprites.hotCore, coreX - 9, -9, 18, 18);
+    }
+    if (car.ram && !car.disabled) {
+      const x = (car.appearance?.halfLength ?? 26) * 0.85;
+      const y = (car.appearance?.halfWidth ?? 14) * 0.8;
+      ctx.strokeStyle = "#ffe8a2"; ctx.lineWidth = 2.6;
+      ctx.beginPath(); ctx.moveTo(x - 3, -y); ctx.lineTo(x, 0); ctx.lineTo(x - 3, y); ctx.stroke();
+    }
     ctx.restore();
   }
-
-
-
 
   #drawCarLabels(ctx, cars, width, height, worldScale) {
     const verticalOffset = 31 * this.outputScale;

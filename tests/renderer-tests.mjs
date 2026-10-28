@@ -67,7 +67,56 @@ globalThis.document = { createElement: () => {
 
 const { generateTrack } = await import(pathToFileURL(path.join(root, "scripts/track.js")).href);
 const { RaceRenderer } = await import(pathToFileURL(path.join(root, "scripts/renderer.js")).href);
+const { VehicleSprites } = await import(pathToFileURL(path.join(root, "scripts/rendering/vehicle-sprites.js")).href);
+const { TrackArt } = await import(pathToFileURL(path.join(root, "scripts/rendering/track-art.js")).href);
 const track = generateTrack("renderer-countdown", 2);
+
+// Continuous telemetry must not allocate paint. Only three discrete damage
+// variants can exist for each of the twelve cars, with a hard LRU memory bound.
+{
+  const sprites = new VehicleSprites();
+  const frames = ["arrow", "spider", "keel", "bull", "turtle", "allantry"];
+  const bodies = [];
+  for (let i = 0; i < 12; i++) {
+    const car = { color: "#6ab", health: 100, maxHealth: 100,
+      appearance: { frame: frames[i % 6], number: i + 1, halfLength: 26, halfWidth: 14 } };
+    for (const damage of [{}, { health: 24 }, { disabled: true }]) {
+      const first = sprites.get({ ...car, ...damage });
+      bodies.push(first);
+      const before = createdCanvasCount;
+      for (let tick = 0; tick < 30; tick++) {
+        assert.equal(sprites.get({ ...car, ...damage, x: tick * 10, angle: tick * .03,
+          place: 1 + tick % 12, heat: tick * 3, boost: Boolean(tick % 2), ram: true }), first);
+      }
+      assert.equal(createdCanvasCount, before, "continuous state rebuilt a chassis canvas");
+    }
+  }
+  assert.equal(sprites.bodies.size, 36);
+  assert.equal(sprites.generated, 36);
+  assert.ok(bodies.reduce((pixels, canvas) => pixels + canvas.width * canvas.height, 0) * 4 < 3_250_000,
+    "body sprites exceeded their 3.25 MB RGBA budget");
+  sprites.get({ color: "invalid-color", health: 100, maxHealth: 100 });
+  assert.equal(sprites.bodies.size, 36, "cache grew beyond twelve cars with three damage states");
+  assert.equal(bodies[0].width, 1, "evicted backing store was not released");
+  const shared = [sprites.halo, sprites.flame, sprites.hotCore];
+  sprites.destroy(); sprites.destroy();
+  assert.equal(sprites.bodies.size, 0);
+  for (const canvas of [...bodies, ...shared]) assert.equal(canvas.width * canvas.height, 1);
+
+  const art = new TrackArt(track);
+  const sources = art.canvases.slice();
+  assert.equal(sources.length, 2);
+  const before = createdCanvasCount;
+  for (let i = 0; i < 20; i++) {
+    art.paintRoad(makeContext(), new Path2D(), track.width);
+    art.paintMarkings(makeContext());
+  }
+  assert.equal(createdCanvasCount, before, "static painting allocated another texture");
+  art.destroy(); art.destroy();
+  for (const canvas of sources) assert.equal(canvas.width * canvas.height, 1);
+  assert.equal(art.asphalt, null);
+  assert.equal(art.grid, null);
+}
 
 
 // Network reconciliation must remain continuous. Reintroducing a fixed fraction
@@ -177,7 +226,13 @@ const track = generateTrack("renderer-countdown", 2);
   assert.equal(afterOvertake.labelCacheMisses, afterFirstLabel.labelCacheMisses, "rank changes must not allocate another label canvas");
   assert.equal(afterOvertake.labelCacheSize, afterFirstLabel.labelCacheSize);
   assert.ok(afterOvertake.labelCacheHits >= 2);
+  assert.equal(afterOvertake.vehicleSpritesGenerated, afterFirstLabel.vehicleSpritesGenerated,
+    "overtaking rebuilt chassis paint");
+  assert.ok(afterOvertake.vehicleSpriteHits >= 2);
+  const artSources = [...renderer.art.canvases, ...renderer.vehicleSprites.bodies.values(),
+    renderer.vehicleSprites.halo, renderer.vehicleSprites.flame, renderer.vehicleSprites.hotCore];
   renderer.destroy();
+  for (const canvas of artSources) assert.equal(canvas.width * canvas.height, 1);
 }
 
 

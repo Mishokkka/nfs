@@ -43,6 +43,7 @@ export class BigRacesApp extends HandlebarsApplicationMixin(ApplicationV2) {
     this.joinPending = false;
     this.resumeRequested = false;
     this.viewingNetworkRace = false;
+    this.dismissedRaceId = null;
     this.tooltips = new TooltipController();
     this.runtime = new RaceRuntime({
       network,
@@ -105,8 +106,12 @@ export class BigRacesApp extends HandlebarsApplicationMixin(ApplicationV2) {
       && this.runtime.currentRaceId === this.network.raceId;
   }
 
+  /** Present only intended sessions. Leaving a race suppresses state replies for
+   * that race until explicit resume, while a different race can still be joined.
+   */
   #shouldPresentRace(race) {
     if (this.runtime.practice) return false;
+    if (race?.raceId === this.dismissedRaceId && !this.resumeRequested && !this.viewingNetworkRace) return false;
     return this.resumeRequested || this.viewingNetworkRace
       || Boolean(race?.controlAssignments?.[game.user.id] && this.network.participant);
   }
@@ -358,6 +363,7 @@ export class BigRacesApp extends HandlebarsApplicationMixin(ApplicationV2) {
       yes: { label: "Передать болид" }, no: { label: "Остаться" }, rejectClose: false, modal: true
     }))) return;
     this.viewingNetworkRace = false;
+    this.dismissedRaceId = this.runtime.currentRaceId;
     this.runtime.sendNeutralInput();
     if (wasDriver) this.network.leaveRace(this.runtime.localCarId);
     this.runtime.stop();

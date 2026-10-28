@@ -39,6 +39,7 @@ globalThis.game = {
 const { PROTOCOL_VERSION } = await import(pathToFileURL(path.join(root, "scripts/constants.js")).href);
 const { cloneDefaultBuild } = await import(pathToFileURL(path.join(root, "scripts/catalog.js")).href);
 const { RaceNetwork, normalizeConfig } = await import(pathToFileURL(path.join(root, "scripts/network.js")).href);
+const { buildRaceCarMeta } = await import(pathToFileURL(path.join(root, "scripts/physics.js")).href);
 
 // Repeated startup and teardown must keep exactly one listener and heartbeat.
 {
@@ -111,13 +112,17 @@ const message = (payload) => ({
     entries: [
       { id: "car-player", userId: "player", name: "Player", build: cloneDefaultBuild(), isBot: false },
       { id: "car-host", userId: "host", name: "Host", build: cloneDefaultBuild(), isBot: false }
-    ]
+    ],
+    carMeta: [{ id: "car-player", appearance: { frame: "bull", number: 999, halfLength: 10000, halfWidth: 10000 } }]
   };
   socketHandler(message({ ...racePayload, senderId: "attacker" }));
   assert.equal(starts, 0);
   socketHandler(message({ ...racePayload, senderId: "host" }));
   assert.equal(starts, 1);
   const prediction = startedRace.carMeta[0].prediction;
+  const expectedAppearance = buildRaceCarMeta(startedRace.entries[0], 0).appearance;
+  assert.deepEqual(startedRace.carMeta[0].appearance, expectedAppearance,
+    "received cosmetics overrode the validated build or physical footprint");
   for (const key of ["lateralGrip", "longitudinalDrag", "rollingDrag", "spinResistance", "offroadGrip", "boostDrain", "heatRate", "cooling"]) {
     assert.ok(Number.isFinite(prediction[key]), `prediction metadata ${key} is missing`);
   }
@@ -142,6 +147,8 @@ const message = (payload) => ({
   socketHandler(message({ type: "race-frame", senderId: "host", lobbyId: "lobby-a", raceId: "race-a", sequence: 2, simulationTick: 10, frame }));
   assert.equal(snapshots, 1);
   assert.equal(network.lastSnapshot.cars[0].name, "Player");
+  assert.deepEqual(network.lastSnapshot.cars[0].appearance, expectedAppearance,
+    "remote snapshot lost the static chassis appearance");
   assert.ok(Number.isFinite(network.lastSnapshot.cars[0].maxHealth));
   socketHandler(message({ type: "race-frame", senderId: "host", lobbyId: "lobby-a", raceId: "race-a", sequence: 1, simulationTick: 9, frame: { ...frame, tick: 9 } }));
   assert.equal(snapshots, 1);

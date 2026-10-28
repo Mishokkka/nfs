@@ -81,6 +81,33 @@ const physics = { ...meta.prediction, maxHealth: meta.maxHealth, maxCharge: meta
   assert.ok(braking.vx >= 0, "braking launched the car backwards");
 }
 
+// Wall-contact gating must not move the car between the raw and predicted poses
+// in one frame. Exercise both transitions, threshold chatter and pit authority.
+{
+  const prediction = new LocalPrediction();
+  let previous = null, maximumStep = 0, blockedFrames = 0;
+  for (let index = 0; index < 80; index++) {
+    const now = 1000 + index * 1000 / 60;
+    const sourceTime = (1000 + Math.floor(index / 2) * 1000 / 30) / 1000 - 0.12;
+    const car = { ...initial(), x: sourceTime * 400, vx: 400,
+      wallContactTimer: index >= 8 && index < 24 ? (index % 4 < 2 ? 0.021 : 0.019) : 0,
+      prediction: { ...meta.prediction, longitudinalDrag: 0, rollingDrag: 0 } };
+    const displayed = prediction.sample(car, frame(car, Math.floor(index / 2), sourceTime), { now, clockOffset: 0 });
+    if (previous) maximumStep = Math.max(maximumStep, Math.abs(displayed.x - previous.x));
+    if (prediction.blocked) {
+      blockedFrames++;
+      assert.equal(prediction.state.x, car.x, "contact smoothing leaked into physical state");
+    }
+    previous = displayed;
+  }
+  assert.ok(blockedFrames >= 20, "contact gate chattered instead of waiting for stable clearance");
+  assert.ok(!prediction.blocked, "prediction did not resume after contact cleared");
+  assert.ok(maximumStep < 22, `wall contact caused a visible snap: ${maximumStep}`);
+  const serviced = { ...initial(), x: 2000, pitState: "service" };
+  const displayed = prediction.sample(serviced, frame(serviced, 90, 2), { now: 2200, clockOffset: 0 });
+  assert.equal(displayed.x, 2000, "pit service retained speculative motion");
+}
+
 // Deterministic latency/loss/reordering matrix, with the production drive core
 // advancing authority at 60 Hz and prediction receiving compact-like snapshots.
 const metrics = [];

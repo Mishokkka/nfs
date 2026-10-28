@@ -8,6 +8,10 @@ const TERRAIN_PROFILES = Object.freeze({
   sand: { accelerationLoss: 0.86, steeringLoss: 0.46, topSpeedLoss: 0.82, gripLoss: 0.34, yawGain: -0.18, dampingShift: 1.18, dragBase: 0.70, dragStrength: 5.20 }
 });
 
+/** Derive deterministic grip, drag and steering multipliers from the last known
+ * surface. Sand keeps crawl traction; grass loses more grip at high speed.
+ * Used by authority and prediction with the same normalized contact severity.
+ */
 export function terrainModifiers(car, physics, speed = null) {
   const p = physics ?? car?.physics ?? {};
   const effective = clamp((Number(car?.surfaceSeverity) || 0) / Math.max(1, Number(p.offroadGrip) || 1), 0, 1);
