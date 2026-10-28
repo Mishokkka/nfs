@@ -113,7 +113,8 @@ function velocityAtPoint(car, x, y) {
   };
 }
 const GLOBAL_SPEED_SCALE = 1.25;
-const GLOBAL_ACCELERATION_SCALE = 1.0;
+const GLOBAL_ACCELERATION_SCALE = 0.68;
+const GLOBAL_BRAKING_SCALE = 0.42;
 
 const PIT_WORDS = Object.freeze([
   "кристалл", "болид", "вираж", "скорость", "поршень", "шестерня", "искрение", "гонщик",
@@ -122,6 +123,10 @@ const PIT_WORDS = Object.freeze([
   "engine", "circuit", "driver", "traction", "coolant", "turbine", "chassis", "resonance"
 ]);
 
+/** Map normalized part/driver ratings to shared world-unit physics parameters.
+ * Engine and passive-loss scales preserve terminal speed while launch and
+ * service-brake strengths remain independent balance controls.
+ */
 export function deriveCarPhysics(resolved) {
   const { stats, traits, driverStats } = resolved;
   const reflexes = clamp(Number(driverStats.reflexes) || 1, 1, 6);
@@ -141,13 +146,15 @@ export function deriveCarPhysics(resolved) {
     maxSpeed: (260 + stats.speed * 30) * traits.topSpeed * (1 + (technique - 1) * 0.005) * GLOBAL_SPEED_SCALE,
     acceleration: (18 + stats.acceleration * 16) * (1 + (reflexes - 1) * 0.04) * GLOBAL_ACCELERATION_SCALE,
     reverseAcceleration: 58 * GLOBAL_ACCELERATION_SCALE,
-    braking: 245 * (1 + (reflexes - 1) * 0.03) * GLOBAL_SPEED_SCALE,
+    braking: 245 * (1 + (reflexes - 1) * 0.03) * GLOBAL_SPEED_SCALE * GLOBAL_BRAKING_SCALE,
     steerRate: (0.88 + stats.handling * 0.14) * (1 + (technique - 1) * 0.028),
     lateralGrip: (1.55 + stats.control * 0.42)
       * traits.cornerGrip
       * (1 + (technique - 1) * 0.016 + (composure - 1) * 0.022),
-    longitudinalDrag: 0.25,
-    rollingDrag: 16 * GLOBAL_SPEED_SCALE,
+    // Match passive losses to the softer engine: launch takes longer without
+    // quietly lowering the attainable top speed of low-torque builds.
+    longitudinalDrag: 0.25 * GLOBAL_ACCELERATION_SCALE,
+    rollingDrag: 16 * GLOBAL_SPEED_SCALE * GLOBAL_ACCELERATION_SCALE,
     mass,
     momentOfInertia,
     maxHealth: (55 + stats.durability * 14) * traits.durabilityMult,

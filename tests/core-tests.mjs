@@ -1322,7 +1322,9 @@ for (const scenario of [
     vy: 0,
     trackIndex: sampleIndex
   });
-  for (let tick = 0; tick < 210; tick += 1) {
+  // The moderated launch needs an extra second after emerging from deep sand;
+  // keep the same escape/usable-speed contract rather than boosting off-road power.
+  for (let tick = 0; tick < 270; tick += 1) {
     simulation.setInput(car.id, { ...neutralInput(), throttle: 1 });
     simulation.step(1 / 60);
   }

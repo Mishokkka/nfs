@@ -2,6 +2,18 @@ const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 const angleWrap = (angle) => Math.atan2(Math.sin(angle), Math.cos(angle));
 const dot = (ax, ay, bx, by) => ax * bx + ay * by;
 
+/** Shared tyre budget in world units/s². The HUD scale maps the unladen road
+ * ceiling to roughly 0.75–1.6 g; thrust/braking reserve some of that grip.
+ * The same base limit informs bot corner planning and client prediction.
+ */
+export function lateralAccelerationBudget(physics, gripMultiplier = 1, longitudinalAcceleration = 0) {
+  const grip = Math.max(0.01, Number(physics?.lateralGrip) || 1);
+  const base = clamp(105 + grip * 19, 125, 270);
+  const longitudinalLoad = clamp(Math.abs(longitudinalAcceleration)
+    / Math.max(1, (Number(physics?.braking) || 1) * 1.5), 0, 0.98);
+  return base * Math.max(0.01, gripMultiplier) * Math.sqrt(Math.max(0.18, 1 - longitudinalLoad * longitudinalLoad));
+}
+
 /**
  * Deterministic kinematic core shared by the authoritative simulation and the
  * remote client's local prediction. The caller owns race-specific resources,
@@ -195,9 +207,7 @@ export function applyDriveModel(state, input, physics, dt, modifiers = {}) {
   state.angularVelocity *= Math.exp(-(baseAngularDamping * driftDampingScale + counterDamping) * step);
   // A finite tyre-force budget makes fast corners open out. Acceleration and
   // braking consume part of that budget, so slowing before a turn matters.
-  const longitudinalLoad = clamp(Math.abs(acceleration) / Math.max(1, brakingPower * 1.5), 0, 0.98);
-  const combinedGrip = Math.sqrt(Math.max(0.18, 1 - longitudinalLoad * longitudinalLoad));
-  const lateralAccelerationLimit = (160 + lateralGrip * 65) * gripMultiplier * combinedGrip;
+  const lateralAccelerationLimit = lateralAccelerationBudget(p, gripMultiplier, acceleration);
   const yawLimit = lateralAccelerationLimit / Math.max(32, Math.abs(forwardSpeed)) * (1 + driftAmount * 0.65);
   const supportedYaw = clamp(state.angularVelocity, -yawLimit, yawLimit);
   state.angularVelocity += (supportedYaw - state.angularVelocity) * (1 - Math.exp(-step * 12));

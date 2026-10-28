@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import { cloneDefaultBuild, resolveBuild } from "../scripts/catalog.js";
-import { deriveCarPhysics, buildRaceCarMeta, neutralInput } from "../scripts/physics.js";
+import { deriveCarPhysics, buildRaceCarMeta, neutralInput, RaceSimulation } from "../scripts/physics.js";
 import { advanceCarMotion } from "../scripts/physics/car-motion.js";
+import { computeBotInput } from "../scripts/physics/bot-controller.js";
+import { generateTrack, sampleTrack, nearestTrackPoint } from "../scripts/track.js";
 
 const build = cloneDefaultBuild();
 const resolved = resolveBuild(build);
@@ -89,4 +91,63 @@ for (const event of ["boost-release", "thermal-lockout", "charge-empty", "grass-
   assert.ok(car.vx <= 60 / kmh);
 }
 
-console.log("handling-tests: ok (momentum, thermal/charge transitions, brake priority, reverse, pit limiter)");
+// Acceptance ranges describe the agreed arcade/realism compromise. Measure
+// actual motion, not just constants, so a second force cannot silently undo it.
+{
+  const car = carAt(0);
+  let reached100 = null;
+  for (let tick = 0; tick < 60 * 60; tick++) {
+    step(car, { throttle: 1 });
+    if (reached100 == null && car.vx * kmh >= 100) reached100 = (tick + 1) * dt;
+  }
+  assert.ok(reached100 >= 6 && reached100 <= 8, `base 0–100 left its 6–8 s range: ${reached100}`);
+  assert.ok(Math.abs(car.vx * kmh - 123.2) < 0.5, "softer launch changed base straight-line top speed");
+  const braking = carAt(80 / kmh);
+  for (let tick = 0; tick < 8 * 60 && braking.vx > 0.01; tick++) step(braking, { brake: true });
+  const distanceMetres = braking.x * kmh / 3.6;
+  assert.ok(distanceMetres >= 25 && distanceMetres <= 35, `80–0 braking distance: ${distanceMetres}`);
+  const turning = carAt(80 / kmh);
+  let lateralG = 0;
+  for (let tick = 0; tick < 60; tick++) {
+    const vx = turning.vx, vy = turning.vy;
+    step(turning, { throttle: 1, steer: 1 });
+    if (tick >= 30) lateralG += Math.abs(vx * (turning.vy - vy) - vy * (turning.vx - vx))
+      / Math.hypot(vx, vy) / dt * (kmh / 3.6) / 9.81 / 30;
+  }
+  assert.ok(lateralG >= 1.2 && lateralG <= 1.6, `base corner returned magnetic grip: ${lateralG} g`);
+}
+
+// Softer engines must still overcome passive losses in a genuine low-torque
+// build; retaining only the displayed speed rating would hide a reduced top end.
+{
+  const weakBuild = { ...cloneDefaultBuild(), frame: "turtle", core: "choir",
+    transmission: "long", running: "heavy", body: "armored" };
+  const weak = resolveBuild(weakBuild);
+  const p = deriveCarPhysics(weak);
+  const car = { ...carAt(0), health: p.maxHealth, maxHealth: p.maxHealth,
+    charge: p.maxCharge, maxCharge: p.maxCharge };
+  for (let tick = 0; tick < 90 * 60; tick++) {
+    advanceCarMotion(car, { ...neutralInput(), throttle: 1 }, p, dt, { traits: weak.traits });
+  }
+  assert.ok(Math.abs(car.vx - p.maxSpeed) < 1, "low-torque build cannot attain its advertised top speed");
+}
+
+// A bot must brake for a curve that its own low-grip tyres cannot sustain.
+// The same curve is safe with the high-grip build at the same approach speed.
+{
+  const track = generateTrack("bot-tyre-budget", 3);
+  const simulation = new RaceSimulation({ track, entries: [{ id: "bot", build, isBot: true, botSkill: 3 }] });
+  const point = sampleTrack(track, 80);
+  const run = (lateralGrip) => {
+    const car = { ...simulation.cars[0], physics: { ...simulation.cars[0].physics, lateralGrip } };
+    Object.assign(car, { x: point.x, y: point.y, angle: Math.atan2(point.ty, point.tx),
+      vx: point.tx * 300, vy: point.ty * 300, botLaneBias: 0, botPhase: 0,
+      botCurvature: 0.0015, botSteer: 0, botThrottle: 0.6 });
+    return computeBotInput({ car, dt, track, cars: [car], laps: 3, tick: 1,
+      routeContext: { mainNearest: nearestTrackPoint(track, car.x, car.y), pitNearest: null } });
+  };
+  assert.equal(run(2).brake, true, "low-grip bot ignored the corner's tyre demand");
+  assert.equal(run(8).brake, false, "high-grip bot did not retain its cornering advantage");
+}
+
+console.log("handling-tests: ok (balance targets, momentum, brake priority, reverse, pit limiter, bot tyre budget)");

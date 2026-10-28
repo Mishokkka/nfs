@@ -1,4 +1,5 @@
 import { samplePitAhead, sampleTrackAhead } from "../track.js";
+import { lateralAccelerationBudget } from "./drive-model.js";
 
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 const angleWrap = (angle) => Math.atan2(Math.sin(angle), Math.cos(angle));
@@ -13,6 +14,10 @@ export function shouldBotPit(car, laps) {
     || car.overheated;
 }
 
+/** Plan a lane and speed from upcoming curvature and the actual tyre budget.
+ * Service braking uses the car's stopping distance; all manoeuvres still go
+ * through the same throttle, brake and steering physics as a human driver.
+ */
 export function computeBotInput({ car, dt, routeContext, track, cars, laps, tick }) {
   const velocity = Math.hypot(car.vx, car.vy);
   const forwardSpeed = Math.max(0, dot(car.vx, car.vy, Math.cos(car.angle), Math.sin(car.angle)));
@@ -23,11 +28,12 @@ export function computeBotInput({ car, dt, routeContext, track, cars, laps, tick
   const pitApproach = Boolean(pitNearest) && car.pitState !== "track";
   const servicePoint = track.pit.samples[track.pit.serviceIndex];
   const serviceHalfLength = Number(track.pit.serviceHalfLength ?? 52);
+  const serviceBrakingDistance = track.pit.speedLimit ** 2 / (2 * Math.max(1, car.physics.braking));
   const serviceRemaining = pitApproach && car.pitState === "entering" && servicePoint
     ? servicePoint.cumulative - Number(pitNearest?.point?.cumulative ?? servicePoint.cumulative)
     : Infinity;
   const serviceApproach = Number.isFinite(serviceRemaining)
-    && serviceRemaining <= Math.max(280, track.pit.speedLimit * 0.96)
+    && serviceRemaining <= Math.max(280, serviceBrakingDistance * 1.2 + serviceHalfLength)
     && serviceRemaining >= -serviceHalfLength * 0.9;
   const routeNearest = pitApproach ? pitNearest : mainNearest;
   const routeWidth = pitApproach ? track.pit.width : track.width;
@@ -118,7 +124,9 @@ export function computeBotInput({ car, dt, routeContext, track, cars, laps, tick
   }
 
   const skillPace = [0, 0.91, 0.97, 1.04, 1.14][skill];
-  const safeCornerSpeed = Math.sqrt(Math.max(1, car.physics.lateralGrip) * 38 / curvaturePerUnit);
+  // Leave tyre capacity for throttle/braking and line corrections. Planning
+  // from the drive model's budget keeps every skill tier on the same tyres.
+  const safeCornerSpeed = Math.sqrt(lateralAccelerationBudget(car.physics) * 0.72 / curvaturePerUnit);
   const cornerConfidence = [0, 0.94, 0.99, 1.05, 1.12][skill];
   let targetSpeed = Math.min(car.physics.maxSpeed * skillPace, safeCornerSpeed * cornerConfidence);
   targetSpeed = Math.max(car.physics.maxSpeed * [0, 0.22, 0.24, 0.27, 0.30][skill], targetSpeed);
@@ -135,7 +143,7 @@ export function computeBotInput({ car, dt, routeContext, track, cars, laps, tick
     // Bots obey the same physical service rule as players: they brake into the
     // visible blue box and reach a standstill there. No teleport or scripted
     // rail is used to start service.
-    const stoppingTarget = Math.max(0, (serviceRemaining - 6) * 1.12);
+    const stoppingTarget = Math.sqrt(2 * car.physics.braking * Math.max(0, serviceRemaining - 10)) * 0.85;
     targetSpeed = Math.min(targetSpeed, stoppingTarget);
   }
 
