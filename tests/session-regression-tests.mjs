@@ -44,9 +44,13 @@ globalThis.foundry = {
   utils: { deepClone: structuredClone, mergeObject: (a, b) => ({ ...structuredClone(a), ...structuredClone(b) }) },
   applications: { api: { ApplicationV2: MockApp, HandlebarsApplicationMixin: a => a, DialogV2: { confirm: async () => true } } }
 };
+const settingsState = new Map();
+const recoveryValues = new Map();
+globalThis.sessionStorage = { getItem: key => recoveryValues.get(key), setItem: (key, value) => recoveryValues.set(key, value), removeItem: key => recoveryValues.delete(key) };
 globalThis.game = {
   user: users.get("host"), users,
-  settings: { get: (_m, key) => ({ build: {}, cameraMode: "overview", soundEnabled: false })[key], set: async () => {} },
+  settings: { get: (_m, key) => settingsState.get(key) ?? ({ build: {}, cameraMode: "overview", soundEnabled: false })[key],
+    set: async (_m, key, value) => settingsState.set(key, structuredClone(value)) },
   socket: {
     on(_name, fn) { listeners.push({ owner: game.user.id, fn }); },
     off(_name, fn) { const index = listeners.findIndex(x => x.fn === fn); if (index >= 0) listeners.splice(index, 1); },
@@ -298,4 +302,93 @@ const setup = () => {
   app.shutdown(); host.destroy(); player.destroy(); game.user = beforeUser;
 }
 
-console.log("session-regression-tests: ok (recovery, coalescing, isolation, garage, worker authority, reordered reconnect, explicit spectator resume)");
+// If Worker creation fails during F5 recovery, fallback must import the same
+// checkpoint rather than placing the cars back on the grid.
+{
+  const config = { seed: 88201, trackComplexity: 2, laps: 3, requiredPitStops: 1 };
+  const entries = [{ id: "car-host", userId: "host", name: "Host", build: cloneDefaultBuild() }];
+  const sim = new RaceSimulation({ ...config, entries, track: generateTrack(88201, 2) });
+  for (let tick = 0; tick < 420; tick++) sim.step();
+  Object.assign(sim.cars[0], { health: sim.cars[0].health - 20, heat: 31, lastInputSequence: 40,
+    currentInput: { ...neutralInput(), throttle: 1 } });
+  globalThis.Worker = class { constructor() { throw new Error("Worker blocked"); } };
+  const saves = [];
+  const runtime = new RaceRuntime({ network: { isHost: true, saveRecoveryCheckpoint: value => saves.push(value) },
+    isRaceActive: () => true, onFinished() {} });
+  const warn = console.warn; console.warn = () => {};
+  try { runtime.start({ config, entries, host: true, raceId: "fallback-recovery", checkpoint: sim.exportCheckpoint() }); }
+  finally { console.warn = warn; delete globalThis.Worker; }
+  assert.equal(runtime.simulationWorker, null);
+  assert.equal(runtime.simulation.tick, 420);
+  assert.equal(runtime.simulation.cars[0].health, sim.cars[0].health);
+  assert.equal(runtime.simulation.cars[0].heat, 31);
+  assert.deepEqual(runtime.simulation.cars[0].currentInput, neutralInput());
+  assert.equal(runtime.simulation.cars[0].lastInputSequence, -1);
+  assert.equal(JSON.parse(saves[0]).tick, 420);
+  runtime.stop();
+}
+
+// F5 resumes full authority, fences old transport packets even when the saved
+// tick precedes the player's last frame, and reassigns the same human cars.
+{
+  await new Promise(resolve => setImmediate(resolve));
+  const { host, player } = setup();
+  await host.sessionWrite;
+  const sim = new RaceSimulation({ ...host.activeRace.config, entries: host.activeRace.entries,
+    track: generateTrack(host.activeRace.config.seed, host.activeRace.config.trackComplexity, host.activeRace.config.environmentTheme) });
+  Object.assign(sim, { tick: 6200, simulationTime: 103.333, time: 99.933, countdown: 0, started: true });
+  Object.assign(sim.cars[0], { lap: 1, nextSector: 2, pitState: "service", pitWord: "ядро", pitAttemptId: "f5-attempt", pitServiceTimer: 2.7 });
+  as("host", () => host.sendSnapshot({ ...sim.snapshot(), tick: 6500 }));
+  const staleFrame = structuredClone(sent.findLast(m => m.type === "race-frame"));
+  as("player", () => player.sendInput("car-player", { throttle: 1 }, 999));
+  advance(8);
+  const staleInput = structuredClone(sent.findLast(m => m.type === "race-input"));
+  assert.equal(as("host", () => host.saveRecoveryCheckpoint(JSON.stringify(sim.exportCheckpoint()))), true);
+  const oldRaceId = host.raceId;
+  const dismissedApp = as("player", () => new BigRacesApp(player));
+  dismissedApp.dismissedRaceId = oldRaceId;
+  as("host", () => host.destroy());
+  const reloaded = makeNetwork("host");
+  const app = as("host", () => new BigRacesApp(reloaded));
+  assert.equal(as("host", () => reloaded.restoreSavedRace()), true);
+  assert.equal(JSON.parse(recoveryValues.get(as("host", () => reloaded.recoveryStore.key))).race.raceId, oldRaceId,
+    "unacknowledged world lease overwrote the last durable checkpoint");
+  await reloaded.sessionWrite;
+  assert.equal(JSON.parse(recoveryValues.get(as("host", () => reloaded.recoveryStore.key))).race.raceId, reloaded.raceId);
+  assert.notEqual(reloaded.raceId, oldRaceId);
+  assert.equal(player.raceId, reloaded.raceId);
+  assert.equal(reloaded.activeRace.sessionId, oldRaceId);
+  assert.equal(player.lastSnapshot.tick, 6200, "new transport retained the old monotonic tick window");
+  assert.equal(dismissedApp.screen, "garage", "F5 pulled a player back into a race they had left");
+  assert.equal(app.screen, "race");
+  assert.equal(app.runtime.simulation.tick, 6200);
+  assert.equal(app.runtime.simulation.cars[0].lap, 1);
+  assert.equal(app.runtime.simulation.cars[0].pitAttemptId, "f5-attempt");
+  assert.equal(app.runtime.localCarId, "car-host");
+  assert.equal(as("player", () => player.participantCarId), "car-player");
+  const oldEpoch = staleFrame.hostEpoch;
+  let inputs = 0;
+  reloaded.on("input", () => inputs++);
+  const deliver = message => { for (const listener of [...listeners]) as(listener.owner, () => listener.fn(message)); };
+  deliver({ ...staleFrame, id: "delayed-old-frame" });
+  deliver({ ...staleInput, id: "delayed-old-input" });
+  deliver({ ...staleFrame, type: "lobby-closed", id: "delayed-old-close", hostEpoch: oldEpoch });
+  assert.equal(inputs, 0);
+  assert.equal(player.lastSnapshot.tick, 6200);
+  assert.ok(player.lobby && reloaded.lobby, "old host epoch closed the resumed lobby");
+  as("player", () => player.sendInput("car-player", { throttle: 1 }, 1)); advance(8);
+  assert.equal(inputs, 1, "fresh low sequence was rejected after resume");
+  assert.equal(app.runtime.simulation.cars[1].currentInput.throttle, 1);
+  as("host", () => app.shutdown());
+  as("player", () => dismissedApp.shutdown());
+  as("host", () => reloaded.stopRace());
+  await reloaded.sessionWrite;
+  assert.deepEqual(settingsState.get("raceSession"), {});
+  const nextReload = makeNetwork("host");
+  assert.equal(as("host", () => nextReload.restoreSavedRace()), false, "stop revived a stale save");
+  as("host", () => reloaded.closeLobby());
+  assert.equal(player.lobby, null, "the resumed epoch could not close its lobby");
+  nextReload.destroy(); reloaded.destroy(); player.destroy();
+}
+
+console.log("session-regression-tests: ok (F5 authority restore, packet fencing, coalescing, isolation, garage, worker authority, reordered reconnect, explicit spectator resume)");

@@ -1,12 +1,15 @@
 import {
+  MODULE_ID,
   SOCKET,
   PROTOCOL_VERSION,
   DEFAULT_CONFIG,
   MAX_RACE_ENTRIES,
   TRACK_ENVIRONMENT_THEMES
 } from "./constants.js";
+import { RaceRecoveryStore } from "./race-recovery.js";
+import { generateTrack } from "./track.js";
 import { normalizeBuild } from "./catalog.js";
-import { buildRaceCarMeta, sanitizeInput } from "./physics.js";
+import { buildRaceCarMeta, sanitizeInput, RaceSimulation } from "./physics.js";
 
 const clone = (value) => foundry.utils.deepClone(value);
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
@@ -44,7 +47,7 @@ const MESSAGE_SIZE_LIMITS = Object.freeze({
 });
 
 const MESSAGE_META_FIELDS = Object.freeze([
-  "type", "protocolVersion", "id", "senderId", "sentAt"
+  "type", "protocolVersion", "id", "senderId", "sentAt", "hostEpoch"
 ]);
 
 const SMALL_MESSAGE_SCHEMAS = Object.freeze({
@@ -116,7 +119,7 @@ function boundedStringArray(value, limit = 80) {
     && value.every((entry) => boundedString(entry, limit));
 }
 
-/** Validate the fixed 39-field protocol-14 row before reading positional fields. */
+/** Validate the fixed 39-field protocol-15 row before reading positional fields. */
 function compactRaceRowFitsSchema(row) {
   if (!Array.isArray(row) || row.length !== 39 || !boundedString(row[0], 80)) return false;
   for (let index = 1; index < row.length; index += 1) {
@@ -207,7 +210,7 @@ function smallMessageFitsSchema(message, schema) {
   if (!Object.keys(message).every((key) => allowed.has(key))) return false;
   if (!Number.isFinite(message.sentAt) || !Number.isInteger(message.protocolVersion)) return false;
   for (const field of [...MESSAGE_META_FIELDS, ...schema.required]) {
-    if (field === "protocolVersion" || field === "sentAt") continue;
+    if (field === "protocolVersion" || field === "sentAt" || field === "hostEpoch") continue;
     const value = message[field];
     const limit = STRING_FIELD_LIMITS[field] ?? 120;
     if (typeof value !== "string" || value.length === 0 || value.length > limit) return false;
@@ -217,13 +220,14 @@ function smallMessageFitsSchema(message, schema) {
 
 function messageFitsLimit(message) {
   if (!message || typeof message !== "object" || Array.isArray(message)) return false;
+  if (message.hostEpoch != null && (!Number.isSafeInteger(message.hostEpoch) || message.hostEpoch < 0)) return false;
   // Compact race frames have a fixed, shallow shape whose maximum encoded size
   // is bounded by the participant count and two 80-character nullable fields per
   // row. Validate that structure directly instead of JSON.stringify-ing every
   // 30 Hz snapshot again on every receiving client.
   if (message.type === "race-frame") return raceFrameMessageFitsSchema(message);
   if (message.type === "race-input") {
-    const allowed = new Set(["type", "lobbyId", "raceId", "userId", "carId", "input", "sequence", "protocolVersion", "id", "senderId", "sentAt"]);
+    const allowed = new Set([...MESSAGE_META_FIELDS, "lobbyId", "raceId", "userId", "carId", "input", "sequence"]);
     const inputKeys = message.input && typeof message.input === "object" && !Array.isArray(message.input)
       ? Object.keys(message.input)
       : [];
@@ -447,7 +451,7 @@ function normalizeRaceFrame(raw, race) {
 const PIT_STATE_TO_CODE = Object.freeze({ track: 0, entering: 1, service: 2, exit: 3 });
 const PIT_CODE_TO_STATE = Object.freeze(["track", "entering", "service", "exit"]);
 
-/** Pack validated state into protocol-14 rows, retaining input ACKs and all
+/** Pack validated state into protocol-15 rows, retaining input ACKs and all
  * deterministic motion state needed by prediction without duplicating metadata.
  */
 function encodeNormalizedFrame(frame) {
@@ -648,6 +652,12 @@ function normalizeResults(raw, race) {
 
 export class RaceNetwork {
   constructor() {
+    this.recoveryStore = new RaceRecoveryStore();
+    this.recoveryCheckpoint = null;
+    this.sessionWrite = Promise.resolve();
+    this.sessionReadyRaceId = null;
+    this.pendingRecoverySave = null;
+    this.recoveryWarningShown = false;
     this.lobby = null;
     this.activeRace = null;
     this.lastSnapshot = null;
@@ -877,6 +887,7 @@ export class RaceNetwork {
     this.activeRace = {
       protocolVersion: PROTOCOL_VERSION,
       raceId,
+      sessionId: raceId,
       lobbyId: this.lobby.id,
       hostId: game.user.id,
       phase: "race",
@@ -897,7 +908,101 @@ export class RaceNetwork {
       controlAssignments
     });
     this.#broadcastLobby();
+    this.#writeSession();
     return raceId;
+  }
+
+  saveRecoveryCheckpoint(checkpoint) {
+    if (!this.isHost || this.activeRace?.phase !== "race") return false;
+    // Keep the previous tab checkpoint until the new world lease is durable.
+    // Otherwise a second F5 during the setting round-trip loses both versions.
+    if (game.user.isGM && this.sessionReadyRaceId !== this.raceId) {
+      this.pendingRecoverySave = { raceId: this.raceId, checkpoint };
+      return false;
+    }
+    const saved = this.recoveryStore.save({ lobby: this.lobby, race: this.activeRace, checkpoint });
+    if (!saved && this.recoveryStore.warned) this.#warnRecoveryUnavailable();
+    return saved;
+  }
+
+  #warnRecoveryUnavailable() {
+    if (this.recoveryWarningShown) return;
+    this.recoveryWarningShown = true;
+    globalThis.ui?.notifications?.warn?.("Сохранение гонки для F5 недоступно. Перезагрузка ведущего может потребовать сброса заезда.");
+  }
+
+  takeRecoveryCheckpoint(raceId) {
+    if (raceId !== this.raceId) return null;
+    const checkpoint = this.recoveryCheckpoint;
+    this.recoveryCheckpoint = null;
+    return checkpoint;
+  }
+
+  /** The world lease invalidates old tab saves after stop/finish/GM takeover. */
+  #writeSession() {
+    if (!game.user.isGM) return;
+    const value = this.activeRace?.phase === "race" ? {
+      raceId: this.raceId, lobbyId: this.lobby.id, hostId: this.lobby.hostId, hostEpoch: this.lobby.hostEpoch
+    } : {};
+    this.sessionReadyRaceId = null;
+    if (!value.raceId) this.pendingRecoverySave = null;
+    this.sessionWrite = this.sessionWrite.catch(() => {}).then(async () => {
+      await game.settings.set(MODULE_ID, "raceSession", value);
+      if (!value.raceId || this.raceId !== value.raceId || !this.isHost) return;
+      this.sessionReadyRaceId = value.raceId;
+      const pending = this.pendingRecoverySave;
+      this.pendingRecoverySave = null;
+      if (pending?.raceId === value.raceId) this.saveRecoveryCheckpoint(pending.checkpoint);
+    })
+      .catch(error => {
+        console.warn("FBL Need for Speed | не удалось сохранить состояние сессии", error);
+        this.#warnRecoveryUnavailable();
+      });
+  }
+
+  restoreSavedRace() {
+    if (!game.user.isGM || this.activeRace) return false;
+    let saved;
+    try { saved = this.recoveryStore.load(game.settings.get(MODULE_ID, "raceSession")); }
+    catch (_) { return false; }
+    if (!saved) return false;
+    try {
+      const race = this.#normalizeRace(saved.race, game.user.id, Date.now());
+      if (!race || race.lobbyId !== saved.lobby?.id || saved.lobby.hostId !== game.user.id) return false;
+      const checkpoint = typeof saved.checkpoint === "string" ? JSON.parse(saved.checkpoint) : saved.checkpoint;
+      const simulation = new RaceSimulation({ ...race.config, entries: race.entries,
+        track: generateTrack(race.config.seed, race.config.trackComplexity, race.config.environmentTheme) });
+      simulation.restoreCheckpoint(checkpoint, { resetInputs: true });
+      if (simulation.finished) return false;
+      const lobby = this.#normalizeLobby(saved.lobby);
+      lobby.hostEpoch += 1;
+      lobby.hostClaimedAt = Date.now();
+      lobby.hostClaimId = `${Date.now().toString(36)}:${game.user.id}`;
+      this.#send({ type: "host-claim", lobby, abortRace: true, abortedRaceId: race.raceId });
+      if (this.lobby?.hostEpoch !== lobby.hostEpoch || this.lobby?.hostId !== game.user.id) return false;
+      // A fresh transport identity fences queued frames, inputs and pit replies.
+      // Car IDs and the full sporting state remain the same.
+      race.raceId = `race-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
+      race.startedAt = Date.now();
+      this.activeRace = race;
+      this.recoveryCheckpoint = simulation.exportCheckpoint();
+      this.lastSnapshot = simulation.snapshot();
+      this.lastFrame = encodeNormalizedFrame(normalizeRaceFrame(this.lastSnapshot, race));
+      this.snapshotSequence = 0;
+      this.lastReceivedSnapshotSequence = -1;
+      this.lastReceivedSimulationTick = -1;
+      this.pendingProbes.clear();
+      this.timing = null;
+      this.#writeSession();
+      this.saveRecoveryCheckpoint(JSON.stringify(this.recoveryCheckpoint));
+      this.#broadcastLobby();
+      this.#broadcastRaceState(null);
+      return true;
+    } catch (error) {
+      console.warn("FBL Need for Speed | сохранение гонки не удалось восстановить", error);
+      this.recoveryStore.clear();
+      return false;
+    }
   }
 
   requestControlAssignment() {
@@ -964,6 +1069,8 @@ export class RaceNetwork {
     if (this.lobby) this.lobby.phase = "results";
     this.activeRace.phase = "results";
     this.lastResults = safeResults;
+    this.recoveryStore.clear();
+    this.#writeSession();
     this.#send({
       type: "race-results",
       lobbyId: this.lobby?.id ?? null,
@@ -978,6 +1085,8 @@ export class RaceNetwork {
     const raceId = this.activeRace?.raceId ?? null;
     this.lobby.phase = "lobby";
     this.activeRace = null;
+    this.recoveryStore.clear();
+    this.#writeSession();
     this.lastSnapshot = null;
     this.lastFrame = null;
     this.lastResults = null;
@@ -991,16 +1100,19 @@ export class RaceNetwork {
     if (!this.isHost || !this.lobby) return;
     const lobbyId = this.lobby.id;
     const raceId = this.activeRace?.raceId ?? null;
+    const hostEpoch = this.lobby.hostEpoch;
     this.#rememberRetired(this.closedLobbyIds, lobbyId);
     this.#rememberRetired(this.retiredRaceIds, raceId);
     this.lobby = null;
     this.activeRace = null;
+    this.recoveryStore.clear();
+    this.#writeSession();
     this.lastSnapshot = null;
     this.lastFrame = null;
     this.lastResults = null;
     this.#clearPendingInputs();
     this.lastRequestAcceptedAt.clear();
-    this.#send({ type: "lobby-closed", lobbyId, raceId });
+    this.#send({ type: "lobby-closed", lobbyId, raceId, hostEpoch });
   }
 
   /**
@@ -1011,6 +1123,7 @@ export class RaceNetwork {
   recoverOrphanedSession() {
     if (!this.lobby || !this.hostOffline || !game.user.isGM) return false;
     const now = Date.now();
+    this.recoveryStore.clear();
     const wasRacing = this.lobby.phase === "race" || (this.recoveryRequired && this.lobby.phase === "results");
     const claimedLobby = clone(this.lobby);
     claimedLobby.hostId = game.user.id;
@@ -1025,6 +1138,7 @@ export class RaceNetwork {
       abortRace: wasRacing,
       abortedRaceId: wasRacing ? this.activeRace?.raceId ?? this.discoveredRaceId : null
     });
+    this.#writeSession();
     return true;
   }
 
@@ -1048,6 +1162,7 @@ export class RaceNetwork {
   #send(payload, handleLocal = true) {
     const message = {
       ...payload,
+      hostEpoch: payload.hostEpoch ?? this.lobby?.hostEpoch ?? 0,
       protocolVersion: PROTOCOL_VERSION,
       id: messageId(),
       senderId: game.user.id,
@@ -1069,7 +1184,8 @@ export class RaceNetwork {
 
   #isExpectedHost(message) {
     const expected = this.lobby?.hostId ?? this.activeRace?.hostId ?? message.hostId;
-    return Boolean(expected && message.senderId === expected);
+    return Boolean(expected && message.senderId === expected
+      && (Number(message.hostEpoch) || 0) === (Number(this.lobby?.hostEpoch) || 0));
   }
 
   #acceptLobby(message) {
@@ -1141,6 +1257,7 @@ export class RaceNetwork {
     return {
       protocolVersion: PROTOCOL_VERSION,
       raceId,
+      sessionId: String(raw.sessionId ?? raceId).slice(0, 120),
       lobbyId,
       hostId,
       phase: raw.phase === "results" ? "results" : "race",
@@ -1577,7 +1694,7 @@ export class RaceNetwork {
         break;
 
       case "host-heartbeat":
-        if (message.lobbyId !== this.lobby?.id || message.senderId !== this.lobby?.hostId) break;
+        if (message.lobbyId !== this.lobby?.id || !this.#isExpectedHost(message)) break;
         this.#markHostAlive();
         break;
 

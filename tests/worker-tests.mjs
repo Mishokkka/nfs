@@ -29,12 +29,14 @@ assert.equal(typeof handler, "function");
 handler({ data: {
   type: "init",
   raceId: "worker-race",
+  checkpoints: true,
   track: generateTrack(0, 2),
   entries: [{ id: "car", userId: "user", name: "Car", build: cloneDefaultBuild(), color: "#fff", isBot: false }],
   config: { laps: 1, collisionMode: "recovery", botDifficulty: 2, requiredPitStops: 1 }
 } });
 assert.ok(posted.some((message) => message.type === "ready" && message.raceId === "worker-race"));
 assert.ok(posted.some((message) => message.type === "snapshot"));
+assert.ok(posted.some((message) => message.type === "checkpoint"));
 assert.ok(posted.every((message) => message.generatedAt == null || Number.isFinite(message.generatedAt)),
   "worker published a non-finite generatedAt timestamp");
 assert.equal(typeof pump, "function");
@@ -56,6 +58,18 @@ for (let index = 1; index < snapshotTimes.length; index += 1) {
   const interval = snapshotTimes[index] - snapshotTimes[index - 1];
   assert.ok(interval > 0 && interval <= 3 / 60 + 1e-9, `worker publication skipped too many ticks: ${interval}`);
 }
+
+// Worker import resumes at the saved tick, not at the start grid. Human input
+// counters reopen, and saving continues off the main thread after recovery.
+const savedCheckpoint = JSON.parse(posted.findLast(message => message.type === "checkpoint").checkpoint);
+savedCheckpoint.tick = 1200; savedCheckpoint.simulationTime = 20;
+savedCheckpoint.countdown = 0; savedCheckpoint.started = true;
+handler({ data: { type: "init", raceId: "worker-restored", track: generateTrack(0, 2),
+  entries: [{ id: "car", userId: "user", name: "Car", build: cloneDefaultBuild(), color: "#fff", isBot: false }],
+  config: { laps: 1, collisionMode: "recovery", botDifficulty: 2, requiredPitStops: 1 },
+  checkpoint: savedCheckpoint, checkpoints: true } });
+assert.equal(posted.findLast(message => message.raceId === "worker-restored" && message.type === "snapshot").snapshot.tick, 1200);
+assert.ok(posted.some(message => message.raceId === "worker-restored" && message.type === "checkpoint"));
 
 handler({ data: {
   type: "init",

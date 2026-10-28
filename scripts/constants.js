@@ -1,7 +1,7 @@
 export const MODULE_ID = "fbl-need-for-speed";
 export const SOCKET = `module.${MODULE_ID}`;
 export const VERSION = "0.17.0";
-export const PROTOCOL_VERSION = 14;
+export const PROTOCOL_VERSION = 15;
 
 export const PHYSICS_HZ = 60;
 export const WORKER_SNAPSHOT_HZ = 30;

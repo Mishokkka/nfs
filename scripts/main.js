@@ -91,6 +91,10 @@ Hooks.once("init", () => {
     default: {}
   });
 
+  game.settings.register(MODULE_ID, "raceSession", {
+    name: "Активная сессия гонки", scope: "world", config: false, type: Object, default: {}
+  });
+
   game.settings.register(MODULE_ID, "cameraMode", {
     name: "Режим камеры",
     scope: "client",
@@ -121,7 +125,7 @@ Hooks.once("ready", () => {
   exposeApi();
   try {
     ensureModuleInitialized();
-    network.requestState();
+    if (!network.restoreSavedRace()) network.requestState();
     console.info(`FBL Need for Speed | Большие Гонки ${VERSION} готовы`);
   } catch (error) {
     // Keep the scene-control button alive even when initialization encountered a

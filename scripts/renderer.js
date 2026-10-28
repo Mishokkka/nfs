@@ -10,6 +10,7 @@ import {
 import { LocalPrediction } from "./netcode/local-prediction.js";
 import { VehicleSprites, REAR_CORE_X } from "./rendering/vehicle-sprites.js";
 import { TrackArt } from "./rendering/track-art.js";
+import { GripFeedback } from "./rendering/grip-feedback.js";
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 const angleDelta = (target, current) => Math.atan2(Math.sin(target - current), Math.cos(target - current));
 const smoothingFactor = (dt, timeConstant) => 1 - Math.exp(-Math.max(0, dt) / Math.max(0.001, timeConstant));
@@ -70,6 +71,7 @@ export class RaceRenderer {
     this.track = track;
     this.localCarId = localCarId;
     this.onHud = onHud;
+    this.gripFeedback = new GripFeedback();
     this.cameraMode = CAMERA_MODES.has(cameraMode) ? cameraMode : "overview";
     this.minimapEnabled = Boolean(minimapEnabled);
     this.previousSnapshot = null;
@@ -1989,6 +1991,7 @@ export class RaceRenderer {
       const length = 44 + (0.5 + 0.5 * Math.sin(now * 0.026)) * 14;
       ctx.drawImage(this.vehicleSprites.flame, coreX - 4 * bodyScale - length, -13, length, 26);
     }
+    this.vehicleSprites.drawSteeringWheels(ctx, car);
     ctx.drawImage(this.vehicleSprites.get(car), -44, -32, 88, 64);
     if (car.heat > 82 && !car.disabled) {
       const glowSize = 18 * bodyScale;
@@ -2136,22 +2139,7 @@ export class RaceRenderer {
     if (car.pitState === "exit") return "Пит-лейн · ограничение 60 км/ч";
     if (car.temporaryAutopilot) return "Временный автопилот";
     if (car.overheated) return "Ядро перегрето";
-    const angle = Number(car.angle) || 0;
-    const forwardX = Math.cos(angle);
-    const forwardY = Math.sin(angle);
-    const rightX = -forwardY;
-    const rightY = forwardX;
-    const vx = Number(car.vx) || 0;
-    const vy = Number(car.vy) || 0;
-    const forwardSpeed = vx * forwardX + vy * forwardY;
-    const lateralSpeed = vx * rightX + vy * rightY;
-    const slipDegrees = Math.abs(Math.atan2(lateralSpeed, Math.max(22, Math.abs(forwardSpeed)))) * 180 / Math.PI;
-    const speedKmh = Math.hypot(vx, vy) * (0.62 / 3);
-    const driftAmount = Number(car.driftAmount) || 0;
-    if (speedKmh > 70 && driftAmount > 0.18 && slipDegrees >= 14) {
-      return slipDegrees >= 34 ? "Срыв заноса: контррулите и отпустите газ" : `Управляемый занос · ${Math.round(slipDegrees)}°`;
-    }
-    return "";
+    return this.gripFeedback.update(car, performance.now());
   }
 
   #drawHudPanel(ctx, x, y, width, height, label, value, { valueColor = "#f2f6f7", valueSize = 16 } = {}) {

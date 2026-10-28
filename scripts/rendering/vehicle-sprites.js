@@ -41,6 +41,32 @@ export class VehicleSprites {
     this.halo = this.#halo();
     this.flame = this.#flame();
     this.hotCore = this.#core();
+    this.frontWheel = this.#frontWheel();
+  }
+
+  #frontWheel() {
+    const { canvas, ctx } = surface(18, 10);
+    ctx.fillStyle = "#111716";
+    ctx.beginPath(); ctx.ellipse(0, 0, 7, 2.7, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = "#55594f"; ctx.fillRect(-5.5, -0.6, 11, 1.2);
+    ctx.fillStyle = "#c7a76a"; ctx.fillRect(-1.5, -2.2, 3, 1.2);
+    ctx.strokeStyle = "#92988a60"; ctx.lineWidth = 0.55; ctx.beginPath();
+    for (const x of [-4, 0, 4]) { ctx.moveTo(x, -1.8); ctx.lineTo(x, 1.8); }
+    ctx.stroke();
+    return canvas;
+  }
+
+  /** Two shared rasters rotate with the actual steering rack, under the fenders.
+   * Steering never enters the body cache key or creates a canvas in the frame. */
+  drawSteeringWheels(ctx, car) {
+    const sx = clamp(Number(car.appearance?.halfLength) || 26, 18, 36) / 28;
+    const sy = clamp(Number(car.appearance?.halfWidth) || 14, 9, 22) / 16;
+    const steer = clamp(Number(car.steeringPosition) || 0, -1, 1) * 0.5;
+    for (let side = -1; side <= 1; side += 2) {
+      ctx.save(); ctx.translate(17 * sx, side * 13.5 * sy);
+      ctx.rotate(steer); ctx.scale(sx, side * sy);
+      ctx.drawImage(this.frontWheel, -9, -5, 18, 10); ctx.restore();
+    }
   }
 
   /** Rasterize the local-driver marker once, without a per-frame shadow filter. */
@@ -117,7 +143,7 @@ export class VehicleSprites {
     ctx.strokeStyle = "#393d39"; ctx.lineWidth = 1.5; ctx.beginPath();
     for (const x of [-16, 17]) { ctx.moveTo(x, -14); ctx.lineTo(x, 14); }
     ctx.stroke();
-    for (const x of [-16, 17]) for (const side of [-1, 1]) {
+    for (const x of [-16]) for (const side of [-1, 1]) {
       const y = side * 13.5;
       ctx.fillStyle = "#111716";
       ctx.beginPath(); ctx.ellipse(x, y, 7, 2.7, 0, 0, Math.PI * 2); ctx.fill();
@@ -237,7 +263,7 @@ export class VehicleSprites {
 
   /** Release every GPU backing store when its race ends. */
   destroy() {
-    for (const canvas of [...this.bodies.values(), this.halo, this.flame, this.hotCore]) {
+    for (const canvas of [...this.bodies.values(), this.halo, this.flame, this.hotCore, this.frontWheel]) {
       canvas.width = 1; canvas.height = 1;
     }
     this.bodies.clear();

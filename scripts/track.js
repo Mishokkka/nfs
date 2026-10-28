@@ -23,12 +23,18 @@ function hashSeed(value) {
 
 export function seededRng(seed) {
   let state = hashSeed(seed) || 0x9e3779b9;
-  return () => {
+  const next = () => {
     state ^= state << 13;
     state ^= state >>> 17;
     state ^= state << 5;
     return (state >>> 0) / 4294967296;
   };
+  next.getState = () => state >>> 0;
+  next.setState = (saved) => {
+    if (!Number.isInteger(saved) || saved < 1 || saved > 0xffffffff) throw new Error("Некорректное состояние генератора");
+    state = saved >>> 0;
+  };
+  return next;
 }
 
 function catmullRom(p0, p1, p2, p3, t, tension = 0) {

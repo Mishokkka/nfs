@@ -426,6 +426,21 @@
   font-size: 13px;
 }
 
+.nfs-garage .nfs-physics-delta {
+  min-height: 1.2em;
+  line-height: 1.2;
+  font-variant-numeric: tabular-nums;
+}
+
+.nfs-garage .nfs-physics-delta.is-better { color: #8fdbb4; }
+.nfs-garage .nfs-physics-delta.is-worse { color: #f3b19c; }
+.nfs-garage .nfs-physics-note {
+  margin: 8px 0 0;
+  color: #a5b5b8;
+  font-size: 10px;
+  line-height: 1.45;
+}
+
 .nfs-card--driver .nfs-driver-stats {
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 7px;

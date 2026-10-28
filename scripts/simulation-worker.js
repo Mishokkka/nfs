@@ -9,6 +9,8 @@ let lastWallTime = 0;
 let nextPumpAt = 0;
 let finishedPublished = false;
 let lastPublishedTick = -Infinity;
+let checkpoints = false;
+let lastCheckpointTick = -Infinity;
 
 const fixedDt = 1 / PHYSICS_HZ;
 const tickIntervalMs = 1000 / PHYSICS_HZ;
@@ -24,6 +26,10 @@ function publishSnapshot({ force = false } = {}) {
   const tick = Number(simulation.tick) || 0;
   if (!force && !simulation.finished && tick - lastPublishedTick < snapshotEveryTicks) return;
   const snapshot = simulation.snapshot();
+  if (checkpoints && !snapshot.finished && (force || tick - lastCheckpointTick >= PHYSICS_HZ / 2)) {
+    lastCheckpointTick = tick;
+    self.postMessage({ type: "checkpoint", raceId, checkpoint: JSON.stringify(simulation.exportCheckpoint()) });
+  }
   lastPublishedTick = Number(snapshot.tick) || tick;
   if (snapshot.finished && !finishedPublished) {
     finishedPublished = true;
@@ -88,6 +94,8 @@ function stopClock() {
   nextPumpAt = 0;
   finishedPublished = false;
   lastPublishedTick = -Infinity;
+  lastCheckpointTick = -Infinity;
+  checkpoints = false;
 }
 
 self.addEventListener("message", (event) => {
@@ -105,6 +113,8 @@ self.addEventListener("message", (event) => {
           botDifficulty: message.config?.botDifficulty,
           requiredPitStops: message.config?.requiredPitStops
         });
+        if (message.checkpoint) simulation.restoreCheckpoint(message.checkpoint, { resetInputs: true });
+        checkpoints = message.checkpoints === true;
         finishedPublished = false;
         startClock();
         publishSnapshot({ force: true });

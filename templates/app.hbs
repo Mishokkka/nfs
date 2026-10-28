@@ -89,7 +89,7 @@
         <div class="nfs-section">
           <div class="nfs-section__title">
             <h3>Профиль машины</h3>
-            <span class="nfs-help" tabindex="0" aria-label="Справка" data-nfs-tooltip="Верхний ряд показывает рейтинги сборки. Нижний ряд содержит фактические параметры физической модели."><i class="fas fa-circle-question"></i></span>
+            <span class="nfs-help" tabindex="0" aria-label="Справка" data-nfs-tooltip="Верхний ряд показывает рейтинги сборки. Ниже — расчёт на сухом асфальте и разница с последней сохранённой сборкой. Форсаж, повреждения и стартовые бонусы отключены."><i class="fas fa-circle-question"></i></span>
           </div>
           <div class="nfs-stat-grid">
             {{#each stats}}
@@ -101,9 +101,10 @@
           </div>
           <div class="nfs-physics-strip" aria-label="Расчётные параметры болида">
             {{#each physicsPreview}}
-            <span data-nfs-tooltip="{{label}}" tabindex="0"><small>{{shortLabel}}</small><strong data-physics-preview="{{key}}">{{value}}</strong></span>
+            <span data-nfs-tooltip="{{tooltip}}" tabindex="0"><small>{{shortLabel}}</small><strong data-physics-preview="{{key}}">{{value}}</strong><small class="nfs-physics-delta {{comparisonClass}}" data-physics-delta="{{key}}">{{comparison}}</small></span>
             {{/each}}
           </div>
+          <p class="nfs-physics-note">Сухой асфальт · без форсажа · 80–0 без времени реакции<br>Изменения — относительно сохранённой сборки</p>
         </div>
       </section>
 

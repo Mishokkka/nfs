@@ -86,7 +86,7 @@ export class BigRacesApp extends HandlebarsApplicationMixin(ApplicationV2) {
       this.network.on("hostStatus", ({ offline }) => {
         this.hostOffline = offline;
         if (this.#ownsNetworkRuntime() || this.screenStateMachine.is("lobby")) {
-          if (offline) ui.notifications.warn("Связь с ведущим потеряна. После перезагрузки ведущего ГМ может сбросить зависший заезд в лобби.");
+          if (offline) ui.notifications.warn("Связь с ведущим потеряна. После F5 ГМа гонка продолжится из сохранения вкладки ведущего; без сохранения доступен сброс в лобби.");
           else ui.notifications.info("Связь с ведущим Больших Гонок восстановлена.");
         }
         if (this.screenStateMachine.is("lobby") && this.rendered) this.render({ force: true });
@@ -111,7 +111,7 @@ export class BigRacesApp extends HandlebarsApplicationMixin(ApplicationV2) {
    */
   #shouldPresentRace(race) {
     if (this.runtime.practice) return false;
-    if (race?.raceId === this.dismissedRaceId && !this.resumeRequested && !this.viewingNetworkRace) return false;
+    if ((race?.sessionId ?? race?.raceId) === this.dismissedRaceId && !this.resumeRequested && !this.viewingNetworkRace) return false;
     return this.resumeRequested || this.viewingNetworkRace
       || Boolean(race?.controlAssignments?.[game.user.id] && this.network.participant);
   }
@@ -331,6 +331,7 @@ export class BigRacesApp extends HandlebarsApplicationMixin(ApplicationV2) {
       practice: false,
       raceId: race.raceId,
       initialSnapshot: snapshot,
+      checkpoint: race.hostId === game.user.id ? this.network.takeRecoveryCheckpoint(race.raceId) : null,
       assignedCarId: race.controlAssignments?.[String(game.user.id)] ?? null
     });
     this.results = null;
@@ -363,7 +364,7 @@ export class BigRacesApp extends HandlebarsApplicationMixin(ApplicationV2) {
       yes: { label: "Передать болид" }, no: { label: "Остаться" }, rejectClose: false, modal: true
     }))) return;
     this.viewingNetworkRace = false;
-    this.dismissedRaceId = this.runtime.currentRaceId;
+    this.dismissedRaceId = this.network.activeRace?.sessionId ?? this.runtime.currentRaceId;
     this.runtime.sendNeutralInput();
     if (wasDriver) this.network.leaveRace(this.runtime.localCarId);
     this.runtime.stop();

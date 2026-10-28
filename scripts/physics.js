@@ -17,6 +17,32 @@ import { advanceCarMotion, terrainModifiers } from "./physics/car-motion.js";
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 const dot = (ax, ay, bx, by) => ax * bx + ay * by;
 const cross = (ax, ay, bx, by) => ax * by - ay * bx;
+const CHECKPOINT_STATIC_FIELDS = new Set(["id", "userId", "name", "driverName", "build", "resolved", "physics", "prediction", "appearance", "color", "rng", "routeContext"]);
+const CHECKPOINT_NULLABLE_STRINGS = new Set(["pitWord", "pitAttemptId"]);
+const checkpointRoute = route => route == null ? null : Object.fromEntries(["mainNearest", "pitNearest"].map(key => [key,
+  route[key] == null ? null : { index: route[key].index, progress: route[key].progress,
+    signedDistance: route[key].signedDistance, point: { ...route[key].point } }]));
+const CHECKPOINT_POINT_KEYS = "x y tx ty nx ny cumulative grassWidth grassWidthLeft grassWidthRight surfaceLeft surfaceRight wallLeftAlpha wallRightAlpha wallLeftX wallLeftY wallRightX wallRightY mainProgressUnwrapped".split(" ");
+
+function validCheckpointRoute(route, track) {
+  if (route === null) return true;
+  if (!route?.mainNearest) return false;
+  return [[route.mainNearest, track.samples.length], [route.pitNearest, track.pit.samples.length]].every(([nearest, size]) =>
+    nearest === null || (Number.isInteger(nearest.index) && nearest.index >= 0 && nearest.index < size
+      && [nearest.progress, nearest.signedDistance].every(value => Number.isFinite(value) && Math.abs(value) <= 1e9)
+      && nearest.point && Object.keys(nearest.point).length === CHECKPOINT_POINT_KEYS.length
+      && CHECKPOINT_POINT_KEYS.every(key => key.startsWith("surface") ? ["grass", "sand", "gravel"].includes(nearest.point[key])
+        : (key === "mainProgressUnwrapped" && nearest.point[key] === null) || (Number.isFinite(nearest.point[key]) && Math.abs(nearest.point[key]) <= 1e9))));
+}
+
+function validCheckpointValue(key, value, initial) {
+  if (key === "currentInput") return value && typeof value === "object"
+    && JSON.stringify(sanitizeInput(value)) === JSON.stringify(value);
+  if (CHECKPOINT_NULLABLE_STRINGS.has(key)) return value === null || (typeof value === "string" && value.length <= 80);
+  if (initial === null) return value === null || (Number.isFinite(value) && Math.abs(value) <= 1e9);
+  if (typeof initial === "number") return Number.isFinite(value) && Math.abs(value) <= 1e9;
+  return typeof value === typeof initial && (typeof value !== "string" || value.length <= 80);
+}
 
 function closestPointOnSegment(point, start, end) {
   const sx = end.x - start.x;
@@ -1520,6 +1546,68 @@ export class RaceSimulation {
     unfinished.forEach((car, index) => {
       car.place = this.finishOrder.length + index + 1;
     });
+  }
+
+  /** Full authority state, separate from the compact presentation snapshot. */
+  exportCheckpoint() {
+    return {
+      format: 1,
+      track: [this.track.seed, this.track.samples.length, this.track.totalLength],
+      options: [this.laps, this.collisionMode, this.botDifficulty, this.requiredPitStops],
+      tick: this.tick, time: this.time, simulationTime: this.simulationTime,
+      countdown: this.countdown, started: this.started, finished: this.finished,
+      finishOrder: [...this.finishOrder],
+      cars: this.cars.map(car => ({ id: car.id, rng: car.rng.getState(), route: checkpointRoute(car.routeContext),
+        state: Object.fromEntries(Object.entries(car).filter(([key]) => !CHECKPOINT_STATIC_FIELDS.has(key))
+          .map(([key, value]) => [key, key === "currentInput" ? { ...value } : value])) }))
+    };
+  }
+
+  /** Validate everything before applying anything. Static build/track data is rebuilt. */
+  restoreCheckpoint(saved, { resetInputs = false } = {}) {
+    const fail = () => { throw new Error("Сохранение гонки повреждено или несовместимо"); };
+    const expected = this.exportCheckpoint();
+    if (!saved || saved.format !== 1 || JSON.stringify(saved.track) !== JSON.stringify(expected.track)
+      || JSON.stringify(saved.options) !== JSON.stringify(expected.options)
+      || !Number.isSafeInteger(saved.tick) || saved.tick < 0 || saved.tick > 1e9
+      || ![saved.time, saved.simulationTime, saved.countdown].every(value => Number.isFinite(value) && value >= 0 && value <= 1e9)
+      || saved.countdown > 3.4 || typeof saved.started !== "boolean" || typeof saved.finished !== "boolean"
+      || !Array.isArray(saved.cars) || saved.cars.length !== this.cars.length
+      || !Array.isArray(saved.finishOrder) || new Set(saved.finishOrder).size !== saved.finishOrder.length
+      || saved.finishOrder.some(id => !this.cars.some(car => car.id === id))) fail();
+    for (let index = 0; index < this.cars.length; index++) {
+      const row = saved.cars[index], template = expected.cars[index];
+      if (row?.id !== template.id || !Number.isInteger(row.rng) || row.rng < 1 || row.rng > 0xffffffff
+        || !validCheckpointRoute(row.route, this.track)
+        || !row.state || Object.keys(row.state).length !== Object.keys(template.state).length
+        || Object.entries(template.state).some(([key, initial]) => !Object.hasOwn(row.state, key)
+          || !validCheckpointValue(key, row.state[key], initial))) fail();
+      if (!["track", "entering", "service", "exit"].includes(row.state.pitState)
+        || !Number.isInteger(row.state.lap) || row.state.lap < 0 || row.state.lap > this.laps
+        || !Number.isInteger(row.state.nextSector) || row.state.nextSector < 0 || row.state.nextSector > this.track.sectors.length
+        || !Number.isInteger(row.state.trackIndex) || row.state.trackIndex < 0 || row.state.trackIndex >= this.track.samples.length
+        || !Number.isInteger(row.state.pitIndex) || row.state.pitIndex < 0 || row.state.pitIndex >= this.track.pit.samples.length
+        || row.state.pitStopsRequired !== this.requiredPitStops || !Number.isInteger(row.state.pitStopsCompleted)
+        || row.state.pitStopsCompleted < 0 || row.state.pitStopsCompleted > this.requiredPitStops
+        || (row.state.pitState === "service" && (!row.state.pitWord || !row.state.pitAttemptId))
+        || !["road", "grass", "gravel", "sand"].includes(row.state.surfaceType)
+        || row.state.heat < 0 || row.state.heat > 112
+        || row.state.health < 0 || row.state.health > this.cars[index].physics.maxHealth
+        || row.state.charge < 0 || row.state.charge > this.cars[index].physics.maxCharge) fail();
+    }
+    for (const key of ["tick", "time", "simulationTime", "countdown", "started", "finished"]) this[key] = saved[key];
+    this.finishOrder = [...saved.finishOrder];
+    this.cars.forEach((car, index) => {
+      Object.assign(car, saved.cars[index].state, { currentInput: { ...saved.cars[index].state.currentInput } });
+      car.rng.setState(saved.cars[index].rng);
+      car.routeContext = checkpointRoute(saved.cars[index].route);
+      if (resetInputs && !car.isBot && !car.abandoned) {
+        car.currentInput = neutralInput();
+        car.lastInputSequence = -1;
+        car.inputAge = 0;
+      }
+    });
+    return this;
   }
 
   snapshot() {

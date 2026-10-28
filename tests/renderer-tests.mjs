@@ -87,6 +87,7 @@ const track = generateTrack("renderer-countdown", 2);
       for (let tick = 0; tick < 30; tick++) {
         assert.equal(sprites.get({ ...car, ...damage, x: tick * 10, angle: tick * .03,
           place: 1 + tick % 12, heat: tick * 3, boost: Boolean(tick % 2), ram: true }), first);
+        sprites.drawSteeringWheels(makeContext(), { ...car, steeringPosition: Math.sin(tick) });
       }
       assert.equal(createdCanvasCount, before, "continuous state rebuilt a chassis canvas");
     }
@@ -98,7 +99,7 @@ const track = generateTrack("renderer-countdown", 2);
   sprites.get({ color: "invalid-color", health: 100, maxHealth: 100 });
   assert.equal(sprites.bodies.size, 36, "cache grew beyond twelve cars with three damage states");
   assert.equal(bodies[0].width, 1, "evicted backing store was not released");
-  const shared = [sprites.halo, sprites.flame, sprites.hotCore];
+  const shared = [sprites.halo, sprites.flame, sprites.hotCore, sprites.frontWheel];
   sprites.destroy(); sprites.destroy();
   assert.equal(sprites.bodies.size, 0);
   for (const canvas of [...bodies, ...shared]) assert.equal(canvas.width * canvas.height, 1);
@@ -230,7 +231,7 @@ const track = generateTrack("renderer-countdown", 2);
     "overtaking rebuilt chassis paint");
   assert.ok(afterOvertake.vehicleSpriteHits >= 2);
   const artSources = [...renderer.art.canvases, ...renderer.vehicleSprites.bodies.values(),
-    renderer.vehicleSprites.halo, renderer.vehicleSprites.flame, renderer.vehicleSprites.hotCore];
+    renderer.vehicleSprites.halo, renderer.vehicleSprites.flame, renderer.vehicleSprites.hotCore, renderer.vehicleSprites.frontWheel];
   renderer.destroy();
   for (const canvas of artSources) assert.equal(canvas.width * canvas.height, 1);
 }
