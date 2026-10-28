@@ -41,10 +41,6 @@ export function advanceCarMotion(car, input, p, dt, { traits = p, laps = 3, pit 
   const forwardSpeed = car.vx * Math.cos(car.angle) + car.vy * Math.sin(car.angle);
   const terrain = terrainModifiers(car, p, Math.abs(forwardSpeed));
   if (car.overheated && car.heat <= 48) car.overheated = false;
-  const heatStress = clamp((car.heat - 68) / 32, 0, 1);
-  const thermalAcceleration = car.overheated ? 0.58 : 1 - heatStress * 0.28;
-  const thermalSteering = car.overheated ? 0.72 : 1 - heatStress * 0.13;
-  const thermalTopSpeed = car.overheated ? 0.78 : 1 - heatStress * 0.08;
   const healthPenalty = car.health < p.maxHealth * 0.25 && !car.criticalGrace ? 0.78 : 1;
   const lastLapBoost = traits.lastLap && car.lap === laps - 1 ? 1.04 : 1;
   const lowHealthBoost = car.health < p.maxHealth * 0.3 ? Math.max(1, Number(traits.lowHealthBoost) || 1) : 1;
@@ -54,7 +50,8 @@ export function advanceCarMotion(car, input, p, dt, { traits = p, laps = 3, pit 
   car.boostActive = false;
   let boostAccelerationMultiplier = 0;
   let boostTopSpeedMultiplier = 1;
-  if (car.pitState === "track" && input.boost && input.throttle > 0 && !car.overheated && car.charge > 0.001) {
+  if (car.pitState === "track" && input.boost && input.throttle > 0 && !input.brake && !input.reverse
+    && !car.overheated && car.charge > 0.001) {
     const requestedCharge = p.boostDrain * dt;
     const fraction = clamp(car.charge / Math.max(0.0001, requestedCharge), 0, 1);
     if (fraction > 0.001) {
@@ -69,8 +66,14 @@ export function advanceCarMotion(car, input, p, dt, { traits = p, laps = 3, pit 
   if (car.heat >= 100) {
     car.overheated = true;
     car.boostActive = false;
+    boostAccelerationMultiplier = 0;
     boostTopSpeedMultiplier = 1;
   }
+  // Apply lockout and its loss of power in the same authoritative step.
+  const heatStress = clamp((car.heat - 68) / 32, 0, 1);
+  const thermalAcceleration = car.overheated ? 0.58 : 1 - heatStress * 0.28;
+  const thermalSteering = car.overheated ? 0.72 : 1 - heatStress * 0.13;
+  const thermalTopSpeed = car.overheated ? 0.78 : 1 - heatStress * 0.08;
   for (const [timer, multiplier] of [["startBoostTimer", 0.3], ["burstTimer", 0.35]]) {
     if (car[timer] > 0) {
       car[timer] = Math.max(0, car[timer] - dt);

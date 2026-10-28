@@ -68,27 +68,31 @@ export function applyDriveModel(state, input, physics, dt, modifiers = {}) {
   const boostTopSpeedMultiplier = Math.max(0.01, Number(modifiers.boostTopSpeedMultiplier) || 1);
   const extraAcceleration = Number(modifiers.extraAcceleration) || 0;
 
-  let acceleration = extraAcceleration;
-  if (input.throttle > 0) {
+  const wantsReverse = Boolean(input.reverse) || input.throttle < 0;
+  // S while W is held means braking, not competing engine/reverse torque.
+  // Releasing W still lets a held S engage reverse after stopping.
+  const brakeRequested = Boolean(input.brake) || (wantsReverse && input.throttle > 0);
+  const brakingForReverse = wantsReverse && forwardSpeed > 7;
+  const applyingBrake = brakeRequested || brakingForReverse;
+  let acceleration = applyingBrake ? Math.min(0, extraAcceleration) : extraAcceleration;
+  if (input.throttle > 0 && !wantsReverse && !applyingBrake) {
     acceleration += input.throttle * accelerationPower * (1 - speedRatio * 0.38) * accelerationMultiplier;
   }
 
-  const wantsReverse = Boolean(input.reverse) || input.throttle < 0;
-  const brakingForReverse = wantsReverse && forwardSpeed > 7;
-  if (wantsReverse && !brakingForReverse) {
+  if (wantsReverse && !applyingBrake) {
     acceleration -= reverseAcceleration * clamp(1 - Math.abs(forwardSpeed) / (maxSpeed * 0.3), 0.25, 1);
   }
 
-  if (input.brake || brakingForReverse) {
+  if (applyingBrake) {
     acceleration -= Math.sign(forwardSpeed || 1) * brakingPower;
   }
 
-  if (boostAccelerationMultiplier > 0) {
+  if (boostAccelerationMultiplier > 0 && !applyingBrake && !wantsReverse) {
     acceleration += accelerationPower * boostAccelerationMultiplier;
   }
 
   forwardSpeed += acceleration * step;
-  if ((input.brake || brakingForReverse)
+  if (applyingBrake
     && (forwardSpeedBeforeAcceleration === 0 || forwardSpeed * forwardSpeedBeforeAcceleration < 0)) forwardSpeed = 0;
   const maxForward = maxSpeed * topSpeedMultiplier * boostTopSpeedMultiplier;
   const speedLimit = Number.isFinite(Number(modifiers.speedLimit)) ? Math.max(0, Number(modifiers.speedLimit)) : Infinity;
@@ -96,16 +100,21 @@ export function applyDriveModel(state, input, physics, dt, modifiers = {}) {
   const reverseSpeedMultiplier = clamp(Number(modifiers.reverseSpeedMultiplier) || 0.26, 0.05, 1);
   const limitedForward = Math.min(maxForward, speedLimit);
 
-  if (Number.isFinite(speedLimit) && forwardSpeedBeforeAcceleration > limitedForward && forwardSpeed > limitedForward) {
-    // A pit-lane limiter must bleed speed away instead of deleting it in one
-    // physics tick. Positive throttle cannot cancel this deceleration, while
-    // active braking is still allowed to slow the car more aggressively.
-    const softenedSpeed = Math.max(limitedForward, forwardSpeedBeforeAcceleration - speedLimitDeceleration * step);
+  if (forwardSpeedBeforeAcceleration > limitedForward && forwardSpeed > limitedForward) {
+    // A lower engine ceiling removes thrust, not stored momentum. Ordinary
+    // drag and terrain resistance bleed off boost/thermal overspeed naturally.
+    // The pit limiter adds its explicit deceleration; braking can still win.
+    const limiterDeceleration = speedLimit <= maxForward ? speedLimitDeceleration : 0;
+    const softenedSpeed = Math.max(limitedForward, forwardSpeedBeforeAcceleration - limiterDeceleration * step);
     forwardSpeed = Math.min(forwardSpeed, softenedSpeed);
   } else {
     forwardSpeed = Math.min(forwardSpeed, limitedForward);
   }
-  forwardSpeed = Math.max(-maxSpeed * reverseSpeedMultiplier, forwardSpeed);
+  const reverseLimit = -maxSpeed * reverseSpeedMultiplier;
+  forwardSpeed = Math.max(forwardSpeed, Math.min(reverseLimit, forwardSpeedBeforeAcceleration));
+  // Grip sharing follows the actual longitudinal drive/brake force after
+  // limiting, rather than a throttle request that no longer produces thrust.
+  acceleration = step > 0 ? (forwardSpeed - forwardSpeedBeforeAcceleration) / step : 0;
 
   const requestedSteering = clamp(Number(input.steer) || 0, -1, 1);
   const rackResponse = (0.045 + speedRatio * 0.035)
@@ -213,7 +222,7 @@ export function applyDriveModel(state, input, physics, dt, modifiers = {}) {
     lateralSpeed += outwardDirection * Math.abs(forwardSpeed) * driftAmount * throttleSlip * step * 0.014;
   }
 
-  const brakeGripMultiplier = (input.brake || brakingForReverse)
+  const brakeGripMultiplier = applyingBrake
     ? Math.max(0.01, Number(modifiers.brakeGripMultiplier) || 1)
     : 1;
   const gripBase = lateralGrip * gripMultiplier;

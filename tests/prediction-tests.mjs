@@ -42,20 +42,27 @@ const physics = { ...meta.prediction, maxHealth: meta.maxHealth, maxCharge: meta
 
 // Shared modifiers are exercised through the real authoritative simulation and
 // the prediction path, including a hot/damaged car in a deliberate drift.
-{
+for (const scenario of ["drift", "thermal-lockout", "brake-priority"]) {
   const simulation = new RaceSimulation({ track: generateTrack(88201, 2), entries: [entry] });
   simulation.started = true; simulation.countdown = 0;
   const car = simulation.cars[0];
   car.vx = Math.cos(car.angle) * 190; car.vy = Math.sin(car.angle) * 190;
-  car.health = car.physics.maxHealth * 0.22; car.heat = 75;
+  car.health = car.physics.maxHealth * 0.22; car.heat = scenario === "thermal-lockout" ? 99.9 : 75;
+  if (scenario !== "drift") {
+    car.vx = Math.cos(car.angle) * car.physics.maxSpeed * 1.10;
+    car.vy = Math.sin(car.angle) * car.physics.maxSpeed * 1.10;
+  }
   const before = simulation.snapshot().cars[0];
-  const input = { ...neutralInput(), throttle: 0.6, steer: 0.4, drift: true };
+  const input = scenario === "drift" ? { ...neutralInput(), throttle: 0.6, steer: 0.4, drift: true }
+    : { ...neutralInput(), throttle: 1, boost: true, reverse: scenario === "brake-priority" };
   simulation.setInput(car.id, input, 1); simulation.step(1 / 60);
   const prediction = new LocalPrediction(); prediction.submit(input, 1, 0);
   prediction.sample({ ...before, inputSequence: -1 }, frame(before, 0, 0), { now: 1000 / 60, clockOffset: 0 });
   for (const key of ["vx", "vy", "angle", "angularVelocity", "driftAmount", "steeringPosition", "heat", "charge"]) {
-    assert.ok(Math.abs(car[key] - prediction.state[key]) < 1e-7, `authority/prediction ${key}: ${car[key]}/${prediction.state[key]}`);
+    assert.ok(Math.abs(car[key] - prediction.state[key]) < 1e-7, `${scenario} authority/prediction ${key}: ${car[key]}/${prediction.state[key]}`);
   }
+  assert.equal(car.boostActive, prediction.state.boostActive, `${scenario} boost state diverged`);
+  assert.equal(car.overheated, prediction.state.overheated, `${scenario} thermal state diverged`);
 }
 
 // Steering is progressive, cannot turn a stationary car, reverses naturally in
