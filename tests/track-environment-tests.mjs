@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
-import { generateTrack, polylineSelfIntersects, pitLaneFitsCircuit, wallBoundaryPoint, RUNOFF_SURFACES } from "../scripts/track.js";
-import { sceneryRoadDistance, sceneryOverlaps, sceneryContact } from "../scripts/scenery-geometry.js";
+import { generateTrack, polylineSelfIntersects, pitLaneFitsCircuit, wallBoundaryPoint, RUNOFF_SURFACES, roadWidthAt, nearestTrackPoint, pointAtTrackProgress } from "../scripts/track.js";
+import { sceneryRoadDistance, sceneryRoadClearance, sceneryOverlaps, sceneryContact } from "../scripts/scenery-geometry.js";
 import { RaceSimulation, buildRaceCarMeta, neutralInput } from "../scripts/physics.js";
 import { cloneDefaultBuild } from "../scripts/catalog.js";
 import { advanceCarMotion, terrainModifiers, applyTerrainForces } from "../scripts/physics/car-motion.js";
@@ -13,30 +13,39 @@ for (let seed = 0; seed < 45; seed++) {
   assert.equal(polylineSelfIntersects(track.samples), false);
   assert.ok(pitLaneFitsCircuit(track.pit, track.samples, track.totalLength, track.width, track.spatialGrid));
   for (const side of [-1,1]) assert.equal(polylineSelfIntersects(track.samples.map(p => wallBoundaryPoint(p,track.width,side))), false);
-  const city = track.city, c = Math.cos(city.rotation), s = Math.sin(city.rotation);
-  const straight = track.samples.filter(p => Math.min(Math.abs(p.tx*c+p.ty*s),Math.abs(-p.tx*s+p.ty*c)) < .015).length;
-  assert.ok(straight / track.samples.length > .4, "city streets became a freeform spline");
-  minimumBuildings = Math.min(minimumBuildings,track.scenery.length);
-  assert.ok(track.scenery.length >= 100 && track.scenery.length <= 192, "city density escaped its bounded plot count");
-  const cityArea=(city.columns.at(-1)-city.columns[0])*(city.rows.at(-1)-city.rows[0]);
-  assert.ok(track.scenery.reduce((sum,b)=>sum+b.width*b.height,0)/cityArea>.18,"city lost its built frontage");
-  assert.ok(city.blocks.some(block=>block.type==="civic"),"city landmark disappeared");
-  const pitRunoff = Math.max(...track.pit.samples.flatMap(p => [p.grassWidthLeft,p.grassWidthRight]));
-  for (const building of track.scenery) {
-    assert.equal(building.collisionShape,"box");
-    assert.ok(building.width >= 170 && building.height >= 120, "buildings returned to toy scale");
-    assert.ok(Math.abs(Math.sin((building.angle-city.rotation)*2)) < 1e-8, "building rotated away from street grid");
-    assert.ok(Math.abs(building.collisionRadius-Math.hypot(building.width,building.height)/2) < 1e-8);
-    assert.ok(sceneryRoadDistance(building,track.samples) >= track.width/2+32+12-1e-5, "foundation entered the race perimeter");
-    assert.ok(sceneryRoadDistance(building,track.pit.samples,false) >= track.pit.width/2+pitRunoff+12-1e-5, "foundation entered the service perimeter");
+  const city=track.city;
+  assert.equal(city.kind,'route-grown');
+  assert.ok(!city.columns && !city.rows,'the global street grid returned');
+  const widths=track.samples.map(p=>p.roadWidth);
+  assert.ok(Math.max(...widths)/Math.min(...widths)>1.8,'street classes lost their width contrast');
+  for(let i=0;i<track.samples.length;i++) {
+    const p=track.samples[i],q=track.samples[(i+1)%track.samples.length];
+    assert.ok(Math.abs(q.roadWidth-p.roadWidth)/p.segmentLength<.3,'street taper became an abrupt pinch');
+    const mid=pointAtTrackProgress(track,(p.cumulative+p.segmentLength*.5)/track.totalLength);
+    assert.ok(Math.abs(mid.roadWidth-(p.roadWidth+q.roadWidth)/2)<1e-7,'width interpolation diverged');
+    const projected=nearestTrackPoint(track,mid.x,mid.y,i);
+    assert.ok(Math.abs(projected.point.roadWidth-mid.roadWidth)<1e-5,'physics queries lost the local width');
   }
-  for (let a=0;a<track.scenery.length;a++) for(let b=a+1;b<track.scenery.length;b++) {
-    assert.equal(sceneryOverlaps(track.scenery[a],track.scenery[b],11.9),false,"city plots overlapped");
+  minimumBuildings=Math.min(minimumBuildings,track.scenery.length);
+  assert.ok(track.scenery.length>=80 && track.scenery.length<=220,'urban frontage disappeared or exceeded its budget');
+  assert.ok(city.roads.length>=4 && city.roads.length<=48,'secondary streets escaped their budget');
+  for(const road of city.roads)for(const p of road.points)assert.ok(p.x-road.width/2-city.sidewalk>=track.bounds.minX
+    && p.x+road.width/2+city.sidewalk<=track.bounds.maxX && p.y-road.width/2-city.sidewalk>=track.bounds.minY
+    && p.y+road.width/2+city.sidewalk<=track.bounds.maxY,'background streets escaped the static layer');
+  const headings=track.controls.map((p,i)=>{const q=track.controls[(i+1)%track.controls.length];return Math.atan2(q.y-p.y,q.x-p.x);});
+  assert.ok(headings.some((h,i)=>Math.abs(Math.sin((h-headings[0])*2))>.2),'all streets still follow two grid axes');
+  const pitRunoff=Math.max(...track.pit.samples.flatMap(p=>[p.grassWidthLeft,p.grassWidthRight]));
+  for(const building of track.scenery) {
+    assert.equal(building.collisionShape,'box');
+    assert.ok(building.width>=150 && building.height>=140,'toy building scale returned');
+    assert.ok(sceneryRoadClearance(building,track.samples,track.width)>=32+12-1e-5,'foundation entered variable-width asphalt');
+    assert.ok(sceneryRoadClearance(building,track.pit.samples,track.pit.width,false)>=pitRunoff+12-1e-5,'foundation entered service road');
+    for(const road of city.roads) assert.ok(sceneryRoadClearance(building,road.points,road.width,false)>=city.sidewalk+14-1e-5,'foundation blocked a side street');
   }
-  assert.ok(track.samples.every(p => p.surfaceLeft === "paving" && p.surfaceRight === "paving"));
-  assert.ok(track.pit.samples.every(p => p.surfaceLeft === "paving" && p.surfaceRight === "paving"));
-  const step = city.columns[1]-city.columns[0];
-  layouts.add(JSON.stringify(track.controls.map(p=>[Math.round((p.x*c+p.y*s)/step),Math.round((-p.x*s+p.y*c)/(city.rows[1]-city.rows[0]))])));
+  for(let a=0;a<track.scenery.length;a++)for(let b=a+1;b<track.scenery.length;b++)assert.equal(sceneryOverlaps(track.scenery[a],track.scenery[b],11.9),false);
+  assert.ok(track.samples.every(p=>p.surfaceLeft==='paving'&&p.surfaceRight==='paving'));
+  assert.ok(track.pit.samples.every(p=>p.surfaceLeft==='paving'&&p.surfaceRight==='paving'));
+  layouts.add(JSON.stringify(track.controls.map((p,i)=>Math.round(Math.hypot(p.x-track.controls[(i+1)%track.controls.length].x,p.y-track.controls[(i+1)%track.controls.length].y)/100))));
   if (track.complexity===5) assert.ok(track.tournamentLayout.technicalRatio>=.28 && track.tournamentLayout.longestStraightRatio>=.105);
 }
 assert.ok(layouts.size>=20,"city seeds did not produce distinct routes");
@@ -136,6 +145,19 @@ assert.ok(stopDistance("gravel")>24 && stopDistance("sand")>18,"loose ground sti
   assert.ok(vehicle.x+vehicle.physics.collisionHalfLength<obstacle.x-obstacle.width/2+.1,"vehicle remained inside the foundation");
 }
 const track=generateTrack("city-checkpoint",3,"city"), entries=[{id:"car",build,isBot:true,botSkill:3}];
+for(const wide of [false,true]) {
+  const point=track.samples.find(p=>(wide?p.roadWidth>track.width*1.4:p.roadWidth<track.width*.75)
+    && track.pit.samples.every(q=>Math.hypot(q.x-p.x,q.y-p.y)>500));
+  assert.ok(point);
+  const sim=new RaceSimulation({track,entries:[{id:'width-contact',build}],laps:2});
+  sim.started=true;sim.countdown=0;
+  const offset=wide?track.width*.55:point.roadWidth/2+4;
+  Object.assign(sim.cars[0],{x:point.x+point.nx*offset,y:point.y+point.ny*offset,
+    vx:0,vy:0,angle:Math.atan2(point.ty,point.tx),trackIndex:track.samples.indexOf(point)});
+  for(let tick=0;tick<15;tick++)sim.step();
+  assert.ok(wide?sim.cars[0].surfaceSeverity<.01:sim.cars[0].surfaceSeverity>.3,
+    'terrain contact used the nominal road width');
+}
 const original=new RaceSimulation({track,entries,laps:2});for(let i=0;i<700;i++)original.step();
 const restored=new RaceSimulation({track,entries,laps:2}).restoreCheckpoint(JSON.parse(JSON.stringify(original.exportCheckpoint())));
 for(let i=0;i<120;i++){original.step();restored.step();}

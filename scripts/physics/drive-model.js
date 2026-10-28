@@ -2,16 +2,17 @@ const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 const angleWrap = (angle) => Math.atan2(Math.sin(angle), Math.cos(angle));
 const dot = (ax, ay, bx, by) => ax * bx + ay * by;
 
-/** Shared tyre budget in world units/s². The HUD scale maps the unladen road
- * ceiling to roughly 0.75–1.6 g; thrust/braking reserve some of that grip.
- * The same base limit informs bot corner planning and client prediction.
+/** Shared racing tyre budget in world units/s². Speed support is deliberately
+ * milder than a modern F1 car, with a finite combined braking/cornering budget.
+ * Authority, prediction, garage estimates and bot planning use this function.
  */
-export function lateralAccelerationBudget(physics, gripMultiplier = 1, longitudinalAcceleration = 0) {
+export function lateralAccelerationBudget(physics, gripMultiplier = 1, longitudinalAcceleration = 0, speed = 0) {
   const grip = Math.max(0.01, Number(physics?.lateralGrip) || 1);
-  const base = clamp(105 + grip * 19, 125, 270);
+  const base = clamp(280 + grip * 20, 300, 500);
+  const speedSupport = 1 + .42 * Math.min(1.4, (Math.abs(speed) / 620) ** 2);
   const longitudinalLoad = clamp(Math.abs(longitudinalAcceleration)
     / Math.max(1, (Number(physics?.braking) || 1) * 1.5), 0, 0.98);
-  return base * Math.max(0.01, gripMultiplier) * Math.sqrt(Math.max(0.18, 1 - longitudinalLoad * longitudinalLoad));
+  return base * speedSupport * Math.max(0.01, gripMultiplier) * Math.sqrt(Math.max(0.18, 1 - longitudinalLoad * longitudinalLoad));
 }
 
 /**
@@ -190,7 +191,7 @@ export function applyDriveModel(state, input, physics, dt, modifiers = {}) {
   const driftYawMultiplier = 1 - driftAmount * 0.28 + (enteringDrift ? driftAmount * 0.06 : 0);
   state.angularVelocity = (Number(state.angularVelocity) || 0)
     + steering * steerRate * steerAuthority * steeringMultiplier * yawResponseMultiplier
-      * driftYawMultiplier * directionSign * step * 5.2;
+      * driftYawMultiplier * directionSign * step * (5.2 + 2.6 * (1 - driftAmount));
 
   if (driftAmount > 0) {
     const throttle = clamp(Number(input.throttle) || 0, 0, 1);
@@ -208,10 +209,14 @@ export function applyDriveModel(state, input, physics, dt, modifiers = {}) {
   state.angularVelocity *= Math.exp(-(baseAngularDamping * driftDampingScale + counterDamping) * step);
   // A finite tyre-force budget makes fast corners open out. Acceleration and
   // braking consume part of that budget, so slowing before a turn matters.
-  const lateralAccelerationLimit = lateralAccelerationBudget(p, gripMultiplier, acceleration);
+  const lateralAccelerationLimit = lateralAccelerationBudget(p, gripMultiplier, acceleration, forwardSpeed);
   const yawLimit = lateralAccelerationLimit / Math.max(32, Math.abs(forwardSpeed)) * (1 + driftAmount * 0.65);
   const supportedYaw = clamp(state.angularVelocity, -yawLimit, yawLimit);
-  state.angularVelocity += (supportedYaw - state.angularVelocity) * (1 - Math.exp(-step * 12));
+  // Rack smoothing already makes ordinary steering progressive. A second soft
+  // limiter allowed yaw to exceed tyre support every tick, accumulating large
+  // sideways slip even without Ctrl. Keep that freedom only for explicit drift.
+  if (driftAmount > .04) state.angularVelocity += (supportedYaw - state.angularVelocity) * (1 - Math.exp(-step * 12));
+  else state.angularVelocity = supportedYaw;
   const inertialVx = forwardX * forwardSpeed + rightX * lateralSpeed;
   const inertialVy = forwardY * forwardSpeed + rightY * lateralSpeed;
   state.angle = angleWrap((Number(state.angle) || 0) + state.angularVelocity * step);
@@ -238,7 +243,8 @@ export function applyDriveModel(state, input, physics, dt, modifiers = {}) {
     : 1;
   const gripBase = lateralGrip * gripMultiplier;
   const driftGripRetention = 1 - driftAmount * (counterSteering ? 0.28 : 0.52);
-  const controlledGrip = gripBase * Math.max(0.12, driftGripRetention)
+  const roadHolding = 1 + .95 * (1 - driftAmount);
+  const controlledGrip = gripBase * roadHolding * Math.max(0.12, driftGripRetention)
     * (counterSteering ? 1.15 + (driftControl - 1) * 0.34 : 1);
   const lateralDamping = 1 - Math.exp(-controlledGrip * brakeGripMultiplier * step);
   const lateralCorrection = clamp(lateralSpeed * lateralDamping, -lateralAccelerationLimit * step, lateralAccelerationLimit * step);

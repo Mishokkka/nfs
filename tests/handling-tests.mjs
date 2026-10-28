@@ -114,7 +114,7 @@ for (const event of ["boost-release", "thermal-lockout", "charge-empty", "grass-
     if (tick >= 30) lateralG += Math.abs(vx * (turning.vy - vy) - vy * (turning.vx - vx))
       / Math.hypot(vx, vy) / dt * (kmh / 3.6) / 9.81 / 30;
   }
-  assert.ok(lateralG >= 1.2 && lateralG <= 1.6, `base corner returned magnetic grip: ${lateralG} g`);
+  assert.ok(lateralG >= 2.4 && lateralG <= 3.3, `base racing grip left its target: ${lateralG} g`);
 }
 
 // Softer engines must still overcome passive losses in a genuine low-torque
@@ -142,12 +142,30 @@ for (const event of ["boost-release", "thermal-lockout", "charge-empty", "grass-
     const car = { ...simulation.cars[0], physics: { ...simulation.cars[0].physics, lateralGrip } };
     Object.assign(car, { x: point.x, y: point.y, angle: Math.atan2(point.ty, point.tx),
       vx: point.tx * 300, vy: point.ty * 300, botLaneBias: 0, botPhase: 0,
-      botCurvature: 0.0015, botSteer: 0, botThrottle: 0.6 });
+      botCurvature: 0.0025, botSteer: 0, botThrottle: 0.6 });
     return computeBotInput({ car, dt, track, cars: [car], laps: 3, tick: 1,
       routeContext: { mainNearest: nearestTrackPoint(track, car.x, car.y), pitNearest: null } });
   };
   assert.equal(run(2).brake, true, "low-grip bot ignored the corner's tyre demand");
   assert.equal(run(8).brake, false, "high-grip bot did not retain its cornering advantage");
+}
+
+// Every frame must hold ordinary steering without a large unrequested slide;
+// the dedicated drift key must still give a distinct, recoverable slide.
+for(const frame of ['allantry','arrow','spider','keel','bull','turtle']) {
+  const resolved=resolveBuild({...cloneDefaultBuild(),frame}),p=deriveCarPhysics(resolved);
+  const run=(car,input)=>advanceCarMotion(car,{...neutralInput(),...input},p,dt,{traits:resolved.traits});
+  const ordinary={...carAt(80/kmh),health:p.maxHealth,charge:p.maxCharge};
+  let largestSlip=0;
+  for(let tick=0;tick<60;tick++) {run(ordinary,{throttle:1,steer:1});largestSlip=Math.max(largestSlip,Math.abs(ordinary.slipAngle));}
+  assert.equal(ordinary.driftAmount,0,frame+' entered drift without Ctrl');
+  assert.ok(largestSlip<7*Math.PI/180,frame+' developed excessive ordinary sideslip');
+  const drift={...carAt(80/kmh),health:p.maxHealth,charge:p.maxCharge};
+  for(let tick=0;tick<70;tick++)run(drift,{throttle:.62,steer:.85,drift:true});
+  assert.ok(drift.driftAmount>.2 && Math.abs(drift.slipAngle)>largestSlip*1.5,frame+' lost intentional drift');
+  const disturbed={...carAt(80/kmh),vy:70,health:p.maxHealth,charge:p.maxCharge};
+  for(let tick=0;tick<48;tick++)run(disturbed,{throttle:.5});
+  assert.ok(Math.abs(disturbed.slipAngle)<Math.PI/180,frame+' failed to recover a lateral disturbance');
 }
 
 console.log("handling-tests: ok (balance targets, momentum, brake priority, reverse, pit limiter, bot tyre budget)");

@@ -120,7 +120,7 @@ function boundedStringArray(value, limit = 80) {
     && value.every((entry) => boundedString(entry, limit));
 }
 
-/** Validate the fixed 39-field protocol-16 row before reading positional fields. */
+/** Validate the fixed 39-field protocol-17 row before reading positional fields. */
 function compactRaceRowFitsSchema(row) {
   if (!Array.isArray(row) || row.length !== 39 || !boundedString(row[0], 80)) return false;
   for (let index = 1; index < row.length; index += 1) {
@@ -452,7 +452,7 @@ function normalizeRaceFrame(raw, race) {
 const PIT_STATE_TO_CODE = Object.freeze({ track: 0, entering: 1, service: 2, exit: 3 });
 const PIT_CODE_TO_STATE = Object.freeze(["track", "entering", "service", "exit"]);
 
-/** Pack validated state into protocol-16 rows, retaining input ACKs and all
+/** Pack validated state into protocol-17 rows, retaining input ACKs and all
  * deterministic motion state needed by prediction without duplicating metadata.
  */
 function encodeNormalizedFrame(frame) {

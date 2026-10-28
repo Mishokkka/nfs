@@ -60,6 +60,21 @@ export function sceneryRoadDistance(obstacle, points, closed = true) {
   return Math.max(0, Math.sqrt(distanceSquared) - (obstacle.collisionShape === "box" ? 0 : obstacle.collisionRadius));
 }
 
+/** Conservative foundation-to-asphalt clearance on a variable-width ribbon.
+ * The wider endpoint bounds the linear taper over each segment. */
+export function sceneryRoadClearance(obstacle, points, width, closed = true) {
+  let clearance = Infinity;
+  const count = closed ? points.length : points.length - 1;
+  for (let i=0;i<count;i++) {
+    const a=points[i],b=points[(i+1)%points.length];
+    const distance = obstacle.collisionShape === "box"
+      ? Math.sqrt(nearestBoxSegment(local(a,obstacle),local(b,obstacle),obstacle).distanceSquared)
+      : Math.hypot(project(obstacle,a,b).x-obstacle.x,project(obstacle,a,b).y-obstacle.y)-obstacle.collisionRadius;
+    clearance=Math.min(clearance,distance-Math.max(Number(a.roadWidth)||width,Number(b.roadWidth)||width)/2);
+  }
+  return clearance;
+}
+
 /** Return a world-space capsule/solid contact, using a circle only for round
  * objects. The enclosing radius is a broad phase, never the building's wall. */
 export function sceneryContact(capsule, obstacle, car) {

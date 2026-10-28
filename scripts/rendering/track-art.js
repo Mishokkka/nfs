@@ -1,4 +1,4 @@
-import { seededRng, wallBoundaryPoint } from "../track.js";
+import { seededRng, wallBoundaryPoint, roadWidthAt, roadEdgePoint } from "../track.js";
 
 const PALETTES = Object.freeze({
   city: { road: "#414448", ground: "#353b3c", light: "#434a47", grass: "#68705b", curb: "#b7ad95" },
@@ -20,11 +20,18 @@ export class TrackArt {
     this.ground = this.#texture(this.palette.ground, `${track.seed}:ground`, true);
     this.city = track.city;
     this.paving = this.city ? this.#paving(track.seed) : null;
-    this.streets = new Path2D();
     this.cityClosures = [];
-    for (const road of this.city?.roads ?? []) {
-      this.streets.moveTo(road.x1, road.y1); this.streets.lineTo(road.x2, road.y2);
-    }
+    this.streetPaths = (this.city?.roads ?? []).map(road => {
+      const path = new Path2D();
+      road.points.forEach((p,i)=>i?path.lineTo(p.x,p.y):path.moveTo(p.x,p.y));
+      return {path,width:road.width};
+    });
+    this.roadBands = this.city ? [6,3.5,0].map(margin => {
+      const path=new Path2D();
+      const edge=[...track.samples.map(p=>roadEdgePoint(p,track.width,1,margin)),
+        ...track.samples.toReversed().map(p=>roadEdgePoint(p,track.width,-1,margin))];
+      edge.forEach((p,i)=>i?path.lineTo(p.x,p.y):path.moveTo(p.x,p.y));path.closePath();return path;
+    }) : null;
     if(this.city) this.#streetClosures(track);
     this.grid = new Path2D();
     this.arrows = new Path2D();
@@ -33,25 +40,13 @@ export class TrackArt {
   }
 
   #streetClosures(track) {
-    const city=this.city,c=Math.cos(city.rotation),s=Math.sin(city.rotation);
-    for(const x of city.columns) for(const y of city.rows) {
-      const node={x:x*c-y*s,y:x*s+y*c};
-      let best=null,distance=Infinity;
-      for(let i=0;i<track.samples.length;i++) {
-        const p=track.samples[i],d=Math.hypot(node.x-p.x,node.y-p.y);
-        if(d<distance){best={p,index:i};distance=d;}
-      }
-      if(distance>40)continue;
-      const {p,index}=best;
-      const before=track.samples[(index-3+track.samples.length)%track.samples.length],after=track.samples[(index+3)%track.samples.length];
-      if(before.tx*after.tx+before.ty*after.ty<.999)continue;
-      for(const side of [-1,1]) {
-        const key=side>0?"wallLeft":"wallRight";
-        if(Number(p[key+"Alpha"]??1)<.96 || Number(p[key+"SegmentAlpha"]??1)<.96)continue;
-        const position=wallBoundaryPoint(p,track.width,side);
-        if(track.pit.samples.some(point=>Math.hypot(position.x-point.x,position.y-point.y)<track.pit.width/2+20))continue;
-        this.cityClosures.push({...position,angle:Math.atan2(p.ty,p.tx),width:city.roadWidth*.86});
-      }
+    for(const junction of this.city.junctions) {
+      const p=track.samples[junction.index],side=junction.side;
+      const key=side>0?'wallLeft':'wallRight';
+      if(Number(p[key+'Alpha']??1)<.96 || Number(p[key+'SegmentAlpha']??1)<.96)continue;
+      const position=wallBoundaryPoint(p,track.width,side);
+      if(track.pit.samples.some(q=>Math.hypot(position.x-q.x,position.y-q.y)<track.pit.width/2+20))continue;
+      this.cityClosures.push({...position,angle:Math.atan2(p.ty,p.tx),width:junction.width*.96});
     }
   }
 
@@ -90,31 +85,19 @@ export class TrackArt {
    * closed race route. The route barriers still close every side intersection. */
   paintCity(ctx) {
     if (!this.city) return;
-    const city = this.city;
-    ctx.save(); ctx.rotate(city.rotation);
-    ctx.lineJoin = "round"; ctx.lineCap = "butt"; ctx.setLineDash([]);
-    ctx.strokeStyle = this.paving ?? "#888576";
-    ctx.lineWidth = city.roadWidth + city.sidewalk * 2; ctx.stroke(this.streets);
-    ctx.strokeStyle = "#bab29a"; ctx.lineWidth = city.roadWidth + 5; ctx.stroke(this.streets);
-    ctx.strokeStyle = this.asphalt ?? this.palette.road; ctx.lineWidth = city.roadWidth; ctx.stroke(this.streets);
-    ctx.strokeStyle = "#c6b99755"; ctx.lineWidth = 2; ctx.setLineDash([24,32]); ctx.stroke(this.streets); ctx.setLineDash([]);
-    // Small internal yards give the blocks a legible scale and open space;
-    // their plots never overlap racing asphalt or the service branch.
-    for (const block of city.blocks) {
-      const {x,y,type}=block;
-      const px = (city.columns[x] + city.columns[x + 1]) / 2;
-      const py = (city.rows[y] + city.rows[y + 1]) / 2;
-      if(type==="park") {
-        const w=city.columns[x+1]-city.columns[x]-city.roadWidth-90;
-        const h=city.rows[y+1]-city.rows[y]-city.roadWidth-90;
-        ctx.fillStyle="#51694f";ctx.fillRect(px-w/2,py-h/2,w,h);
-        ctx.fillStyle=this.paving??"#918b75";ctx.fillRect(px-12,py-h/2,24,h);ctx.fillRect(px-w/2,py-12,w,24);
-        ctx.fillStyle="#536b72";ctx.beginPath();ctx.arc(px,py,33,0,Math.PI*2);ctx.fill();
-        ctx.strokeStyle="#b5b19a";ctx.lineWidth=5;ctx.stroke();
-        continue;
-      }
-      ctx.fillStyle = "#77796b"; ctx.fillRect(px - 75, py - 90, 150, 180);
-      ctx.fillStyle = "#5c7057"; ctx.fillRect(px - 50, py - 48, 100, 96);
+    ctx.save();ctx.lineJoin='round';ctx.lineCap='round';ctx.setLineDash([]);
+    for(const {path,width} of this.streetPaths) {
+      ctx.strokeStyle=this.paving??'#888576';ctx.lineWidth=width+this.city.sidewalk*2;ctx.stroke(path);
+      ctx.strokeStyle='#bab29a';ctx.lineWidth=width+5;ctx.stroke(path);
+      ctx.strokeStyle=this.asphalt??this.palette.road;ctx.lineWidth=width;ctx.stroke(path);
+    }
+    for(const park of this.city.parks) {
+      ctx.save();ctx.translate(park.x,park.y);ctx.rotate(park.angle);
+      ctx.fillStyle='#52684f';ctx.fillRect(-park.width/2,-park.height/2,park.width,park.height);
+      ctx.fillStyle=this.paving??'#918b75';ctx.fillRect(-9,-park.height/2,18,park.height);
+      ctx.fillRect(-park.width/2,-9,park.width,18);
+      ctx.fillStyle='#536b72';ctx.beginPath();ctx.arc(0,0,23,0,Math.PI*2);ctx.fill();
+      ctx.strokeStyle='#b5b19a';ctx.lineWidth=4;ctx.stroke();ctx.restore();
     }
     ctx.restore();
   }
@@ -160,7 +143,7 @@ export class TrackArt {
     }
     for (let index = 0; index < 12; index++) {
       const p = points[(points.length - 5 - Math.floor(index / 2) * 7 + points.length) % points.length];
-      const lane = (index % 2 ? 1 : -1) * Math.min(42, track.width * 0.19);
+      const lane = (index % 2 ? 1 : -1) * Math.min(42, roadWidthAt(p,track.width) * 0.19);
       for (const [i, [x, y]] of [[20, -17], [-23, -17], [-23, 17], [20, 17]].entries()) {
         const wx = p.x + p.tx * x + p.nx * (y + lane), wy = p.y + p.ty * x + p.ny * (y + lane);
         if (i) this.grid.lineTo(wx, wy); else this.grid.moveTo(wx, wy);
@@ -171,6 +154,13 @@ export class TrackArt {
   /** Stroke a textured road with layered shoulders and alternating kerb paint. */
   paintRoad(ctx, path, width, pit = false) {
     ctx.setLineDash([]);
+    if(!pit && this.roadBands) {
+      for(let i=0;i<this.roadBands.length;i++) {
+        ctx.fillStyle=i===0?'#14232b':i===1?'#bbb49c':this.asphalt??this.palette.road;
+        ctx.fill(this.roadBands[i]);
+      }
+      return;
+    }
     ctx.strokeStyle = "#14232b"; ctx.lineWidth = width + 12; ctx.stroke(path);
     ctx.strokeStyle = this.city ? "#bbb49c" : "#d3d9ca"; ctx.lineWidth = width + 7; ctx.stroke(path);
     ctx.strokeStyle = pit ? "#75aaaf" : this.palette.curb;
@@ -194,7 +184,8 @@ export class TrackArt {
     this.canvases.length = 0;
     this.asphalt = null; this.ground = null;
     this.grid = null; this.arrows = null; this.rubber = null;
-    this.city = null; this.paving = null; this.streets = null;
+    this.city = null; this.paving = null;
     this.cityClosures.length = 0;
+    this.streetPaths.length = 0; this.roadBands = null;
   }
 }

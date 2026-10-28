@@ -1,4 +1,4 @@
-import { samplePitAhead, sampleTrackAhead } from "../track.js";
+import { samplePitAhead, sampleTrackAhead, roadWidthAt } from "../track.js";
 import { lateralAccelerationBudget } from "./drive-model.js";
 
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
@@ -36,7 +36,7 @@ export function computeBotInput({ car, dt, routeContext, track, cars, laps, tick
     && serviceRemaining <= Math.max(280, serviceBrakingDistance * 1.2 + serviceHalfLength)
     && serviceRemaining >= -serviceHalfLength * 0.9;
   const routeNearest = pitApproach ? pitNearest : mainNearest;
-  const routeWidth = pitApproach ? track.pit.width : track.width;
+  const routeWidth = roadWidthAt(routeNearest.point, pitApproach ? track.pit.width : track.width);
   const ahead = (distance) => pitApproach
     ? samplePitAhead(track, routeNearest.index, distance)
     : sampleTrackAhead(track, routeNearest.index, distance);
@@ -75,6 +75,8 @@ export function computeBotInput({ car, dt, routeContext, track, cars, laps, tick
     target = samplePitAhead(track, mappedIndex, lookaheadDistance * 0.72);
     laneOffset = 0;
   }
+  const laneRoom = Math.max(0, Math.min(routeWidth,roadWidthAt(target,routeWidth))*.5 - car.physics.collisionHalfWidth - 12);
+  laneOffset = clamp(laneOffset,-laneRoom,laneRoom);
   const targetX = target.x + target.nx * laneOffset;
   const targetY = target.y + target.ny * laneOffset;
   const pursuitHeading = Math.atan2(targetY - car.y, targetX - car.x);
@@ -126,7 +128,7 @@ export function computeBotInput({ car, dt, routeContext, track, cars, laps, tick
   const skillPace = [0, 0.91, 0.97, 1.04, 1.14][skill];
   // Leave tyre capacity for throttle/braking and line corrections. Planning
   // from the drive model's budget keeps every skill tier on the same tyres.
-  const safeCornerSpeed = Math.sqrt(lateralAccelerationBudget(car.physics) * 0.72 / curvaturePerUnit);
+  const safeCornerSpeed = Math.sqrt(lateralAccelerationBudget(car.physics,1,0,forwardSpeed) * 0.72 / curvaturePerUnit);
   const cornerConfidence = [0, 0.94, 0.99, 1.05, 1.12][skill];
   let targetSpeed = Math.min(car.physics.maxSpeed * skillPace, safeCornerSpeed * cornerConfidence);
   targetSpeed = Math.max(car.physics.maxSpeed * [0, 0.22, 0.24, 0.27, 0.30][skill], targetSpeed);

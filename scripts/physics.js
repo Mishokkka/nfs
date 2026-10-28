@@ -11,7 +11,8 @@ import {
   wallSegmentActiveRange,
   wallBoundaryPoint,
   WALL_COLLISION_ALPHA,
-  RUNOFF_SURFACES
+  RUNOFF_SURFACES,
+  roadWidthAt
 } from "./track.js";
 import { computeBotInput, shouldBotPit } from "./physics/bot-controller.js";
 import { advanceCarMotion, terrainModifiers, applyTerrainForces } from "./physics/car-motion.js";
@@ -24,7 +25,7 @@ const CHECKPOINT_NULLABLE_STRINGS = new Set(["pitWord", "pitAttemptId"]);
 const checkpointRoute = route => route == null ? null : Object.fromEntries(["mainNearest", "pitNearest"].map(key => [key,
   route[key] == null ? null : { index: route[key].index, progress: route[key].progress,
     signedDistance: route[key].signedDistance, point: { ...route[key].point } }]));
-const CHECKPOINT_POINT_KEYS = "x y tx ty nx ny cumulative grassWidth grassWidthLeft grassWidthRight surfaceLeft surfaceRight wallLeftAlpha wallRightAlpha wallLeftX wallLeftY wallRightX wallRightY mainProgressUnwrapped".split(" ");
+const CHECKPOINT_POINT_KEYS = "x y tx ty nx ny cumulative roadWidth grassWidth grassWidthLeft grassWidthRight surfaceLeft surfaceRight wallLeftAlpha wallRightAlpha wallLeftX wallLeftY wallRightX wallRightY mainProgressUnwrapped".split(" ");
 
 function validCheckpointRoute(route, track) {
   if (route === null) return true;
@@ -279,7 +280,7 @@ export class RaceSimulation {
     const startIndex = (this.track.samples.length - 5 - Math.floor(index / 2) * 7 + this.track.samples.length) % this.track.samples.length;
     const start = sampleTrack(this.track, startIndex);
     const lane = index % 2 === 0 ? -1 : 1;
-    const offset = lane * Math.min(42, this.track.width * 0.19);
+    const offset = lane * Math.min(42, roadWidthAt(start, this.track.width) * 0.19);
     return {
       id: entry.id,
       userId: entry.userId ?? null,
@@ -605,7 +606,7 @@ export class RaceSimulation {
       car.botRecoveryRequested = false;
       if (this.collisionMode === "recovery" && car.pitState === "track") {
         const point = mainNearest.point;
-        const lane = clamp(car.botLaneBias || 0, -0.12, 0.12) * this.track.width;
+        const lane = clamp(car.botLaneBias || 0, -0.12, 0.12) * roadWidthAt(point, this.track.width);
         car.x = point.x + point.nx * lane;
         car.y = point.y + point.ny * lane;
         car.angle = Math.atan2(point.ty, point.tx);
@@ -676,8 +677,9 @@ export class RaceSimulation {
         && pitNearest.index <= Math.min(this.track.pit.samples.length - 1, this.track.pit.entryTriggerEnd + 3);
       const separated = Number(branchPoint?.separation ?? 0) >= 0.86;
       const insidePitAsphalt = pitNearest.distance <= this.track.pit.width * 0.44;
-      const outsideMainAsphalt = mainNearest.distance >= this.track.width * 0.56;
-      const onPitSide = mainNearest.signedDistance * Number(this.track.pit.side || 1) >= this.track.width * 0.36;
+      const mainWidth = roadWidthAt(mainNearest.point, this.track.width);
+      const outsideMainAsphalt = mainNearest.distance >= mainWidth * 0.56;
+      const onPitSide = mainNearest.signedDistance * Number(this.track.pit.side || 1) >= mainWidth * 0.36;
       const clearlyCloserToPit = pitNearest.distance + Math.max(14, this.track.pit.width * 0.14) < mainNearest.distance;
       const movingAlongPit = dot(car.vx, car.vy, Number(branchPoint?.tx) || 0, Number(branchPoint?.ty) || 0) > 2;
       // Entering the branch is a swept gate crossing, not a proximity test. This
@@ -1024,7 +1026,7 @@ export class RaceSimulation {
       && embeddedSpeed < 56;
     if (needsRecovery && recoveryCandidate?.nearest) {
       const point = recoveryCandidate.nearest.point;
-      const lane = car.pitState === "track" ? clamp(car.botLaneBias || 0, -0.18, 0.18) * this.track.width : 0;
+      const lane = car.pitState === "track" ? clamp(car.botLaneBias || 0, -0.18, 0.18) * roadWidthAt(point, this.track.width) : 0;
       car.x = point.x + point.nx * lane;
       car.y = point.y + point.ny * lane;
       car.angle = Math.atan2(point.ty, point.tx);
@@ -1089,8 +1091,8 @@ export class RaceSimulation {
     const makeCandidate = (nearest, roadWidth, fallbackGrass, route) => {
       if (!nearest) return null;
       const side = Number(nearest.signedDistance) >= 0 ? 1 : -1;
-      const halfRoad = roadWidth * 0.5;
       const point = nearest.point ?? {};
+      const halfRoad = roadWidthAt(point, roadWidth) * 0.5;
       const sideGrass = side > 0 ? point.grassWidthLeft : point.grassWidthRight;
       const grassWidth = Math.max(0, Number(sideGrass ?? point.grassWidth ?? fallbackGrass ?? 0));
       const surfaceType = runoffSurfaceForSide(point, side);
@@ -1169,7 +1171,7 @@ export class RaceSimulation {
       && car.offroadTimer > 1.6
       && Math.hypot(car.vx, car.vy) < 48) {
       const point = surface.nearest.point;
-      const lane = car.pitState === "track" ? clamp(car.botLaneBias || 0, -0.14, 0.14) * this.track.width : 0;
+      const lane = car.pitState === "track" ? clamp(car.botLaneBias || 0, -0.14, 0.14) * roadWidthAt(point, this.track.width) : 0;
       car.x = point.x + point.nx * lane;
       car.y = point.y + point.ny * lane;
       car.angle = Math.atan2(point.ty, point.tx);
@@ -1207,8 +1209,9 @@ export class RaceSimulation {
       const along = dot(dx, dy, gate.tx, gate.ty);
       const lateral = dot(dx, dy, gate.nx, gate.ny);
       const tangentSpeed = dot(car.vx, car.vy, gate.tx, gate.ty);
-      const alongTolerance = Math.max(38, this.track.width * 0.22);
-      const lateralTolerance = this.track.width * 0.5 + Number(gate.grassWidth ?? this.track.grassWidth ?? 0) + car.physics.radius;
+      const gateWidth = roadWidthAt(gate, this.track.width);
+      const alongTolerance = Math.max(38, gateWidth * 0.22);
+      const lateralTolerance = gateWidth * 0.5 + Number(gate.grassWidth ?? this.track.grassWidth ?? 0) + car.physics.radius;
       return Math.abs(along) <= alongTolerance
         && Math.abs(lateral) <= lateralTolerance
         && tangentSpeed > -30
@@ -1273,7 +1276,7 @@ export class RaceSimulation {
     const hasCornerEffect = car.resolved.traits.cornerCharge || car.resolved.traits.exitBurst;
     if (hasCornerEffect) {
       const turning = Math.abs(steering) > 0.45 && speed > car.physics.maxSpeed * 0.38;
-      if (turning && Math.abs(nearest.signedDistance) < this.track.width * 0.28) {
+      if (turning && Math.abs(nearest.signedDistance) < roadWidthAt(nearest.point, this.track.width) * 0.28) {
         car.cornerAccumulator += dt;
       } else if (car.cornerAccumulator > 0.55) {
         if (car.resolved.traits.cornerCharge) {

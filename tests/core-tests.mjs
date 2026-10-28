@@ -617,13 +617,17 @@ function forwardSpeed(car) {
     trackIndex: 150
   });
   const initialB = Math.hypot(b.vx, b.vy);
+  let peakSpinA = 0, peakSpinB = 0;
   for (let tick = 0; tick < 8; tick += 1) {
     simulation.setInput(a.id, neutralInput());
     simulation.setInput(b.id, neutralInput());
     simulation.step(1 / 60);
+    peakSpinA = Math.max(peakSpinA,Math.abs(a.angularVelocity));
+    peakSpinB = Math.max(peakSpinB,Math.abs(b.angularVelocity));
   }
   assert.ok(Math.hypot(b.vx, b.vy) > initialB + 45, "rear car did not transfer momentum");
-  assert.ok(Math.abs(a.angularVelocity) > 0.25 && Math.abs(b.angularVelocity) > 0.25, "glancing collision caused no spin");
+  assert.ok(peakSpinA > .5 && peakSpinB > .5 && Math.abs(a.angle-heading) > .04 && Math.abs(b.angle-heading) > .04,
+    "glancing collision caused no rotation before tyre recovery");
   assert.ok(a.health < a.physics.maxHealth && b.health < b.physics.maxHealth, "collision caused no damage");
   assert.ok(Math.hypot(a.x - b.x, a.y - b.y) > a.physics.collisionHalfWidth + b.physics.collisionHalfWidth,
     "cars remained interpenetrating");

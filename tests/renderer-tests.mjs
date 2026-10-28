@@ -7,8 +7,9 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 globalThis.foundry = { utils: { deepClone: structuredClone } };
 globalThis.Path2D = class {
-  moveTo() {}
-  lineTo() {}
+  constructor() { this.commands=[]; }
+  moveTo(x,y) { this.commands.push(["move",x,y]); }
+  lineTo(x,y) { this.commands.push(["line",x,y]); }
   quadraticCurveTo() {}
   arc() {}
   closePath() {}
@@ -76,12 +77,33 @@ const track = generateTrack("renderer-countdown", 2);
 {
   const city = generateTrack("city-render-budget",3,"city");
   const urbanRenderer = new RaceRenderer(makeCanvas(),city);
+  const painted=[],context=makeContext();context.fill=path=>painted.push(path);
+  urbanRenderer.art.paintRoad(context,urbanRenderer.trackPath,city.width);
+  assert.deepEqual(painted,urbanRenderer.art.roadBands,"city asphalt fell back to a constant-width stroke");
+  const asphalt=urbanRenderer.art.roadBands[2].commands;
+  for(const index of [0,Math.floor(city.samples.length/3),Math.floor(city.samples.length*2/3)]) {
+    const p=city.samples[index],vertex=asphalt[index];
+    assert.ok(Math.abs(((vertex[1]-p.x)*p.nx+(vertex[2]-p.y)*p.ny)*2-p.roadWidth)<1e-7,"drawn asphalt width differs from physics");
+  }
   assert.equal(urbanRenderer.art.canvases.length,3);
   assert.ok(urbanRenderer.art.cityClosures.length>0 && urbanRenderer.art.cityClosures.length<=64);
   const textures=[...urbanRenderer.art.canvases];
   urbanRenderer.destroy();
   for(const canvas of textures)assert.equal(canvas.width*canvas.height,1);
   assert.equal(urbanRenderer.art.cityClosures.length,0);
+}
+
+// Surface transitions must occur at the same midpoint in static paint and
+// nearest-point terrain queries, rather than one sample apart.
+{
+  const t=generateTrack('surface-seam-paint',2),p=t.samples[0],q=t.samples[1];
+  p.surfaceLeft='grass';q.surfaceLeft='sand';
+  const r=new RaceRenderer(makeCanvas(),t);
+  const expected={x:(p.x+p.nx*t.width/2+q.x+q.nx*t.width/2)/2,y:(p.y+p.ny*t.width/2+q.y+q.ny*t.width/2)/2};
+  for(const material of ['grass','sand'])assert.ok(r.runoffSurfacePaths[material].commands.some(([,x,y])=>Math.hypot(x-expected.x,y-expected.y)<1e-7),'paint omitted the shared material seam');
+  const {nearestTrackPoint}=await import(pathToFileURL(path.join(root,'scripts/track.js')).href);
+  for(const [fraction,material] of [[.25,'grass'],[.75,'sand']])assert.equal(nearestTrackPoint(t,p.x+(q.x-p.x)*fraction,p.y+(q.y-p.y)*fraction,0).point.surfaceLeft,material);
+  r.destroy();
 }
 
 // Continuous telemetry must not allocate paint. Only three discrete damage

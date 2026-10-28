@@ -39,7 +39,7 @@ export function estimateBuildPerformance(resolved) {
   }
   const brakingDistance = braking.x * METRES;
   const value = Object.freeze({ maxSpeed: physics.maxSpeed * KMH, zeroTo100, brakingDistance,
-    lateralBudget: lateralAccelerationBudget(physics) * METRES / 9.81,
+    lateralBudget: lateralAccelerationBudget(physics, 1, 0, 100 / KMH) * METRES / 9.81,
     maxHealth: physics.maxHealth, maxCharge: physics.maxCharge });
   cache.set(key, value);
   if (cache.size > 64) cache.delete(cache.keys().next().value);
@@ -50,7 +50,7 @@ const METRICS = [
   ["maxSpeed", "Предел скорости без форсажа", "Скорость", "км/ч", 0, 1],
   ["zeroTo100", "Разгон с места до 100 км/ч без форсажа", "0–100", "с", 1, -1],
   ["brakingDistance", "Тормозной путь с 80 км/ч до остановки, без времени реакции", "80–0", "м", 1, -1],
-  ["lateralBudget", "Предел бокового ускорения шин на сухом асфальте, без одновременного торможения", "Сцепление", "g", 2, 1],
+  ["lateralBudget", "Предел бокового ускорения шин при 100 км/ч на сухом асфальте, без одновременного торможения", "Сцепление", "g", 2, 1],
   ["maxHealth", "Максимальная прочность", "Прочность", "", 0, 1],
   ["maxCharge", "Максимальный заряд", "Заряд", "", 0, 1]
 ];

@@ -6,7 +6,9 @@ import {
   boundaryPoint,
   wallBoundaryPoint,
   wallSegmentActiveRange,
-  RUNOFF_SURFACES
+  RUNOFF_SURFACES,
+  roadWidthAt,
+  roadEdgePoint
 } from "./track.js";
 import { LocalPrediction } from "./netcode/local-prediction.js";
 import { VehicleSprites, REAR_CORE_X } from "./rendering/vehicle-sprites.js";
@@ -816,7 +818,6 @@ export class RaceRenderer {
     const paths = Object.fromEntries(RUNOFF_SURFACES.map(type => [type, new Path2D()]));
     if (!points?.length) return paths;
     const segmentCount = closed ? points.length : Math.max(0, points.length - 1);
-    const halfRoad = Math.max(0, Number(roadWidth) || 0) * 0.5;
     for (let index = 0; index < segmentCount; index += 1) {
       const nextIndex = closed ? (index + 1) % points.length : index + 1;
       const point = points[index];
@@ -824,16 +825,20 @@ export class RaceRenderer {
       for (const side of [1, -1]) {
         if (grassWidthForSide(point, side) <= 0.5 && grassWidthForSide(next, side) <= 0.5) continue;
         const type = forcedSurface ?? runoffSurfaceForSide(point, side);
-        const path = paths[type] ?? paths.grass;
-        const innerA = { x: point.x + point.nx * halfRoad * side, y: point.y + point.ny * halfRoad * side };
-        const innerB = { x: next.x + next.nx * halfRoad * side, y: next.y + next.ny * halfRoad * side };
+        const nextType = forcedSurface ?? runoffSurfaceForSide(next, side);
+        const innerA = roadEdgePoint(point,roadWidth,side);
+        const innerB = roadEdgePoint(next,roadWidth,side);
         const outerA = wallBoundaryPoint(point, roadWidth, side);
         const outerB = wallBoundaryPoint(next, roadWidth, side);
-        path.moveTo(innerA.x, innerA.y);
-        path.lineTo(innerB.x, innerB.y);
-        path.lineTo(outerB.x, outerB.y);
-        path.lineTo(outerA.x, outerA.y);
-        path.closePath();
+        // Terrain queries switch material halfway along a segment. Split the
+        // visual patch at that same position rather than a whole sample later.
+        const slices = type === nextType ? [[type,0,1]] : [[type,0,.5],[nextType,.5,1]];
+        const mix = (a,b,t) => ({x:a.x+(b.x-a.x)*t,y:a.y+(b.y-a.y)*t});
+        for(const [material,start,end] of slices) {
+          const path=paths[material]??paths.grass;
+          const a=mix(innerA,innerB,start),b=mix(innerA,innerB,end),c=mix(outerA,outerB,end),d=mix(outerA,outerB,start);
+          path.moveTo(a.x,a.y);path.lineTo(b.x,b.y);path.lineTo(c.x,c.y);path.lineTo(d.x,d.y);path.closePath();
+        }
       }
     }
     return paths;
@@ -854,7 +859,7 @@ export class RaceRenderer {
         const type = runoffSurfaceForSide(point, side);
         const noise = Math.sin(index * 12.9898 + side * 78.233) * 43758.5453;
         const unit = noise - Math.floor(noise);
-        const offset = roadWidth * 0.5 + width * (0.16 + unit * 0.70);
+        const offset = roadWidthAt(point,roadWidth) * 0.5 + width * (0.16 + unit * 0.70);
         const centerX = point.x + point.nx * offset * side;
         const centerY = point.y + point.ny * offset * side;
         if (type === "grass") {
@@ -990,7 +995,7 @@ export class RaceRenderer {
     if (!ctx) return;
     const maxTrackGrass = maximumRunoffWidth(this.track.samples);
     const maxPitGrass = maximumRunoffWidth(this.track.pit?.samples);
-    const padding = Math.max(this.track.width * 0.5 + maxTrackGrass, (this.track.pit?.width ?? 0) * 0.5 + maxPitGrass) + 72;
+    const padding = Math.max(Math.max(this.track.width,...this.track.samples.map(p=>roadWidthAt(p,this.track.width))) * 0.5 + maxTrackGrass, (this.track.pit?.width ?? 0) * 0.5 + maxPitGrass) + 72;
     const minX = this.track.bounds.minX - padding;
     const minY = this.track.bounds.minY - padding;
     const worldWidth = this.track.bounds.maxX - this.track.bounds.minX + padding * 2;
@@ -1361,7 +1366,7 @@ export class RaceRenderer {
           grassWidthForSide(a, 1), grassWidthForSide(a, -1),
           grassWidthForSide(b, 1), grassWidthForSide(b, -1)
         );
-        const radius = roadWidth * 0.5 + grassRadius + 24;
+        const radius = Math.max(roadWidthAt(a,roadWidth),roadWidthAt(b,roadWidth)) * 0.5 + grassRadius + 24;
         const minTileX = Math.floor((Math.min(a.x, b.x) - radius) / TRACK_TILE_WORLD_SIZE);
         const maxTileX = Math.floor((Math.max(a.x, b.x) + radius) / TRACK_TILE_WORLD_SIZE);
         const minTileY = Math.floor((Math.min(a.y, b.y) - radius) / TRACK_TILE_WORLD_SIZE);
@@ -1373,7 +1378,9 @@ export class RaceRenderer {
     };
     markPolyline(this.track.samples, this.track.width, true);
     markPolyline(this.track.pit?.samples ?? [], this.track.pit?.width ?? 0, false);
-    for (const obstacle of this.track.scenery ?? []) {
+    for(const road of this.track.city?.roads ?? [])markPolyline(road.points,road.width+this.track.city.sidewalk*2,false);
+    const parks=(this.track.city?.parks??[]).map(p=>({...p,visualRadius:Math.hypot(p.width,p.height)/2}));
+    for (const obstacle of [...(this.track.scenery ?? []),...parks]) {
       const radius = Math.max(12, Number(obstacle.visualRadius) || Number(obstacle.collisionRadius) || 12) + 18;
       const minTileX = Math.floor((obstacle.x - radius) / TRACK_TILE_WORLD_SIZE);
       const maxTileX = Math.floor((obstacle.x + radius) / TRACK_TILE_WORLD_SIZE);
@@ -1765,7 +1772,7 @@ export class RaceRenderer {
     this.#drawScenery(ctx, clipBounds);
 
     const start = this.track.samples[0];
-    const half = this.track.width * 0.48;
+    const half = roadWidthAt(start,this.track.width) * 0.48;
     const squares = 10;
     const squareWidth = (half * 2) / squares;
     ctx.save();

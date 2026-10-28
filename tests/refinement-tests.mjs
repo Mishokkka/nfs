@@ -11,7 +11,7 @@ assert.ok(Object.values(resolved.overflow).every(value => value === 0), "starter
 const preview = estimateBuildPerformance(resolved);
 assert.ok(preview.zeroTo100 > 6 && preview.zeroTo100 < 8);
 assert.ok(preview.brakingDistance > 24 && preview.brakingDistance < 34);
-assert.ok(preview.lateralBudget > 1.2 && preview.lateralBudget < 1.6);
+assert.ok(preview.lateralBudget > 2.7 && preview.lateralBudget < 3.6);
 assert.equal(estimateBuildPerformance(resolveBuild({ ...build, name: "A different name" })), preview, "renaming reran the physics preview");
 assert.ok(compareBuildPerformance(resolved, resolved).every(metric => metric.comparison === ""));
 const oldBuild = { ...build, running: "grip" };

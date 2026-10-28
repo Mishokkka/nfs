@@ -265,7 +265,7 @@
               <option value="ruins" {{#if (nfsEq config.environmentTheme "ruins")}}selected{{/if}}>Древние руины</option>
               <option value="tournament" {{#if (nfsEq config.environmentTheme "tournament")}}selected{{/if}}>Большой турнир</option>
             </select>
-            <small>Городские кварталы строятся по уличной сетке. Другие окружения меняют пейзаж и объекты вдоль трассы.</small>
+            <small>Город растёт вокруг маршрута: узкие улицы, проспекты и плавные изменения ширины. Другие окружения меняют пейзаж и объекты вдоль трассы.</small>
           </label>
           <label class="nfs-field"><span class="nfs-field__label">Поломка болида</span>
             <select name="collisionMode" {{#unless isHost}}disabled{{/unless}}>
