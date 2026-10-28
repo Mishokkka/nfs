@@ -1,4 +1,4 @@
-import { advanceCarMotion, terrainModifiers } from "../physics/car-motion.js";
+import { advanceCarMotion, applyTerrainForces } from "../physics/car-motion.js";
 
 const neutral = () => ({ throttle: 0, steer: 0, brake: false, reverse: false, boost: false, ram: false, drift: false });
 const clamp = (x, min, max) => Math.max(min, Math.min(max, x));
@@ -63,12 +63,7 @@ export class LocalPrediction {
       advanceCarMotion(state, input, p, step, { laps: snapshot.laps, pit });
       // Frozen contact data is safe for a short replay. New collisions and
       // random gravel kicks are reconciled exclusively from the next authority.
-      const terrain = terrainModifiers(state, p);
-      if (terrain.dragRate) {
-        const damping = Math.exp(-terrain.dragRate * step);
-        state.vx *= damping;
-        state.vy *= damping;
-      }
+      applyTerrainForces(state, input, p, step);
       elapsed += step;
     }
     return { state, horizon };

@@ -1,7 +1,8 @@
 export const MODULE_ID = "fbl-need-for-speed";
 export const SOCKET = `module.${MODULE_ID}`;
 export const VERSION = "0.17.0";
-export const PROTOCOL_VERSION = 15;
+export const PROTOCOL_VERSION = 16;
+export const SURFACE_TYPES = Object.freeze(["road", "grass", "gravel", "sand", "paving"]);
 
 export const PHYSICS_HZ = 60;
 export const WORKER_SNAPSHOT_HZ = 30;
@@ -28,5 +29,5 @@ export const CAR_COLORS = Object.freeze([
 
 
 export const TRACK_ENVIRONMENT_THEMES = Object.freeze([
-  "auto", "industrial", "woodland", "estate", "ruins", "tournament"
+  "auto", "city", "industrial", "woodland", "estate", "ruins", "tournament"
 ]);

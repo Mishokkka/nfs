@@ -480,7 +480,9 @@ function forwardSpeed(car) {
     maximumGrass = Math.max(maximumGrass, car.surfaceSeverity);
   }
   assert.equal(car.health, health);
-  assert.ok(Math.hypot(car.vx, car.vy) < 200, `grass speed was ${Math.hypot(car.vx, car.vy)}`);
+  // Coasting over grass loses speed without an unbraked >1 g stop in 0.5 s.
+  const grassSpeed = Math.hypot(car.vx, car.vy);
+  assert.ok(grassSpeed > 255 && grassSpeed < 290, `grass coast speed was ${grassSpeed}`);
   assert.ok(maximumGrass > 0.30);
 }
 

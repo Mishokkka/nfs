@@ -135,7 +135,7 @@ export function computeBotInput({ car, dt, routeContext, track, cars, laps, tick
     targetSpeed *= clamp(1.06 - edgeRatio * edgePenalty, skill === 4 ? 0.54 : 0.42, skill === 4 ? 0.97 : 0.78);
   }
   if (car.surfaceSeverity > 0.02) {
-    const terrainLimit = car.surfaceType === "sand" ? 0.13 : car.surfaceType === "gravel" ? 0.20 : 0.26;
+    const terrainLimit = car.surfaceType === "sand" ? 0.13 : car.surfaceType === "gravel" ? 0.20 : car.surfaceType === "paving" ? 0.72 : 0.26;
     targetSpeed = Math.min(targetSpeed, car.physics.maxSpeed * terrainLimit);
   }
   if (pitApproach || pitEntryMode) targetSpeed = Math.min(targetSpeed, track.pit.speedLimit * (pitApproach ? 0.93 : 1.08));

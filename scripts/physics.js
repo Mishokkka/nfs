@@ -1,4 +1,5 @@
-import { PHYSICS_HZ, CAR_COLORS, INPUT_TIMEOUT_SECONDS } from "./constants.js";
+import { PHYSICS_HZ, CAR_COLORS, INPUT_TIMEOUT_SECONDS, SURFACE_TYPES } from "./constants.js";
+import { sceneryContact } from "./scenery-geometry.js";
 import { resolveBuild } from "./catalog.js";
 import {
   nearestTrackPoint,
@@ -9,10 +10,11 @@ import {
   runoffSurfaceForSide,
   wallSegmentActiveRange,
   wallBoundaryPoint,
-  WALL_COLLISION_ALPHA
+  WALL_COLLISION_ALPHA,
+  RUNOFF_SURFACES
 } from "./track.js";
 import { computeBotInput, shouldBotPit } from "./physics/bot-controller.js";
-import { advanceCarMotion, terrainModifiers } from "./physics/car-motion.js";
+import { advanceCarMotion, terrainModifiers, applyTerrainForces } from "./physics/car-motion.js";
 
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 const dot = (ax, ay, bx, by) => ax * bx + ay * by;
@@ -31,7 +33,7 @@ function validCheckpointRoute(route, track) {
     nearest === null || (Number.isInteger(nearest.index) && nearest.index >= 0 && nearest.index < size
       && [nearest.progress, nearest.signedDistance].every(value => Number.isFinite(value) && Math.abs(value) <= 1e9)
       && nearest.point && Object.keys(nearest.point).length === CHECKPOINT_POINT_KEYS.length
-      && CHECKPOINT_POINT_KEYS.every(key => key.startsWith("surface") ? ["grass", "sand", "gravel"].includes(nearest.point[key])
+      && CHECKPOINT_POINT_KEYS.every(key => key.startsWith("surface") ? RUNOFF_SURFACES.includes(nearest.point[key])
         : (key === "mainProgressUnwrapped" && nearest.point[key] === null) || (Number.isFinite(nearest.point[key]) && Math.abs(nearest.point[key]) <= 1e9))));
 }
 
@@ -1051,25 +1053,9 @@ export class RaceSimulation {
       const capsule = carCapsule(car);
       for (const obstacle of obstacles) {
         if (!obstacle?.solid) continue;
-        const closest = closestPointOnSegment(obstacle, capsule.start, capsule.end);
-        let nx = closest.x - obstacle.x;
-        let ny = closest.y - obstacle.y;
-        let distance = Math.hypot(nx, ny);
-        const combinedRadius = capsule.halfWidth + Math.max(4, Number(obstacle.collisionRadius) || 12);
-        if (distance >= combinedRadius) continue;
-        if (distance < 0.001) {
-          const speed = Math.hypot(car.vx, car.vy);
-          nx = speed > 0.1 ? -car.vx / speed : Math.cos(car.angle + Math.PI * 0.5);
-          ny = speed > 0.1 ? -car.vy / speed : Math.sin(car.angle + Math.PI * 0.5);
-          distance = 0.001;
-        } else {
-          nx /= distance;
-          ny /= distance;
-        }
-        const penetration = combinedRadius - distance;
-        const obstacleRadius = Math.max(4, Number(obstacle.collisionRadius) || 12);
-        const contactX = obstacle.x + nx * obstacleRadius;
-        const contactY = obstacle.y + ny * obstacleRadius;
+        const contact = sceneryContact(capsule, obstacle, car);
+        if (!contact) continue;
+        const { nx, ny, penetration, contactX, contactY } = contact;
         const pointVelocity = velocityAtPoint(car, contactX, contactY);
         const impact = Math.max(0, -dot(pointVelocity.x, pointVelocity.y, nx, ny));
         if (!best || penetration > best.penetration) {
@@ -1107,7 +1093,7 @@ export class RaceSimulation {
       const point = nearest.point ?? {};
       const sideGrass = side > 0 ? point.grassWidthLeft : point.grassWidthRight;
       const grassWidth = Math.max(0, Number(sideGrass ?? point.grassWidth ?? fallbackGrass ?? 0));
-      const surfaceType = route === "pit" ? "grass" : runoffSurfaceForSide(point, side);
+      const surfaceType = runoffSurfaceForSide(point, side);
       const wallAlpha = Math.max(0, Math.min(1, Number(side > 0 ? point.wallLeftAlpha ?? 1 : point.wallRightAlpha ?? 1)));
       const lateral = Math.max(0, Number(nearest.distance) || Math.abs(nearest.signedDistance));
       return {
@@ -1160,75 +1146,22 @@ export class RaceSimulation {
     const terrain = terrainModifiers(car, car.physics, currentSpeed);
     const effectiveSeverity = terrain.severity;
     car.surfaceKickCooldown = Math.max(0, Number(car.surfaceKickCooldown || 0) - dt);
-    if (effectiveSeverity > 0.008) {
-      const damping = Math.exp(-terrain.dragRate * dt);
-      car.vx *= damping;
-      car.vy *= damping;
-      const rightX = -Math.sin(car.angle);
-      const rightY = Math.cos(car.angle);
-      const lateralSpeed = dot(car.vx, car.vy, rightX, rightY);
-
-      if (terrain.type === "grass") {
-        // Grass is not the heaviest surface, but at racing speed it offers very
-        // little lateral support. Countersteer can save the car; a large slip
-        // angle or an abrupt steering input keeps adding yaw until it spins.
-        const highSpeed = clamp((terrain.speedRatio - 0.28) / 0.82, 0, 1);
-        const slipRatio = clamp(Math.abs(lateralSpeed) / Math.max(34, currentSpeed * 0.34), 0, 1.4);
-        const steer = clamp(Number(car.currentInput?.steer) || 0, -1, 1);
-        const instabilitySource = Math.abs(lateralSpeed) > 0.5 ? lateralSpeed : steer;
-        if (Math.abs(instabilitySource) > 0.001) {
-          const slipDirection = Math.sign(instabilitySource);
-          car.angularVelocity += slipDirection * effectiveSeverity * highSpeed
-            * (0.16 + slipRatio * 0.62 + Math.abs(steer) * 0.25) * dt;
-        }
-        // Two wheels on asphalt and two on grass should feel nervous again, but
-        // without the old positional snap. Use a small yaw bias only while the
-        // contact is genuinely split and the driver is already loading the car
-        // with speed, steering or lateral slip.
-        const splitContact = clamp(1 - Math.abs(grassContact - 0.5) / 0.5, 0, 1);
-        const splitLoad = Math.max(Math.abs(steer) * 0.82, slipRatio * 0.94);
-        if (splitContact > 0.04 && highSpeed > 0.08 && splitLoad > 0.06) {
-          const vergeYaw = Number(car.surfaceSide || surface.side || 0) >= 0 ? 1 : -1;
-          car.angularVelocity += vergeYaw * splitContact * highSpeed * effectiveSeverity
-            * (0.030 + splitLoad * 0.070) * dt;
-        }
-      } else if (terrain.type === "sand") {
-        // Loose sand piles in front of the wheels. It kills speed and yaw, making
-        // escape possible only with a straight wheel and sustained throttle.
-        car.angularVelocity *= Math.exp(-(1.6 + effectiveSeverity * 3.8) * dt);
-        const lateralDamping = Math.exp(-(1.2 + effectiveSeverity * 4.2) * dt);
-        const forwardX = Math.cos(car.angle);
-        const forwardY = Math.sin(car.angle);
-        const forwardSpeed = dot(car.vx, car.vy, forwardX, forwardY);
-        const reducedLateral = lateralSpeed * lateralDamping;
-        car.vx = forwardX * forwardSpeed + rightX * reducedLateral;
-        car.vy = forwardY * forwardSpeed + rightY * reducedLateral;
-        // Static rolling resistance used to exceed the weakest engine's entire
-        // sand-adjusted output. Preserve the heavy bogging at speed, but give a
-        // straight, throttled car a small low-speed digging force so it can leave.
-        const throttle = clamp(Number(car.currentInput?.throttle) || 0, 0, 1);
-        const crawlWindow = 1 - clamp(currentSpeed / 92, 0, 1);
-        if (throttle > 0.05 && crawlWindow > 0) {
-          const crawlAcceleration = (24 + car.physics.acceleration * 0.22)
-            * throttle * crawlWindow * Math.sqrt(effectiveSeverity);
-          car.vx += forwardX * crawlAcceleration * dt;
-          car.vy += forwardY * crawlAcceleration * dt;
-        }
-      } else if (terrain.type === "gravel") {
-        // A buried stone can kick one front wheel. The event is random but has a
-        // cooldown, so gravel feels treacherous rather than like constant noise.
-        const chancePerSecond = (0.16 + terrain.speedRatio * 0.78) * effectiveSeverity;
-        if (effectiveSeverity > 0.24 && currentSpeed > 72 && car.offroadTimer > 0.35
-          && car.surfaceKickCooldown <= 0 && car.rng() < chancePerSecond * dt) {
-          const direction = car.rng() < 0.5 ? -1 : 1;
-          const impulse = (0.50 + car.rng() * 0.85) * (0.65 + terrain.speedRatio * 0.95)
-            * Math.sqrt(effectiveSeverity) / Math.pow(Math.max(0.45, car.physics.spinResistance), 0.35);
-          car.angularVelocity += direction * impulse;
-          const lateralKick = currentSpeed * (0.010 + car.rng() * 0.022) * effectiveSeverity;
-          car.vx += rightX * direction * lateralKick;
-          car.vy += rightY * direction * lateralKick;
-          car.surfaceKickCooldown = 0.65 + car.rng() * 0.9;
-        }
+    applyTerrainForces(car, car.currentInput, car.physics, dt, terrain);
+    if (effectiveSeverity > 0.008 && terrain.type === "gravel") {
+      const rightX = -Math.sin(car.angle), rightY = Math.cos(car.angle);
+      // A buried stone can kick one front wheel. The event is random but has a
+      // cooldown, so gravel feels treacherous rather than like constant noise.
+      const chancePerSecond = (0.16 + terrain.speedRatio * 0.78) * effectiveSeverity;
+      if (effectiveSeverity > 0.24 && currentSpeed > 72 && car.offroadTimer > 0.35
+        && car.surfaceKickCooldown <= 0 && car.rng() < chancePerSecond * dt) {
+        const direction = car.rng() < 0.5 ? -1 : 1;
+        const impulse = (0.50 + car.rng() * 0.85) * (0.65 + terrain.speedRatio * 0.95)
+          * Math.sqrt(effectiveSeverity) / Math.pow(Math.max(0.45, car.physics.spinResistance), 0.35);
+        car.angularVelocity += direction * impulse;
+        const lateralKick = currentSpeed * (0.010 + car.rng() * 0.022) * effectiveSeverity;
+        car.vx += rightX * direction * lateralKick;
+        car.vy += rightY * direction * lateralKick;
+        car.surfaceKickCooldown = 0.65 + car.rng() * 0.9;
       }
     }
 
@@ -1590,7 +1523,7 @@ export class RaceSimulation {
         || row.state.pitStopsRequired !== this.requiredPitStops || !Number.isInteger(row.state.pitStopsCompleted)
         || row.state.pitStopsCompleted < 0 || row.state.pitStopsCompleted > this.requiredPitStops
         || (row.state.pitState === "service" && (!row.state.pitWord || !row.state.pitAttemptId))
-        || !["road", "grass", "gravel", "sand"].includes(row.state.surfaceType)
+        || !SURFACE_TYPES.includes(row.state.surfaceType)
         || row.state.heat < 0 || row.state.heat > 112
         || row.state.health < 0 || row.state.health > this.cars[index].physics.maxHealth
         || row.state.charge < 0 || row.state.charge > this.cars[index].physics.maxCharge) fail();

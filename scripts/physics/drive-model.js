@@ -41,7 +41,8 @@ export function applyDriveModel(state, input, physics, dt, modifiers = {}) {
   const maxSpeed = Math.max(1, Number(p.maxSpeed) || 420);
   const accelerationPower = Math.max(0, Number(p.acceleration) || 0);
   const reverseAcceleration = Math.max(0, Number(p.reverseAcceleration) || 0);
-  const brakingPower = Math.max(0, Number(p.braking) || 0);
+  const brakingPower = Math.max(0, Number(p.braking) || 0)
+    * (Number.isFinite(Number(modifiers.brakingMultiplier)) ? clamp(Number(modifiers.brakingMultiplier), 0.05, 1.5) : 1);
   const steerRate = Math.max(0, Number(p.steerRate) || 0);
   const recovery = Math.max(0.01, Number(p.recovery) || 1);
   const spinResistance = Math.max(0.01, Number(p.spinResistance) || 1);

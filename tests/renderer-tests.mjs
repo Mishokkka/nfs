@@ -71,6 +71,19 @@ const { VehicleSprites } = await import(pathToFileURL(path.join(root, "scripts/r
 const { TrackArt } = await import(pathToFileURL(path.join(root, "scripts/rendering/track-art.js")).href);
 const track = generateTrack("renderer-countdown", 2);
 
+// Dense urban scenery is still baked into bounded static layers. Pavers add
+// one small texture; closing a city view must release it with the old assets.
+{
+  const city = generateTrack("city-render-budget",3,"city");
+  const urbanRenderer = new RaceRenderer(makeCanvas(),city);
+  assert.equal(urbanRenderer.art.canvases.length,3);
+  assert.ok(urbanRenderer.art.cityClosures.length>0 && urbanRenderer.art.cityClosures.length<=64);
+  const textures=[...urbanRenderer.art.canvases];
+  urbanRenderer.destroy();
+  for(const canvas of textures)assert.equal(canvas.width*canvas.height,1);
+  assert.equal(urbanRenderer.art.cityClosures.length,0);
+}
+
 // Continuous telemetry must not allocate paint. Only three discrete damage
 // variants can exist for each of the twelve cars, with a hard LRU memory bound.
 {
@@ -145,8 +158,8 @@ const track = generateTrack("renderer-countdown", 2);
   assert.doesNotMatch(rendererSource, /elapsed < this\.renderInterval - 1/, "legacy interval-skipping gate returned");
   assert.match(rendererSource, /trackTileReuses/, "track tile reuse telemetry is missing");
   assert.match(rendererSource, /TRACK_TILE_OVERLAP_PX/, "track tile overlap guard is missing");
-  const staticTrackPaint = rendererSource.slice(rendererSource.indexOf("#paintStaticTrack(ctx)"), rendererSource.indexOf("\n  #drawScenery(ctx) {"));
-  assert.ok(staticTrackPaint.indexOf("#drawBoundaryWallGeometry") < staticTrackPaint.indexOf("this.#drawScenery(ctx)"),
+  const staticTrackPaint = rendererSource.slice(rendererSource.indexOf("  #paintStaticTrack("), rendererSource.indexOf("\n  #drawScenery("));
+  assert.ok(staticTrackPaint.indexOf("#drawBoundaryWallGeometry") < staticTrackPaint.indexOf("this.#drawScenery("),
     "solid scenery must be painted after fence geometry");
   assert.match(rendererSource, /RAF p50/);
   assert.match(rendererSource, /#drawRaceHud\(ctx, focus, snapshot, width, height\)/);

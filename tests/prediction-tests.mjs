@@ -40,6 +40,32 @@ const physics = { ...meta.prediction, maxHealth: meta.maxHealth, maxCharge: meta
   assert.deepEqual(acked, originalAcked, "replay mutated the source snapshot");
 }
 
+// Deterministic tyre, drag, yaw and sand-crawl effects must use the same path
+// on both sides. New random gravel kicks remain an authoritative event.
+for (const scenario of ["grass", "gravel", "sand", "paving", "sand-crawl"]) {
+  const type = scenario === "sand-crawl" ? "sand" : scenario;
+  const track = generateTrack("surface-replay", 2, "woodland");
+  track.scenery = [];
+  for (const p of track.samples) { p.surfaceLeft = type; p.surfaceRight = type; p.wallLeftAlpha = 0; p.wallRightAlpha = 0; }
+  const index = track.samples.findIndex(p => p.grassWidthLeft > 85 && p.cumulative / track.totalLength > .2);
+  assert.ok(index >= 0);
+  const p = track.samples[index], offset = track.width / 2 + 45, speed = scenario === "sand-crawl" ? 20 : 160;
+  const simulation = new RaceSimulation({ track, entries: [entry], laps: 3 });
+  simulation.started = true; simulation.countdown = 0;
+  const car = simulation.cars[0];
+  Object.assign(car, { x: p.x + p.nx * offset, y: p.y + p.ny * offset,
+    angle: Math.atan2(p.ty,p.tx), vx: p.tx * speed + p.nx * 20, vy: p.ty * speed + p.ny * 20,
+    angularVelocity: .2, trackIndex: index, surfaceType: type, surfaceSeverity: 1, surfaceSide: 1 });
+  const before = simulation.snapshot().cars[0], input = { ...neutralInput(), throttle: .6, steer: .25 };
+  simulation.setInput(car.id,input,1); simulation.step(1/60);
+  assert.equal(car.surfaceType,type);
+  const prediction = new LocalPrediction(); prediction.submit(input,1,0);
+  prediction.sample({ ...before, inputSequence: -1 }, frame(before,0,0), { now:1000/60,clockOffset:0 });
+  for (const key of ["x","y","vx","vy","angle","angularVelocity"]) {
+    assert.ok(Math.abs(car[key]-prediction.state[key])<1e-7,`${scenario} contact replay diverged at ${key}`);
+  }
+}
+
 // Shared modifiers are exercised through the real authoritative simulation and
 // the prediction path, including a hot/damaged car in a deliberate drift.
 for (const scenario of ["drift", "thermal-lockout", "brake-priority"]) {

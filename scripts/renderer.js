@@ -5,12 +5,14 @@ import {
   runoffSurfaceForSide,
   boundaryPoint,
   wallBoundaryPoint,
-  wallSegmentActiveRange
+  wallSegmentActiveRange,
+  RUNOFF_SURFACES
 } from "./track.js";
 import { LocalPrediction } from "./netcode/local-prediction.js";
 import { VehicleSprites, REAR_CORE_X } from "./rendering/vehicle-sprites.js";
 import { TrackArt } from "./rendering/track-art.js";
 import { GripFeedback } from "./rendering/grip-feedback.js";
+import { paintBuilding } from "./rendering/building-art.js";
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 const angleDelta = (target, current) => Math.atan2(Math.sin(target - current), Math.cos(target - current));
 const smoothingFactor = (dt, timeConstant) => 1 - Math.exp(-Math.max(0, dt) / Math.max(0.001, timeConstant));
@@ -218,7 +220,7 @@ export class RaceRenderer {
     this.trackPath = this.#buildTrackPath(this.track.samples, true);
     this.pitPath = this.#buildTrackPath(this.track.pit?.samples ?? [], false);
     this.runoffSurfacePaths = this.#buildRunoffSurfacePaths(this.track.samples, this.track.width, true);
-    this.pitRunoffSurfacePaths = this.#buildRunoffSurfacePaths(this.track.pit?.samples ?? [], this.track.pit?.width ?? 0, false, "grass");
+    this.pitRunoffSurfacePaths = this.#buildRunoffSurfacePaths(this.track.pit?.samples ?? [], this.track.pit?.width ?? 0, false);
     this.runoffTextureGeometry = this.#buildRunoffTextureGeometry(this.track.samples, this.track.width);
     this.wallGeometry = [
       this.#buildBoundaryWallGeometry(this.track.samples, this.track.width, 1, true, "wallLeftAlpha"),
@@ -811,7 +813,7 @@ export class RaceRenderer {
 
 
   #buildRunoffSurfacePaths(points, roadWidth, closed = true, forcedSurface = null) {
-    const paths = { grass: new Path2D(), sand: new Path2D(), gravel: new Path2D() };
+    const paths = Object.fromEntries(RUNOFF_SURFACES.map(type => [type, new Path2D()]));
     if (!points?.length) return paths;
     const segmentCount = closed ? points.length : Math.max(0, points.length - 1);
     const halfRoad = Math.max(0, Number(roadWidth) || 0) * 0.5;
@@ -867,7 +869,7 @@ export class RaceRenderer {
           const bow = (unit - 0.5) * 5;
           path.moveTo(centerX - point.tx * length * 0.5, centerY - point.ty * length * 0.5);
           path.quadraticCurveTo(centerX + point.nx * bow, centerY + point.ny * bow, centerX + point.tx * length * 0.5, centerY + point.ty * length * 0.5);
-        } else {
+        } else if (type === "gravel") {
           const path = geometry.gravel[Math.floor(unit * geometry.gravel.length) % geometry.gravel.length];
           const radius = 1.4 + unit * 2.8;
           path.moveTo(centerX + radius, centerY);
@@ -1444,7 +1446,7 @@ export class RaceRenderer {
     ctx.beginPath();
     ctx.rect(worldX, worldY, worldSize, worldSize);
     ctx.clip();
-    this.#paintStaticTrack(ctx);
+    this.#paintStaticTrack(ctx, { minX: worldX, minY: worldY, maxX: worldX + worldSize, maxY: worldY + worldSize });
     ctx.restore();
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     this.trackTileGenerated += 1;
@@ -1708,9 +1710,10 @@ export class RaceRenderer {
     ctx.restore();
   }
 
-  #paintStaticTrack(ctx) {
+  #paintStaticTrack(ctx, clipBounds = null) {
     ctx.lineJoin = "round";
     ctx.lineCap = "round";
+    this.art.paintCity(ctx);
 
     // Runoff is a true variable-width ribbon. Near the finish line and through
     // the committed pit lane its width collapses to zero, so the same perimeter
@@ -1718,9 +1721,10 @@ export class RaceRenderer {
     const surfaceFills = {
       grass: this.art.palette.grass,
       sand: "#b09a6d",
-      gravel: "#737e78"
+      gravel: "#737e78",
+      paving: this.art.paving ?? "#888576"
     };
-    for (const type of ["grass", "sand", "gravel"]) {
+    for (const type of RUNOFF_SURFACES) {
       ctx.fillStyle = surfaceFills[type];
       ctx.fill(this.runoffSurfacePaths?.[type] ?? new Path2D());
       ctx.fill(this.pitRunoffSurfacePaths?.[type] ?? new Path2D());
@@ -1757,7 +1761,8 @@ export class RaceRenderer {
     // Solid scenery is deliberately painted after every fence layer. A building,
     // tree crown or column therefore masks a rail behind it instead of being cut
     // in half by a fence drawn later in the static pass.
-    this.#drawScenery(ctx);
+    this.art.paintCityClosures(ctx, clipBounds);
+    this.#drawScenery(ctx, clipBounds);
 
     const start = this.track.samples[0];
     const half = this.track.width * 0.48;
@@ -1773,38 +1778,22 @@ export class RaceRenderer {
   }
 
 
-  #drawScenery(ctx) {
+  #drawScenery(ctx, clipBounds = null) {
     const obstacles = this.track.scenery ?? [];
     if (!obstacles.length) return;
-    const drawRoof = (ctx, width, height, roof, wall) => {
-      ctx.fillStyle = "rgba(12, 10, 8, 0.28)";
-      ctx.fillRect(-width * 0.48 + 5, -height * 0.48 + 7, width * 0.96, height * 0.96);
-      ctx.fillStyle = wall;
-      ctx.fillRect(-width * 0.5, -height * 0.5, width, height);
-      ctx.strokeStyle = "rgba(35, 27, 21, 0.85)";
-      ctx.lineWidth = 3;
-      ctx.strokeRect(-width * 0.5, -height * 0.5, width, height);
-      ctx.fillStyle = roof;
-      ctx.beginPath();
-      ctx.moveTo(-width * 0.56, -height * 0.08);
-      ctx.lineTo(0, -height * 0.62);
-      ctx.lineTo(width * 0.56, -height * 0.08);
-      ctx.lineTo(width * 0.56, height * 0.18);
-      ctx.lineTo(0, -height * 0.34);
-      ctx.lineTo(-width * 0.56, height * 0.18);
-      ctx.closePath();
-      ctx.fill();
-      ctx.stroke();
-    };
 
     for (const obstacle of obstacles) {
+      const bound = (Number(obstacle.visualRadius) || 24) + 12;
+      if (clipBounds && (obstacle.x + bound < clipBounds.minX || obstacle.x - bound > clipBounds.maxX
+        || obstacle.y + bound < clipBounds.minY || obstacle.y - bound > clipBounds.maxY)) continue;
       const scale = Math.max(0.4, Number(obstacle.scale) || 1);
-      const width = Math.max(12, Number(obstacle.width) || Number(obstacle.visualRadius) * 1.5 || 24);
-      const height = Math.max(12, Number(obstacle.height) || Number(obstacle.visualRadius) * 1.5 || 24);
       const visualRadius = Math.max(9, Number(obstacle.visualRadius) || 18);
       ctx.save();
       ctx.translate(obstacle.x, obstacle.y);
       ctx.rotate(Number(obstacle.angle) || 0);
+      if (obstacle.collisionShape === "box") {
+        paintBuilding(ctx, obstacle); ctx.restore(); continue;
+      }
       ctx.fillStyle = "rgba(7, 6, 5, 0.28)";
       ctx.beginPath();
       ctx.ellipse(5, 8, visualRadius * 0.92, visualRadius * 0.55, 0, 0, Math.PI * 2);
@@ -1902,19 +1891,6 @@ export class RaceRenderer {
           ctx.stroke();
           break;
         }
-        case "house":
-          drawRoof(ctx, width, height, "#695043", "#a28c6a");
-          break;
-        case "barn":
-          drawRoof(ctx, width, height, "#6c3c31", "#8b684f");
-          ctx.fillStyle = "#33251d";
-          ctx.fillRect(-width * 0.13, height * 0.08, width * 0.26, height * 0.42);
-          break;
-        case "workshop":
-          drawRoof(ctx, width, height, "#4e5556", "#716f66");
-          ctx.fillStyle = "#252b2c";
-          ctx.fillRect(width * 0.18, -height * 0.62, width * 0.14, height * 0.28);
-          break;
         case "tank": {
           ctx.fillStyle = "#62645d";
           ctx.strokeStyle = "#272925";
@@ -1928,36 +1904,6 @@ export class RaceRenderer {
           ctx.beginPath();
           ctx.arc(0, 0, visualRadius * 0.48, 0, Math.PI * 2);
           ctx.stroke();
-          break;
-        }
-        case "tower":
-        case "timingTower": {
-          ctx.fillStyle = obstacle.kind === "timingTower" ? "#665a49" : "#777269";
-          ctx.strokeStyle = "#292722";
-          ctx.lineWidth = 3;
-          ctx.fillRect(-width * 0.46, -height * 0.5, width * 0.92, height);
-          ctx.strokeRect(-width * 0.46, -height * 0.5, width * 0.92, height);
-          ctx.fillStyle = "#252a2d";
-          for (let row = -1; row <= 1; row += 1) {
-            ctx.fillRect(-width * 0.24, row * height * 0.22 - height * 0.07, width * 0.48, height * 0.12);
-          }
-          break;
-        }
-        case "grandstand": {
-          ctx.fillStyle = "#5f5548";
-          ctx.strokeStyle = "#28231e";
-          ctx.lineWidth = 3;
-          ctx.fillRect(-width * 0.5, -height * 0.5, width, height);
-          ctx.strokeRect(-width * 0.5, -height * 0.5, width, height);
-          for (let row = 0; row < 5; row += 1) {
-            ctx.strokeStyle = row % 2 ? "#9f8e69" : "#40372e";
-            ctx.lineWidth = 3;
-            const y = -height * 0.36 + row * height * 0.18;
-            ctx.beginPath();
-            ctx.moveTo(-width * 0.42, y);
-            ctx.lineTo(width * 0.42, y);
-            ctx.stroke();
-          }
           break;
         }
         default:

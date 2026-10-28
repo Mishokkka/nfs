@@ -258,13 +258,14 @@
           <label class="nfs-field"><span class="nfs-field__label">Окружение трассы</span>
             <select name="environmentTheme" {{#unless isHost}}disabled{{/unless}}>
               <option value="auto" {{#if (nfsEq config.environmentTheme "auto")}}selected{{/if}}>Автоматически по зерну</option>
+              <option value="city" {{#if (nfsEq config.environmentTheme "city")}}selected{{/if}}>Городские кварталы</option>
               <option value="industrial" {{#if (nfsEq config.environmentTheme "industrial")}}selected{{/if}}>Промышленный пояс</option>
               <option value="woodland" {{#if (nfsEq config.environmentTheme "woodland")}}selected{{/if}}>Лесная трасса</option>
               <option value="estate" {{#if (nfsEq config.environmentTheme "estate")}}selected{{/if}}>Дворцовый парк</option>
               <option value="ruins" {{#if (nfsEq config.environmentTheme "ruins")}}selected{{/if}}>Древние руины</option>
               <option value="tournament" {{#if (nfsEq config.environmentTheme "tournament")}}selected{{/if}}>Большой турнир</option>
             </select>
-            <small>Набор определяет здания, деревья, колонны и другие твёрдые объекты на траве.</small>
+            <small>Городские кварталы строятся по уличной сетке. Другие окружения меняют пейзаж и объекты вдоль трассы.</small>
           </label>
           <label class="nfs-field"><span class="nfs-field__label">Поломка болида</span>
             <select name="collisionMode" {{#unless isHost}}disabled{{/unless}}>

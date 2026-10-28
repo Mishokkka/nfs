@@ -26,6 +26,7 @@ const emitted = [];
 globalThis.game = {
   user: users.get("player"),
   users,
+  settings: { get: () => ({}), set: async () => {} },
   socket: {
     on: (_channel, handler) => { socketOnCalls += 1; socketHandler = handler; },
     off: (_channel, handler) => {
@@ -66,6 +67,7 @@ const { buildRaceCarMeta } = await import(pathToFileURL(path.join(root, "scripts
 assert.equal(normalizeConfig({ requiredPitStops: 0 }).requiredPitStops, 0);
 assert.equal(normalizeConfig({ trackComplexity: 5 }).trackComplexity, 5);
 assert.equal(normalizeConfig({ environmentTheme: "ruins" }).environmentTheme, "ruins");
+assert.equal(normalizeConfig({ environmentTheme: "city" }).environmentTheme, "city");
 assert.equal(normalizeConfig({ environmentTheme: "invalid" }).environmentTheme, "auto");
 
 let counter = 0;
@@ -322,7 +324,7 @@ const message = (payload) => ({
     finishOrder: [],
     cars: [
       { id: "car-host", x: 1.23456, y: 2.34567, health: 100, charge: 100, place: 1, driftAmount: 0.4567, pitInServiceZone: true, name: "must-not-repeat" },
-      { id: "car-player", x: 3.45678, y: 4.56789, health: 100, charge: 100, place: 2, name: "must-not-repeat" }
+      { id: "car-player", x: 3.45678, y: 4.56789, health: 100, charge: 100, place: 2, surfaceType: "paving", name: "must-not-repeat" }
     ]
   });
   const sentFrame = emitted.findLast((entry) => entry.type === "race-frame");
@@ -332,6 +334,7 @@ const message = (payload) => ({
   assert.equal(sentFrame.frame.v[0].length, 39);
   assert.equal(sentFrame.frame.v[0][27], 0.457);
   assert.equal(sentFrame.frame.v[0][28], 1);
+  assert.equal(sentFrame.frame.v[1][34], 4, "paving was lost from compact frames");
   assert.equal(sentFrame.frame.v[0].includes("must-not-repeat"), false);
   let inputs = 0;
   let acceptedInput = null;

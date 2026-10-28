@@ -2,10 +2,11 @@ import { applyDriveModel } from "./drive-model.js";
 
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 const TERRAIN_PROFILES = Object.freeze({
-  road: { accelerationLoss: 0, steeringLoss: 0, topSpeedLoss: 0, gripLoss: 0, yawGain: 0, dampingShift: 0, dragBase: 0, dragStrength: 0 },
-  grass: { accelerationLoss: 0.45, steeringLoss: 0.34, topSpeedLoss: 0.42, gripLoss: 0.72, yawGain: 0.48, dampingShift: -0.68, dragBase: 0.18, dragStrength: 1.38 },
-  gravel: { accelerationLoss: 0.64, steeringLoss: 0.42, topSpeedLoss: 0.64, gripLoss: 0.66, yawGain: 0.22, dampingShift: -0.34, dragBase: 0.42, dragStrength: 2.82 },
-  sand: { accelerationLoss: 0.86, steeringLoss: 0.46, topSpeedLoss: 0.82, gripLoss: 0.34, yawGain: -0.18, dampingShift: 1.18, dragBase: 0.70, dragStrength: 5.20 }
+  road: { accelerationLoss: 0, brakingLoss: 0, steeringLoss: 0, topSpeedLoss: 0, gripLoss: 0, yawGain: 0, dampingShift: 0, dragBase: 0, dragStrength: 0, maxDrag: 0 },
+  grass: { accelerationLoss: 0.45, brakingLoss: 0.48, steeringLoss: 0.34, topSpeedLoss: 0.42, gripLoss: 0.72, yawGain: 0.48, dampingShift: -0.68, dragBase: 0.18, dragStrength: 1.38, maxDrag: 32 },
+  gravel: { accelerationLoss: 0.64, brakingLoss: 0.35, steeringLoss: 0.42, topSpeedLoss: 0.64, gripLoss: 0.66, yawGain: 0.22, dampingShift: -0.34, dragBase: 0.42, dragStrength: 2.82, maxDrag: 44 },
+  sand: { accelerationLoss: 0.86, brakingLoss: 0.22, steeringLoss: 0.46, topSpeedLoss: 0.82, gripLoss: 0.34, yawGain: -0.18, dampingShift: 1.18, dragBase: 0.70, dragStrength: 5.20, maxDrag: 78 },
+  paving: { accelerationLoss: 0.10, brakingLoss: 0.12, steeringLoss: 0.04, topSpeedLoss: 0.08, gripLoss: 0.18, yawGain: 0, dampingShift: 0.08, dragBase: 0.08, dragStrength: 0.16, maxDrag: 8 }
 });
 
 /** Derive deterministic grip, drag and steering multipliers from the last known
@@ -25,13 +26,54 @@ export function terrainModifiers(car, physics, speed = null) {
   return {
     type, severity: effective, speedRatio,
     acceleration: Math.max(0.08, 1 - effective * profile.accelerationLoss + sandCrawlAssist),
+    braking: Math.max(0.18, 1 - effective * profile.brakingLoss),
     steering: Math.max(0.18, 1 - effective * profile.steeringLoss * (0.78 + highSpeed * 0.32)),
     topSpeed: Math.max(0.12, 1 - effective * profile.topSpeedLoss),
     grip: Math.max(0.06, 1 - effective * gripLoss),
     yawResponse: Math.max(0.28, 1 + effective * profile.yawGain * (0.42 + highSpeed * 0.78)),
     angularDamping: Math.max(0.16, 1 + effective * profile.dampingShift * (0.45 + highSpeed * 0.75)),
+    maxDragDeceleration: profile.maxDrag * effective,
     dragRate: effective > 0.001 ? profile.dragBase * effective + profile.dragStrength * Math.pow(effective, 1.28) * (0.54 + speedRatio * 0.52) : 0
   };
+}
+
+/** Deterministic contact forces shared by authority and replay. Longitudinal
+ * ground resistance has a force ceiling: exponential damping alone used to
+ * stop an 80 km/h car in four metres on sand (several g of deceleration). */
+export function applyTerrainForces(car, input, physics, dt, terrain = terrainModifiers(car, physics)) {
+  const severity = terrain.severity;
+  if (severity <= .008 || dt <= 0) return;
+  const speed = Math.hypot(car.vx, car.vy);
+  const requestedLoss = speed * (1 - Math.exp(-terrain.dragRate * dt));
+  const speedLoss = Math.min(requestedLoss, terrain.maxDragDeceleration * dt);
+  const damping = speed > 1e-8 ? Math.max(0, 1 - speedLoss / speed) : 1;
+  car.vx *= damping; car.vy *= damping;
+  const rightX = -Math.sin(car.angle), rightY = Math.cos(car.angle);
+  const lateral = car.vx * rightX + car.vy * rightY;
+  if (terrain.type === "grass") {
+    const highSpeed = clamp((terrain.speedRatio - .28) / .82, 0, 1);
+    const slipRatio = clamp(Math.abs(lateral) / Math.max(34, speed * .34), 0, 1.4);
+    const steer = clamp(Number(input?.steer) || 0, -1, 1);
+    const source = Math.abs(lateral) > .5 ? lateral : steer;
+    if (Math.abs(source) > .001) car.angularVelocity += Math.sign(source) * severity * highSpeed
+      * (.16 + slipRatio * .62 + Math.abs(steer) * .25) * dt;
+    const contact = clamp(Number(car.surfaceSeverity) || 0, 0, 1);
+    const split = clamp(1 - Math.abs(contact - .5) / .5, 0, 1);
+    const load = Math.max(Math.abs(steer) * .82, slipRatio * .94);
+    if (split > .04 && highSpeed > .08 && load > .06) car.angularVelocity += Math.sign(car.surfaceSide || 1)
+      * split * highSpeed * severity * (.030 + load * .070) * dt;
+  } else if (terrain.type === "sand") {
+    car.angularVelocity *= Math.exp(-(1.6 + severity * 3.8) * dt);
+    const requestedLateral = lateral * (1 - Math.exp(-(1.2 + severity * 4.2) * dt));
+    const correction = clamp(requestedLateral, -60 * severity * dt, 60 * severity * dt);
+    car.vx -= rightX * correction; car.vy -= rightY * correction;
+    const throttle = clamp(Number(input?.throttle) || 0, 0, 1);
+    const crawl = 1 - clamp(speed / 92, 0, 1);
+    if (throttle > .05 && crawl > 0) {
+      const force = (24 + physics.acceleration * .22) * throttle * crawl * Math.sqrt(severity);
+      car.vx += Math.cos(car.angle) * force * dt; car.vy += Math.sin(car.angle) * force * dt;
+    }
+  }
 }
 
 /** Resources and all deterministic drive modifiers use the same path on both clients.
@@ -86,6 +128,7 @@ export function advanceCarMotion(car, input, p, dt, { traits = p, laps = 3, pit 
     steeringMultiplier: (input.ram ? (traits.ramSteerPenalty || 0.55) : 1) * thermalSteering * terrain.steering * (traits.precision ? 1.04 : 1),
     topSpeedMultiplier: thermalTopSpeed * terrain.topSpeed * lastLapBoost,
     gripMultiplier: terrain.grip,
+    brakingMultiplier: terrain.braking,
     yawResponseMultiplier: terrain.yawResponse,
     angularDampingMultiplier: terrain.angularDamping,
     brakeGripMultiplier: traits.lateBrake ? 1.22 : 1,

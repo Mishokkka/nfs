@@ -2,6 +2,7 @@ import {
   MODULE_ID,
   SOCKET,
   PROTOCOL_VERSION,
+  SURFACE_TYPES,
   DEFAULT_CONFIG,
   MAX_RACE_ENTRIES,
   TRACK_ENVIRONMENT_THEMES
@@ -119,7 +120,7 @@ function boundedStringArray(value, limit = 80) {
     && value.every((entry) => boundedString(entry, limit));
 }
 
-/** Validate the fixed 39-field protocol-15 row before reading positional fields. */
+/** Validate the fixed 39-field protocol-16 row before reading positional fields. */
 function compactRaceRowFitsSchema(row) {
   if (!Array.isArray(row) || row.length !== 39 || !boundedString(row[0], 80)) return false;
   for (let index = 1; index < row.length; index += 1) {
@@ -154,7 +155,7 @@ function legacyRaceCarFitsSchema(car) {
   for (const [key, value] of Object.entries(car)) {
     if (key === "id") continue;
     if (key === "surfaceType") {
-      if (!["road", "grass", "gravel", "sand"].includes(value)) return false;
+      if (!SURFACE_TYPES.includes(value)) return false;
       continue;
     }
     if (key === "pitState") {
@@ -426,7 +427,7 @@ function normalizeRaceFrame(raw, race) {
       lastSteer: rounded(source.lastSteer, 5, 0, -1, 1),
       driftDirection: rounded(source.driftDirection, 0, 0, -1, 1),
       slipAngle: rounded(source.slipAngle, 5, 0, -4, 4),
-      surfaceType: ["road", "grass", "gravel", "sand"].includes(source.surfaceType) ? source.surfaceType : "road",
+      surfaceType: SURFACE_TYPES.includes(source.surfaceType) ? source.surfaceType : "road",
       surfaceSide: rounded(source.surfaceSide, 3, 0, -1, 1),
       criticalGrace: Boolean(source.criticalGrace),
       startBoostTimer: rounded(source.startBoostTimer, 4, 0, 0, 10),
@@ -451,7 +452,7 @@ function normalizeRaceFrame(raw, race) {
 const PIT_STATE_TO_CODE = Object.freeze({ track: 0, entering: 1, service: 2, exit: 3 });
 const PIT_CODE_TO_STATE = Object.freeze(["track", "entering", "service", "exit"]);
 
-/** Pack validated state into protocol-15 rows, retaining input ACKs and all
+/** Pack validated state into protocol-16 rows, retaining input ACKs and all
  * deterministic motion state needed by prediction without duplicating metadata.
  */
 function encodeNormalizedFrame(frame) {
@@ -508,7 +509,7 @@ function encodeNormalizedFrame(frame) {
         car.driftAmount,
         car.pitInServiceZone ? 1 : 0,
         car.angularVelocity, car.steeringPosition, car.lastSteer, car.driftDirection,
-        car.slipAngle, ["road", "grass", "gravel", "sand"].indexOf(car.surfaceType),
+        car.slipAngle, SURFACE_TYPES.indexOf(car.surfaceType),
         car.surfaceSide, car.criticalGrace ? 1 : 0, car.startBoostTimer, car.burstTimer
       ];
     })
@@ -572,7 +573,7 @@ function decodeRaceFrame(raw, race) {
         pitInServiceZone: Boolean(values[28]),
         angularVelocity: values[29], steeringPosition: values[30], lastSteer: values[31],
         driftDirection: values[32], slipAngle: values[33],
-        surfaceType: ["road", "grass", "gravel", "sand"][values[34]] ?? "road",
+        surfaceType: SURFACE_TYPES[values[34]] ?? "road",
         surfaceSide: values[35], criticalGrace: Boolean(values[36]),
         startBoostTimer: values[37], burstTimer: values[38]
       };

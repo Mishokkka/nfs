@@ -1,3 +1,5 @@
+import { makeUrbanCircuit, urbanBuildingPlots, URBAN_SIDEWALK_WIDTH } from "./urban-track.js";
+import { sceneryRoadDistance, sceneryOverlaps } from "./scenery-geometry.js";
 const TRACK_LENGTH_SCALE = 3.30;
 export const WALL_COLLISION_ALPHA = 0.08;
 export const MAIN_TRACK_SCENERY_CLEARANCE = 8;
@@ -223,7 +225,7 @@ function localCurveData(samples, index, span = 4) {
   };
 }
 
-export const RUNOFF_SURFACES = Object.freeze(["grass", "sand", "gravel"]);
+export const RUNOFF_SURFACES = Object.freeze(["grass", "sand", "gravel", "paving"]);
 
 function circularBump(progress, center, halfWidth) {
   const distance = circularDistance(progress, center);
@@ -275,6 +277,17 @@ function makeSurfacePatches(seed, theme) {
 }
 
 function assignTrackRunoffProfile(samples, totalLength, baseWidth, seed, theme = "auto") {
+  if (theme === "city") {
+    for (const point of samples) {
+      point.grassWidthLeft = URBAN_SIDEWALK_WIDTH;
+      point.grassWidthRight = URBAN_SIDEWALK_WIDTH;
+      point.grassWidth = (point.grassWidthLeft + point.grassWidthRight) / 2;
+      point.runoffWideLeft = 0; point.runoffWideRight = 0;
+      point.surfaceLeft = "paving"; point.surfaceRight = "paving";
+      point.wallLeftAlpha = 1; point.wallRightAlpha = 1;
+    }
+    return;
+  }
   const rng = seededRng(`${seed}:grass-profile`);
   const anchorCount = 14;
   const leftAnchors = Array.from({ length: anchorCount }, () => 0.30 + rng() * 0.24);
@@ -1485,17 +1498,18 @@ const SCENERY_ARCHETYPES = Object.freeze({
   column: { collisionRadius: 13, visualRadius: 24, placementRadius: 12 },
   statue: { collisionRadius: 15, visualRadius: 28, placementRadius: 14 },
   boulder: { collisionRadius: 20, visualRadius: 30, placementRadius: 18 },
-  house: { collisionRadius: 34, visualRadius: 64, width: 90, height: 68, placementRadius: 24 },
-  barn: { collisionRadius: 36, visualRadius: 68, width: 98, height: 66, placementRadius: 25 },
-  workshop: { collisionRadius: 39, visualRadius: 74, width: 110, height: 72, placementRadius: 27 },
+  house: { width: 240, height: 180, building: true },
+  barn: { width: 310, height: 220, building: true },
+  workshop: { width: 400, height: 260, building: true },
   tank: { collisionRadius: 24, visualRadius: 34, placementRadius: 20 },
-  tower: { collisionRadius: 27, visualRadius: 44, placementRadius: 21 },
+  tower: { width: 130, height: 130, building: true },
   obelisk: { collisionRadius: 14, visualRadius: 26, placementRadius: 12 },
-  grandstand: { collisionRadius: 43, visualRadius: 86, width: 158, height: 62, placementRadius: 28 },
-  timingTower: { collisionRadius: 25, visualRadius: 44, width: 58, height: 78, placementRadius: 21 }
+  grandstand: { width: 560, height: 160, building: true },
+  timingTower: { width: 100, height: 100, building: true }
 });
 
 const SCENERY_SETS = Object.freeze({
+  city: { label: "Городские кварталы", density: 1, kinds: [] },
   industrial: { label: "Промышленный пояс", density: 1.05, kinds: ["workshop", "tank", "column", "tower", "boulder", "workshop", "tank"] },
   woodland: { label: "Лесная трасса", density: 1.22, kinds: ["tree", "pine", "tree", "pine", "boulder", "barn", "tree"] },
   estate: { label: "Дворцовый парк", density: 0.96, kinds: ["column", "statue", "tree", "house", "obelisk", "column", "tree"] },
@@ -1524,13 +1538,40 @@ function distanceToPolyline(points, x, y, closed = true) {
   return Math.sqrt(best);
 }
 
-function buildScenery(trackSamples, totalLength, trackWidth, pit, seed, complexity, requestedTheme) {
+function buildScenery(trackSamples, totalLength, trackWidth, pit, seed, complexity, requestedTheme, city = null) {
   const theme = resolveSceneryTheme(seed, complexity, requestedTheme);
   const set = SCENERY_SETS[theme];
   const rng = seededRng(`${seed}:scenery:${complexity}:${theme}`);
+  if (city) {
+    const obstacles = [];
+    const pitRunoff = Math.max(...pit.samples.map(point => Math.max(grassWidthForSide(point, 1), grassWidthForSide(point, -1))));
+    for (const plot of urbanBuildingPlots(city, rng)) {
+      const [column,row] = plot.block.split(":").map(Number);
+      const cx=(city.columns[column]+city.columns[column+1])/2, cy=(city.rows[row]+city.rows[row+1])/2;
+      const c=Math.cos(city.rotation),s=Math.sin(city.rotation), center={x:cx*c-cy*s,y:cx*s+cy*c};
+      // Corner plots can step back from a racing fillet. Keep a smaller house
+      // facing the same street rather than deleting an entire inner block.
+      for(const inset of [0,.12,.25]) {
+        const scale=1-inset*.8, width=plot.width*scale,height=plot.height*scale;
+        const building={...plot,width,height,x:plot.x+(center.x-plot.x)*inset,y:plot.y+(center.y-plot.y)*inset,
+          collisionRadius:Math.hypot(width,height)/2,visualRadius:Math.hypot(width,height)/2+16};
+        if (sceneryRoadDistance(building, trackSamples) < trackWidth / 2 + URBAN_SIDEWALK_WIDTH + SCENERY_CLEARANCE
+          || sceneryRoadDistance(building, pit.samples, false) < pit.width / 2 + pitRunoff + SCENERY_CLEARANCE
+          || obstacles.some(other => sceneryOverlaps(building, other, 12))) continue;
+        obstacles.push({ ...building, theme, id: `city-${obstacles.length}` });break;
+      }
+    }
+    return { theme, label: set.label, obstacles };
+  }
   const targetCount = Math.max(18, Math.min(62, Math.round(totalLength / 510 * set.density)));
   const obstacles = [];
   const maximumAttempts = targetCount * 34;
+  const buildingWallLines = [
+    { points: trackSamples.map(point => wallBoundaryPoint(point, trackWidth, 1)), closed: true },
+    { points: trackSamples.map(point => wallBoundaryPoint(point, trackWidth, -1)), closed: true },
+    { points: pit.samples.map(point => wallBoundaryPoint(point, pit.width, 1)), closed: false },
+    { points: pit.samples.map(point => wallBoundaryPoint(point, pit.width, -1)), closed: false }
+  ];
 
   for (let attempt = 0; attempt < maximumAttempts && obstacles.length < targetCount; attempt += 1) {
     const pointIndex = Math.floor(rng() * trackSamples.length) % trackSamples.length;
@@ -1538,18 +1579,20 @@ function buildScenery(trackSamples, totalLength, trackWidth, pit, seed, complexi
     const side = rng() < 0.5 ? -1 : 1;
     const kind = set.kinds[Math.floor(rng() * set.kinds.length) % set.kinds.length];
     const archetype = SCENERY_ARCHETYPES[kind];
-    const largeFeature = kind === "house" || kind === "workshop" || kind === "barn" || kind === "grandstand" || kind === "timingTower";
-    const scale = largeFeature ? 0.96 + rng() * 0.56 : 0.90 + rng() * 0.48;
-    const collisionRadius = archetype.collisionRadius * scale;
-    const visualRadius = archetype.visualRadius * scale;
-    const placementRadius = Math.max(8, Number(archetype.placementRadius ?? archetype.collisionRadius * 0.72)) * scale;
+    const largeFeature = Boolean(archetype.building);
+    const scale = largeFeature ? 0.92 + rng() * 0.28 : 0.90 + rng() * 0.48;
+    const collisionRadius = largeFeature ? Math.hypot(archetype.width, archetype.height) * scale / 2 : archetype.collisionRadius * scale;
+    const visualRadius = largeFeature ? collisionRadius + 16 : archetype.visualRadius * scale;
+    const placementRadius = largeFeature ? collisionRadius : Math.max(8, Number(archetype.placementRadius ?? archetype.collisionRadius * 0.72)) * scale;
     const grassWidth = grassWidthForSide(point, side);
     const roadMargin = Math.max(10, placementRadius * 0.28);
     const wallMargin = Math.max(4, visualRadius * 0.04);
     const freeWidth = grassWidth - roadMargin - placementRadius * 2;
-    if (freeWidth < -visualRadius * 0.38) continue;
+    if (!largeFeature && freeWidth < -visualRadius * 0.38) continue;
 
-    const offset = trackWidth * 0.5 + roadMargin + placementRadius + Math.max(0, freeWidth) * rng();
+    // Real-sized buildings belong behind the perimeter, not squeezed into a
+    // two-metre verge. Small round scenery can still occupy the runoff.
+    const offset = trackWidth * 0.5 + (largeFeature ? grassWidth + 28 : roadMargin) + placementRadius + Math.max(0, freeWidth) * rng();
     const along = (rng() - 0.5) * Math.min(58, Number(point.segmentLength || 0) * 0.8 + 16);
     const x = point.x + point.nx * offset * side + point.tx * along;
     const y = point.y + point.ny * offset * side + point.ty * along;
@@ -1565,8 +1608,8 @@ function buildScenery(trackSamples, totalLength, trackWidth, pit, seed, complexi
     if (obstacles.some((other) => Math.hypot(other.x - x, other.y - y)
       < other.collisionRadius + collisionRadius + Math.max(SCENERY_CLEARANCE, Math.min(32, visualRadius * 0.35)))) continue;
 
-    const angle = Math.atan2(point.ty, point.tx) + (rng() - 0.5) * (kind === "house" || kind === "workshop" || kind === "barn" || kind === "grandstand" ? 0.42 : Math.PI);
-    obstacles.push({
+    const angle = Math.atan2(point.ty, point.tx) + (largeFeature ? (side > 0 ? Math.PI : 0) : (rng() - .5) * Math.PI);
+    const obstacle = {
       id: `${theme}-${obstacles.length}`,
       kind,
       theme,
@@ -1574,13 +1617,16 @@ function buildScenery(trackSamples, totalLength, trackWidth, pit, seed, complexi
       y,
       angle,
       scale,
+      collisionShape: largeFeature ? "box" : "circle",
       collisionRadius,
       visualRadius,
       width: Number(archetype.width ?? visualRadius * 1.5) * scale,
       height: Number(archetype.height ?? visualRadius * 1.5) * scale,
       solid: true,
       drawLayer: 2
-    });
+    };
+    if (largeFeature && buildingWallLines.some(line => sceneryRoadDistance(obstacle, line.points, line.closed) < SCENERY_CLEARANCE)) continue;
+    obstacles.push(obstacle);
   }
 
   return {
@@ -1591,7 +1637,7 @@ function buildScenery(trackSamples, totalLength, trackWidth, pit, seed, complexi
 }
 
 export function generateTrack(seed, complexity = 2, environmentTheme = "auto") {
-  const safeComplexity = Math.max(1, Math.min(5, Number(complexity) || 2));
+  const safeComplexity = Math.max(1, Math.min(5, Math.floor(Number(complexity) || 2)));
   const width = safeComplexity === 5 ? 195 : 230 - safeComplexity * 10;
   const resolvedEnvironmentTheme = resolveSceneryTheme(seed, safeComplexity, environmentTheme);
   let controls = null;
@@ -1601,6 +1647,7 @@ export function generateTrack(seed, complexity = 2, environmentTheme = "auto") {
   let pit = null;
   let spatialGrid = null;
   let usedAttempt = 0;
+  let city = null;
 
   const prepareCandidate = (candidateControls, candidateSamples, { requireTournamentProfile = true } = {}) => {
     if (!candidateSamples?.length || polylineSelfIntersects(candidateSamples)) return null;
@@ -1650,7 +1697,11 @@ export function generateTrack(seed, complexity = 2, environmentTheme = "auto") {
     const smoothingPasses = safeComplexity === 1 ? 2 : safeComplexity === 2 ? 1 : 0;
     let candidateControls;
     let candidateSamples;
-    if (safeComplexity === 4) {
+    let candidateCity = null;
+    if (resolvedEnvironmentTheme === "city") {
+      const urban = makeUrbanCircuit(rng, safeComplexity, width);
+      candidateControls = urban.controls; candidateSamples = urban.samples; candidateCity = urban.city;
+    } else if (safeComplexity === 4) {
       candidateSamples = makeExtremeProfileSamples(rng, irregularity);
       candidateControls = candidateSamples.filter((_, index) => index % 20 === 0).map((point) => ({ ...point }));
     } else if (safeComplexity === 5) {
@@ -1663,8 +1714,20 @@ export function generateTrack(seed, complexity = 2, environmentTheme = "auto") {
     const prepared = prepareCandidate(candidateControls, candidateSamples);
     if (!prepared) continue;
     ({ controls, samples, totalLength, tournamentLayout, pit, spatialGrid } = prepared);
+    city = candidateCity;
     usedAttempt = attempt;
     break;
+  }
+
+  if (!samples && resolvedEnvironmentTheme === "city") {
+    // Keep the city profile if all varied block routes fail validation. A
+    // seed-independent street template cannot turn into the rural oval fallback.
+    const urban = makeUrbanCircuit(seededRng(`city-safe:${safeComplexity}`), safeComplexity, width, false);
+    const prepared = prepareCandidate(urban.controls, urban.samples);
+    if (!prepared) throw new Error(`Unable to generate a valid city circuit for seed ${seed}`);
+    ({ controls, samples, totalLength, tournamentLayout, pit, spatialGrid } = prepared);
+    city = urban.city;
+    usedAttempt = 90;
   }
 
   if (!samples) {
@@ -1723,7 +1786,8 @@ export function generateTrack(seed, complexity = 2, environmentTheme = "auto") {
     return { index, sampleIndex, progress: samples[sampleIndex].cumulative / totalLength };
   });
   applyWallSegmentSafetyMasks(samples, totalLength, width, pit);
-  const scenery = buildScenery(samples, totalLength, width, pit, seed, safeComplexity, resolvedEnvironmentTheme);
+  if (city) for (const point of pit.samples) { point.surfaceLeft = "paving"; point.surfaceRight = "paving"; }
+  const scenery = buildScenery(samples, totalLength, width, pit, seed, safeComplexity, resolvedEnvironmentTheme, city);
   pit.spatialGrid = buildSpatialGrid(pit.samples, Math.max(180, pit.width * 1.75), false);
   const start = samples[0];
   const sceneryBounds = scenery.obstacles.flatMap((obstacle) => [
@@ -1739,6 +1803,7 @@ export function generateTrack(seed, complexity = 2, environmentTheme = "auto") {
     environmentTheme: scenery.theme,
     environmentLabel: scenery.label,
     scenery: scenery.obstacles,
+    city,
     generationAttempt: usedAttempt,
     controls,
     samples,
