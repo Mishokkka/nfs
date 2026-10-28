@@ -240,4 +240,29 @@ const setup = () => {
   host.destroy(); player.destroy();
 }
 
-console.log("session-regression-tests: ok (recovery, coalescing, isolation, garage, worker authority)");
+// A reloading player still restores when a full race-state reply overtakes the
+// lobby metadata. Late race-init must not remount the newly restored runtime.
+{
+  const { host, player } = setup();
+  const simulation = new RaceSimulation({ track: generateTrack(88201, 2), entries: host.activeRace.entries });
+  const snapshot = simulation.snapshot(); snapshot.tick = 2;
+  as("host", () => host.sendSnapshot(snapshot));
+  const init = structuredClone(sent.find(m => m.type === "race-init"));
+  player.destroy();
+  const returning = makeNetwork("player");
+  const app = as("player", () => new BigRacesApp(returning));
+  wireDelay.set("lobby-state", 120);
+  as("player", () => returning.requestState());
+  assert.equal(returning.raceId, null, "state was accepted without known lobby authority");
+  advance(120);
+  assert.equal(returning.raceId, host.raceId);
+  assert.equal(returning.lastSnapshot.tick, 2);
+  assert.equal(app.runtime.localCarId, "car-player");
+  assert.equal(app.screen, "race");
+  const renders = app.renderCalls;
+  as("host", () => game.socket.emit("test", { ...init, id: "late-init-after-restore" }));
+  assert.equal(app.renderCalls, renders);
+  app.shutdown(); host.destroy(); returning.destroy();
+}
+
+console.log("session-regression-tests: ok (recovery, coalescing, isolation, garage, worker authority, reordered reconnect)");

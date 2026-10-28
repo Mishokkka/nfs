@@ -664,6 +664,7 @@ export class RaceNetwork {
     this.retiredRaceIds = new Set();
     this.closedLobbyIds = new Set();
     this.lastStartedRaceId = null;
+    this.pendingRaceState = null;
     this.handlers = {
       timing: new Set(),
       lobby: new Set(),
@@ -1169,6 +1170,7 @@ export class RaceNetwork {
     if (carId == null) {
       this.inputSequences.clear();
       this.pendingProbes.clear();
+      this.pendingRaceState = null;
       this.timing = null;
       this.lastProbeAt = -Infinity;
     } else this.inputSequences.delete(carId);
@@ -1292,6 +1294,15 @@ export class RaceNetwork {
         this.lobby = incoming;
         this.#markHostAlive();
         this.#emit("lobby", this.lobby);
+        const pending = this.pendingRaceState;
+        this.pendingRaceState = null;
+        if (pending && performance.now() - pending.receivedAt < 10000
+          && pending.message.lobbyId === incoming.id && pending.message.senderId === incoming.hostId) {
+          // A state reply can beat its lobby metadata during reconnect. It was
+          // retained, not accepted; validate it now against the known authority.
+          this.seen.delete(pending.message.id);
+          this.#receive(pending.message);
+        }
         break;
       }
 
@@ -1380,6 +1391,11 @@ export class RaceNetwork {
 
       case "race-state": {
         if (message.targetId && message.targetId !== game.user.id) break;
+        if (!this.lobby && message.targetId === game.user.id
+          && message.senderId === message.race?.hostId && game.users?.get(message.senderId)?.active) {
+          this.pendingRaceState = { message, receivedAt: performance.now() };
+          break;
+        }
         if (!this.#isExpectedHost(message) || message.lobbyId !== this.lobby?.id) break;
         const race = this.#normalizeRace(message.race, message.senderId, message.sentAt);
         if (!race || race.lobbyId !== this.lobby.id) break;
@@ -1397,6 +1413,7 @@ export class RaceNetwork {
           this.lastReceivedSimulationTick = -1;
         }
         this.activeRace = race;
+        this.lastStartedRaceId = race.raceId;
         if (restoredFrame) this.lastReceivedSimulationTick = restoredFrame.tick;
         this.lastFrame = encodeNormalizedFrame(restoredFrame);
         this.lastSnapshot = hydrateRaceFrame(restoredFrame, this.activeRace);
