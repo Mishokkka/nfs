@@ -125,9 +125,11 @@ const message = (payload) => ({
   const expectedAppearance = buildRaceCarMeta(startedRace.entries[0], 0).appearance;
   assert.deepEqual(startedRace.carMeta[0].appearance, expectedAppearance,
     "received cosmetics overrode the validated build or physical footprint");
-  for (const key of ["lateralGrip", "longitudinalDrag", "rollingDrag", "spinResistance", "offroadGrip", "boostDrain", "heatRate", "cooling"]) {
+  for (const key of ["wheelbase", "lateralGrip", "longitudinalDrag", "rollingDrag", "spinResistance", "offroadGrip", "boostDrain", "heatRate", "cooling"]) {
     assert.ok(Number.isFinite(prediction[key]), `prediction metadata ${key} is missing`);
   }
+  assert.ok(Math.abs(prediction.wheelbase-buildRaceCarMeta(startedRace.entries[0],0).prediction.wheelbase)<1e-4,
+    "wheelbase was lost while normalizing race metadata");
 
   const frame = {
     tick: 10,
@@ -527,6 +529,25 @@ const message = (payload) => ({
   assert.equal(network.lobby.phase, "lobby");
   assert.equal(recoveredStops, 1);
   network.destroy();
+}
+
+// An offline Socket.IO transport must not retain stale inputs or race frames.
+// Reliable control/state requests retain their existing transport semantics.
+{
+  game.user=users.get('player');
+  const network=new RaceNetwork();
+  network.activeRace={raceId:'offline-race'};
+  const before=emitted.length;
+  game.socket.connected=false;
+  for(let i=0;i<120;i++)network.sendInput('car',{throttle:1,steer:i%2?1:-1},i);
+  assert.equal(emitted.length,before,'offline motion was buffered for reconnect');
+  network.requestState();
+  assert.equal(emitted.at(-1).type,'state-request','reliable state recovery was dropped with motion');
+  game.socket.connected=true;
+  network.sendInput('car',{throttle:0,steer:0},120);
+  assert.equal(emitted.at(-1).type,'race-input');
+  assert.equal(emitted.at(-1).sequence,120,'reconnect sent an obsolete command');
+  delete game.socket.connected;
 }
 
 console.log("network-tests: ok");

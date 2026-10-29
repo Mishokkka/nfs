@@ -120,7 +120,7 @@ function boundedStringArray(value, limit = 80) {
     && value.every((entry) => boundedString(entry, limit));
 }
 
-/** Validate the fixed 39-field protocol-17 row before reading positional fields. */
+/** Validate the fixed 39-field protocol-18 row before reading positional fields. */
 function compactRaceRowFitsSchema(row) {
   if (!Array.isArray(row) || row.length !== 39 || !boundedString(row[0], 80)) return false;
   for (let index = 1; index < row.length; index += 1) {
@@ -348,6 +348,7 @@ function normalizeCarMeta(rawMeta, entries) {
         reverseAcceleration: rounded(source?.prediction?.reverseAcceleration, 2, fallback.prediction.reverseAcceleration, 1, 100000),
         braking: rounded(source?.prediction?.braking, 2, fallback.prediction.braking, 1, 100000),
         steerRate: rounded(source?.prediction?.steerRate, 4, fallback.prediction.steerRate, 0.01, 100),
+        wheelbase: rounded(source?.prediction?.wheelbase, 4, fallback.prediction.wheelbase, 12, 100),
         lateralGrip: rounded(source?.prediction?.lateralGrip, 4, fallback.prediction.lateralGrip, 0.01, 1000),
         longitudinalDrag: rounded(source?.prediction?.longitudinalDrag, 4, fallback.prediction.longitudinalDrag, 0, 100),
         rollingDrag: rounded(source?.prediction?.rollingDrag, 4, fallback.prediction.rollingDrag, 0, 10000),
@@ -452,7 +453,7 @@ function normalizeRaceFrame(raw, race) {
 const PIT_STATE_TO_CODE = Object.freeze({ track: 0, entering: 1, service: 2, exit: 3 });
 const PIT_CODE_TO_STATE = Object.freeze(["track", "entering", "service", "exit"]);
 
-/** Pack validated state into protocol-17 rows, retaining input ACKs and all
+/** Pack validated state into protocol-18 rows, retaining input ACKs and all
  * deterministic motion state needed by prediction without duplicating metadata.
  */
 function encodeNormalizedFrame(frame) {
@@ -1170,6 +1171,9 @@ export class RaceNetwork {
       sentAt: Date.now()
     };
     if (handleLocal) this.#receive(message);
+    // Socket.IO buffers offline emits. Stale motion is superseded by the next
+    // frame/input heartbeat; never add it to Foundry's shared reconnect queue.
+    if (game.socket.connected === false && ["race-frame", "race-input", "race-ping", "race-pong"].includes(payload.type)) return;
     game.socket.emit(SOCKET, message);
   }
 

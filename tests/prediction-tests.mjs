@@ -199,4 +199,52 @@ for (const profile of [
     maxRenderedStepPx: +maximumStep.toFixed(2), maxCorrectionPx: +maximumCorrection.toFixed(2) });
 }
 console.log(JSON.stringify(metrics));
-console.log("prediction-tests: ok (replay, differential physics, handling, latency/loss/pause matrix)");
+
+// Slow steering and braking use the transmitted wheelbase during input replay.
+for(const speed of [0,1/(.62/3),10/(.62/3),-10/(.62/3)]) {
+  const authority={...initial(),vx:speed,vy:0,angularVelocity:.2};
+  const expected=structuredClone(authority),command={...neutralInput(),steer:1,brake:Math.abs(speed)<1};
+  for(let tick=0;tick<12;tick++)advanceCarMotion(expected,command,physics,1/60,{laps:3,pit:{}});
+  const predictor=new LocalPrediction();predictor.submit(command,1,0);
+  predictor.sample(authority,frame(authority,0,0),{now:200,clockOffset:0});
+  for(const key of ['x','y','vx','vy','angle','angularVelocity'])assert.ok(Math.abs(expected[key]-predictor.state[key])<1e-7,'low-speed replay diverged: '+key);
+}
+
+// A clock correction changes the physical replay horizon, never the displayed
+// pose in a single step. Include the first pong and a simultaneous new tick.
+for(const fps of [60,144])for(const [oldOffset,newOffset] of [[undefined,0],[.1,0],[0,.1],[-.04,.06]])for(const newTick of [false,true]) {
+  const predictor=new LocalPrediction(), dt=1000/fps;
+  const car={...initial(),vx:600,prediction:{...physics,longitudinalDrag:0,rollingDrag:0}};
+  const first=predictor.sample(car,frame(car,60,1),{now:1110,clockOffset:oldOffset,receivedAt:1100});
+  const nextCar=newTick?{...car,x:20}:car;
+  const nextFrame=frame(nextCar,newTick?62:60,newTick?1+1/30:1);
+  const next=predictor.sample(nextCar,nextFrame,{now:1110+dt,clockOffset:newOffset,receivedAt:newTick?1100+1e3/30:1100});
+  assert.ok(Math.abs(next.x-first.x)<=600*dt/1000*2.1,`clock correction snapped at ${fps} Hz: ${next.x-first.x}`);
+  const fresh=new LocalPrediction();
+  fresh.sample(nextCar,nextFrame,{now:1110+dt,clockOffset:newOffset});
+  assert.deepEqual(predictor.state,fresh.state,'clock smoothing leaked into physical state');
+  for(let i=2;i<fps*2;i++)predictor.sample(nextCar,nextFrame,{now:1110+i*dt,clockOffset:newOffset});
+  assert.ok(Math.abs(predictor.offset.x)<.1,'clock correction did not converge');
+}
+
+// Loss of the outgoing channel can leave snapshots flowing while authority
+// runs a bot. Pending driver input must not be replayed until control returns.
+{
+  const prediction=new LocalPrediction();
+  prediction.submit({...neutralInput(),throttle:1,steer:-1},1,0);
+  const car={...initial(),temporaryAutopilot:true,isBot:false};
+  const visual={...car,x:-20,y:5};
+  const result=prediction.sample(car,frame(car,60,1),{now:1150,clockOffset:0,bufferedState:visual});
+  assert.equal(prediction.blocked,true);
+  assert.equal(prediction.horizon,0);
+  assert.deepEqual(prediction.state,car,'autopilot replayed an unknown bot command');
+  assert.equal(result.x,visual.x,'autopilot ignored buffered presentation');
+  const human={...car,temporaryAutopilot:false,inputSequence:1};
+  prediction.submit({...neutralInput(),throttle:1,steer:.3},2,1055);
+  const restored=prediction.sample(human,frame(human,62,1+1/30),{now:1167,clockOffset:0,bufferedState:visual});
+  assert.equal(prediction.blocked,false);
+  assert.ok(prediction.state.steeringPosition>0,'confirmed manual control failed to resume prediction');
+  assert.ok(Math.hypot(restored.x-result.x,restored.y-result.y)<12,'autopilot return snapped the local pose');
+}
+
+console.log("prediction-tests: ok (replay, differential physics, steering, clock corrections, autopilot, latency/loss/pause matrix)");

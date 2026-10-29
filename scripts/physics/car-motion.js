@@ -69,7 +69,7 @@ export function applyTerrainForces(car, input, physics, dt, terrain = terrainMod
     car.vx -= rightX * correction; car.vy -= rightY * correction;
     const throttle = clamp(Number(input?.throttle) || 0, 0, 1);
     const crawl = 1 - clamp(speed / 92, 0, 1);
-    if (throttle > .05 && crawl > 0) {
+    if (throttle > .05 && !input.brake && !input.reverse && crawl > 0) {
       const force = (24 + physics.acceleration * .22) * throttle * crawl * Math.sqrt(severity);
       car.vx += Math.cos(car.angle) * force * dt; car.vy += Math.sin(car.angle) * force * dt;
     }

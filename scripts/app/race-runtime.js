@@ -437,7 +437,7 @@ export class RaceRuntime {
       this.simulationWorker.addEventListener("error", this.#onWorkerError);
       this.simulationWorker.postMessage({
         type: "init", raceId: this.currentRaceId, track: this.track, entries, config: this.config,
-        checkpoint: this.initialCheckpoint, checkpoints: !this.practice
+        checkpoint: this.initialCheckpoint, checkpoints: !this.practice, snapshotFlowControl: true
       });
       this.workerStartupTimer = window.setTimeout(() => {
         if (!this.workerReady && this.simulationWorker) this.#fallbackWorker(new Error("Фоновая симуляция не ответила при запуске"));
@@ -487,26 +487,33 @@ export class RaceRuntime {
       else this.showError(error, this.renderer?.canvas?.closest?.(".fbl-need-for-speed"));
       return;
     }
-    if ((message.type !== "snapshot" && message.type !== "finished") || !message.snapshot) return;
-    const priorSnapshot = this.currentSimulationSnapshot;
-    this.previousSimulationSnapshot = priorSnapshot ?? message.snapshot;
-    this.currentSimulationSnapshot = message.snapshot;
-    this.pendingInitialSnapshot = message.snapshot;
-    this.audio.update(message.snapshot);
-    const now = performance.now();
-    this.lastWorkerSnapshotAt = now;
-    // Worker snapshots are timestamped at production and enter the same bounded
-    // presentation buffer as network frames. This decouples visible motion from
-    // message-delivery jitter and prevents alpha from resetting on every packet.
-    this.renderer?.pushSnapshot(message.snapshot, { source: "worker", generatedAt: message.generatedAt });
-    if (!this.practice && this.network.isHost) {
-      // The worker already publishes on the fixed simulation cadence. Forward
-      // each authoritative snapshot directly instead of applying a second wall-
-      // clock gate that can accidentally turn 30 Hz into an uneven 15-30 Hz stream.
-      this.lastSnapshotSent = now;
-      this.network.sendSnapshot(message.snapshot, { generatedAt: message.generatedAt });
+    if (!["snapshot", "state", "finished"].includes(message.type) || !message.snapshot) return;
+    const sourceWorker = this.simulationWorker;
+    try {
+      const priorSnapshot = this.currentSimulationSnapshot;
+      this.previousSimulationSnapshot = priorSnapshot ?? message.snapshot;
+      this.currentSimulationSnapshot = message.snapshot;
+      this.pendingInitialSnapshot = message.snapshot;
+      this.audio.update(message.snapshot);
+      const now = performance.now();
+      this.lastWorkerSnapshotAt = now;
+      // Worker snapshots are timestamped at production and enter the same bounded
+      // presentation buffer as network frames. This decouples visible motion from
+      // message-delivery jitter and prevents alpha from resetting on every packet.
+      this.renderer?.pushSnapshot(message.snapshot, { source: "worker", generatedAt: message.generatedAt });
+      if (!this.practice && this.network.isHost) {
+        // The worker already publishes on the fixed simulation cadence. Forward
+        // each consumed snapshot directly instead of applying a second wall-
+        // clock gate that can accidentally turn 30 Hz into an uneven 15-30 Hz stream.
+        this.lastSnapshotSent = now;
+        this.network.sendSnapshot(message.snapshot, { generatedAt: message.generatedAt });
+      }
+      if (message.type === "finished" && !this.resultsSent) this.#finish(message.snapshot);
+    } finally {
+      if (message.type === "snapshot" && Number.isFinite(message.snapshotId) && sourceWorker === this.simulationWorker) {
+        sourceWorker?.postMessage({ type: "snapshot-consumed", raceId: message.raceId, snapshotId: message.snapshotId });
+      }
     }
-    if (message.type === "finished" && !this.resultsSent) this.#finish(message.snapshot);
   };
 
   #onWorkerError = (event) => {

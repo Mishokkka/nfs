@@ -71,9 +71,35 @@ handler({ data: { type: "init", raceId: "worker-restored", track: generateTrack(
 assert.equal(posted.findLast(message => message.raceId === "worker-restored" && message.type === "snapshot").snapshot.tick, 1200);
 assert.ok(posted.some(message => message.raceId === "worker-restored" && message.type === "checkpoint"));
 
+// Main-thread stalls cannot enqueue a stream of increasingly obsolete frames.
+// A single ACK releases a fresh snapshot, while state events stay independent.
+for(const stallMs of [250,500,1000]) {
+  const raceId='worker-pressure-'+stallMs;
+  handler({data:{type:'init',raceId,snapshotFlowControl:true,checkpoints:true,
+    track:generateTrack('worker-pressure',2),entries:[{id:'car',userId:'user',build:cloneDefaultBuild()}],
+    config:{laps:1,requiredPitStops:0}}});
+  const initial=posted.findLast(message=>message.raceId===raceId&&message.type==='snapshot');
+  for(let elapsed=0;elapsed<stallMs;elapsed+=1000/60) {
+    clock+=1000/60;const current=pump;pump=null;current?.();
+  }
+  assert.equal(posted.filter(message=>message.raceId===raceId&&message.type==='snapshot').length,1,'worker accumulated unconsumed periodic snapshots');
+  handler({data:{type:'snapshot-request'}});
+  assert.ok(posted.some(message=>message.raceId===raceId&&message.type==='state'),'state event was trapped behind the periodic ACK');
+  handler({data:{type:'snapshot-consumed',raceId:'old-race',snapshotId:initial.snapshotId}});
+  assert.equal(posted.filter(message=>message.raceId===raceId&&message.type==='snapshot').length,1,'an old-race ACK released a snapshot');
+  handler({data:{type:'snapshot-consumed',raceId,snapshotId:initial.snapshotId}});
+  const fresh=posted.findLast(message=>message.raceId===raceId&&message.type==='snapshot');
+  assert.ok(fresh.snapshot.tick>=Math.floor(stallMs/1000*60),'ACK released an obsolete replacement');
+  assert.equal(fresh.generatedAt,clock,'replacement retained an old production timestamp');
+  assert.equal(posted.filter(message=>message.raceId===raceId&&message.type==='snapshot').length,2,'ACK burst a queue of stale frames');
+  handler({data:{type:'snapshot-consumed',raceId,snapshotId:initial.snapshotId}});
+  assert.equal(posted.filter(message=>message.raceId===raceId&&message.type==='snapshot').length,2,'duplicate ACK changed the outstanding frame');
+}
+
 handler({ data: {
   type: "init",
   raceId: "worker-finish",
+  snapshotFlowControl: true,
   track: generateTrack("worker-finish", 1),
   entries: [{
     id: "bot", userId: null, name: "Bot", build: cloneDefaultBuild(), color: "#fff",
@@ -91,5 +117,39 @@ assert.ok(posted.some((message) => message.type === "finished" && message.raceId
   "worker did not publish a final snapshot");
 assert.equal(pump, null, "worker interval continued after the final snapshot");
 handler({ data: { type: "stop" } });
+
+// The real runtime ACKs only after audio, rendering and network consumption.
+// State/checkpoint events bypass this credit without accidentally granting more.
+{
+  globalThis.window={setTimeout:()=>1,clearTimeout:()=>{},setInterval:()=>1,clearInterval:()=>{}};
+  globalThis.game={user:{id:'user'},settings:{get:()=>undefined}};
+  globalThis.ui={notifications:{warn:()=>{},error:()=>{}}};
+  const order=[];
+  globalThis.Worker=class {
+    constructor(){this.listeners=new Map();this.sent=[];}
+    addEventListener(type,callback){this.listeners.set(type,callback);}
+    removeEventListener(type){this.listeners.delete(type);}
+    postMessage(message){this.sent.push(message);if(message.type==='snapshot-consumed')order.push('ack');}
+    terminate(){}
+  };
+  const {RaceRuntime}=await load('scripts/app/race-runtime.js');
+  const network={isHost:true,sendSnapshot:()=>order.push('network'),saveRecoveryCheckpoint:()=>order.push('checkpoint')};
+  const runtime=new RaceRuntime({network,isRaceActive:()=>true,onFinished:()=>{}});
+  runtime.start({config:{seed:1,trackComplexity:1},entries:[{id:'car',userId:'user',build:cloneDefaultBuild()}],host:true,raceId:'runtime-pressure'});
+  const worker=runtime.simulationWorker;
+  assert.equal(worker.sent[0].snapshotFlowControl,true,'runtime did not enable snapshot credits');
+  runtime.audio.update=()=>order.push('audio');
+  runtime.renderer={pushSnapshot:()=>order.push('renderer'),destroy:()=>{}};
+  const receive=worker.listeners.get('message');
+  receive({data:{type:'snapshot',raceId:'runtime-pressure',snapshotId:1,snapshot:{tick:2,cars:[]},generatedAt:clock}});
+  assert.deepEqual(order,['audio','renderer','network','ack']);
+  assert.deepEqual(worker.sent.at(-1),{type:'snapshot-consumed',raceId:'runtime-pressure',snapshotId:1});
+  order.length=0;
+  receive({data:{type:'state',raceId:'runtime-pressure',snapshot:{tick:3,cars:[]}}});
+  assert.deepEqual(order,['audio','renderer','network']);
+  receive({data:{type:'checkpoint',raceId:'runtime-pressure',checkpoint:'{}'}});
+  assert.equal(order.at(-1),'checkpoint');
+  runtime.stop();
+}
 
 console.log("worker-tests: ok");

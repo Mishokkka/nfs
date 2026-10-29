@@ -1,3 +1,5 @@
+import { steeringLockAngle } from "../physics/drive-model.js";
+
 const SCALE = 2;
 const WIDTH = 88, HEIGHT = 64;
 const MAX_SPRITES = 36;
@@ -61,7 +63,7 @@ export class VehicleSprites {
   drawSteeringWheels(ctx, car) {
     const sx = clamp(Number(car.appearance?.halfLength) || 26, 18, 36) / 28;
     const sy = clamp(Number(car.appearance?.halfWidth) || 14, 9, 22) / 16;
-    const steer = clamp(Number(car.steeringPosition) || 0, -1, 1) * 0.5;
+    const steer = clamp(Number(car.steeringPosition) || 0, -1, 1) * steeringLockAngle(car.prediction);
     for (let side = -1; side <= 1; side += 2) {
       ctx.save(); ctx.translate(17 * sx, side * 13.5 * sy);
       ctx.rotate(steer); ctx.scale(sx, side * sy);

@@ -325,6 +325,8 @@ export class RaceRenderer {
       predictionHorizonMs: this.predictor.horizon * 1000,
       pendingInputs: this.predictor.history.filter(command => command.sequence > (this.predictor.state?.inputSequence ?? -1)).length,
       renderDelayMs: this.networkRenderDelay * 1000,
+      downlinkDelayMs: this.#downlinkDelay() * 1000,
+      totalRenderDelayMs: (this.networkRenderDelay + this.#downlinkDelay()) * 1000,
       rttMs: this.networkTiming?.rttMs ?? null,
       snapshotAgeMs: Math.max(0, performance.now() - this.snapshotAt),
       vehicleSpriteCacheSize: this.vehicleSprites.bodies.size,
@@ -1141,6 +1143,16 @@ export class RaceRenderer {
     return a + (b - a) * t;
   }
 
+  #downlinkDelay() {
+    const offset = this.networkTiming?.clockOffset;
+    if (!Number.isFinite(offset)) return 0; // Arrival-based mapping already includes delivery.
+    // Prefer observed low-latency frame age; RTT/2 only seeds the estimate when
+    // no frame has arrived. This also works with asymmetric transport delays.
+    return Number.isFinite(this.playbackClockOffset)
+      ? Math.max(0, this.playbackClockOffset - offset)
+      : Math.max(0, Number(this.networkTiming?.rttMs) || 0) / 2000;
+  }
+
   #interpolatedSnapshot(now) {
     if (this.simulationFrame) {
       const { previous, current, alpha } = this.simulationFrame;
@@ -1153,7 +1165,7 @@ export class RaceRenderer {
     const offset = this.networkTiming?.clockOffset ?? this.playbackClockOffset;
     const fallbackSourceAt = Number.isFinite(latest.presentationAt) ? latest.presentationAt : latest.receivedAt;
     const rawTargetTime = Number.isFinite(offset)
-      ? now / 1000 - offset - this.networkRenderDelay
+      ? now / 1000 - offset - this.#downlinkDelay() - this.networkRenderDelay
       : latest.time + Math.max(0, now - fallbackSourceAt) / 1000 - this.networkRenderDelay;
 
     let targetTime = rawTargetTime;
@@ -1340,7 +1352,8 @@ export class RaceRenderer {
     const local = this.predictor.sample(authoritative, source, {
       now, receivedAt: this.snapshotAt,
       clockOffset: this.networkTiming?.clockOffset ?? this.playbackClockOffset,
-      maxHorizon: 0.25, pit: this.track.pit
+      maxHorizon: 0.25, pit: this.track.pit,
+      bufferedState: snapshot.cars?.find(car => car.id === this.localCarId)
     });
     this.predictionState = this.predictor.state;
     this.predictionError = this.predictor.error;

@@ -11,6 +11,10 @@ let finishedPublished = false;
 let lastPublishedTick = -Infinity;
 let checkpoints = false;
 let lastCheckpointTick = -Infinity;
+let snapshotFlowControl = false;
+let snapshotSequence = 0;
+let awaitingSnapshotId = null;
+let snapshotPending = false;
 
 const fixedDt = 1 / PHYSICS_HZ;
 const tickIntervalMs = 1000 / PHYSICS_HZ;
@@ -21,23 +25,35 @@ function clearClockTimer() {
   timer = null;
 }
 
-function publishSnapshot({ force = false } = {}) {
+function publishSnapshot({ force = false, flush = false } = {}) {
   if (!simulation) return;
   const tick = Number(simulation.tick) || 0;
-  if (!force && !simulation.finished && tick - lastPublishedTick < snapshotEveryTicks) return;
-  const snapshot = simulation.snapshot();
-  if (checkpoints && !snapshot.finished && (force || tick - lastCheckpointTick >= PHYSICS_HZ / 2)) {
+  if (!force && !flush && !simulation.finished && tick - lastPublishedTick < snapshotEveryTicks) return;
+  if (checkpoints && !simulation.finished && (force || tick - lastCheckpointTick >= PHYSICS_HZ / 2)) {
     lastCheckpointTick = tick;
     self.postMessage({ type: "checkpoint", raceId, checkpoint: JSON.stringify(simulation.exportCheckpoint()) });
   }
-  lastPublishedTick = Number(snapshot.tick) || tick;
-  if (snapshot.finished && !finishedPublished) {
+  lastPublishedTick = tick;
+  if (simulation.finished && !finishedPublished) {
     finishedPublished = true;
+    snapshotPending = false;
+    const snapshot = simulation.snapshot();
     self.postMessage({ type: "finished", raceId, snapshot, generatedAt: performance.timeOrigin + performance.now() });
     clearClockTimer();
     return;
   }
-  self.postMessage({ type: "snapshot", raceId, snapshot, generatedAt: performance.timeOrigin + performance.now() });
+  if (snapshotFlowControl && awaitingSnapshotId !== null && !force) {
+    // Do not clone stale frames into the main-thread event queue. The next ACK
+    // requests the then-current state, replacing all missed periodic snapshots.
+    snapshotPending = true;
+    return;
+  }
+  const snapshot = simulation.snapshot();
+  const stateEvent = snapshotFlowControl && awaitingSnapshotId !== null;
+  const snapshotId = stateEvent ? null : ++snapshotSequence;
+  if (snapshotFlowControl && !stateEvent) awaitingSnapshotId = snapshotId;
+  self.postMessage({ type: stateEvent ? "state" : "snapshot", raceId, snapshot, snapshotId,
+    generatedAt: performance.timeOrigin + performance.now() });
 }
 
 function schedulePump(now = performance.now()) {
@@ -96,6 +112,10 @@ function stopClock() {
   lastPublishedTick = -Infinity;
   lastCheckpointTick = -Infinity;
   checkpoints = false;
+  snapshotFlowControl = false;
+  snapshotSequence = 0;
+  awaitingSnapshotId = null;
+  snapshotPending = false;
 }
 
 self.addEventListener("message", (event) => {
@@ -115,10 +135,19 @@ self.addEventListener("message", (event) => {
         });
         if (message.checkpoint) simulation.restoreCheckpoint(message.checkpoint, { resetInputs: true });
         checkpoints = message.checkpoints === true;
+        snapshotFlowControl = message.snapshotFlowControl === true;
         finishedPublished = false;
         startClock();
         publishSnapshot({ force: true });
         self.postMessage({ type: "ready", raceId });
+        break;
+      case "snapshot-consumed":
+        if (awaitingSnapshotId === null || message.raceId !== raceId || message.snapshotId !== awaitingSnapshotId) break;
+        awaitingSnapshotId = null;
+        if (snapshotPending && simulation && !simulation.finished) {
+          snapshotPending = false;
+          publishSnapshot({ flush: true });
+        }
         break;
       case "input":
         simulation?.setInput(message.carId, message.input, message.sequence);

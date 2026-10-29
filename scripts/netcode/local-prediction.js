@@ -27,6 +27,7 @@ export class LocalPrediction {
     this.displayedState = null;
     this.contactBlocked = false;
     this.contactClearAt = null;
+    this.buffered = false;
   }
 
   /** Record an owning client's command on its monotonic clock; cap outage memory. */
@@ -98,14 +99,16 @@ export class LocalPrediction {
    * Wall contact switches smoothly in both directions; terminal states snap to
    * authority so service, retirement and respawn do not retain speculative motion.
    */
-  sample(authority, snapshot, { now, clockOffset, receivedAt = now, maxHorizon = 0.25, pit = {} }) {
+  sample(authority, snapshot, { now, clockOffset, receivedAt = now, maxHorizon = 0.25, pit = {}, bufferedState = null }) {
     const dt = this.lastAt == null ? 0 : clamp((now - this.lastAt) / 1000, 0, 0.25);
     const sourceTick = Number(snapshot.tick) || 0;
     const wasContactBlocked = this.contactBlocked;
+    const wasBuffered = this.buffered;
     this.#updateContact(Number(authority.wallContactTimer) || 0, now);
     const terminal = !snapshot.started || authority.finished || authority.disabled || authority.abandoned
-      || authority.isBot || authority.pitState === "service";
-    this.blocked = Boolean(terminal || this.contactBlocked);
+      || authority.pitState === "service";
+    this.buffered = Boolean(authority.isBot || authority.temporaryAutopilot);
+    this.blocked = Boolean(terminal || this.contactBlocked || this.buffered);
     if (terminal || !authority.prediction) {
       this.authority = null;
       this.offset = { x: 0, y: 0, angle: 0 };
@@ -113,23 +116,31 @@ export class LocalPrediction {
       this.displayedState = this.state;
       this.contactBlocked = false;
       this.contactClearAt = null;
+      this.buffered = false;
       this.lastAt = now;
       this.horizon = 0;
       this.error = 0;
       return this.state;
     }
-    const replay = this.contactBlocked ? { state: { ...authority }, horizon: 0 }
+    const replay = this.contactBlocked || this.buffered ? { state: { ...authority }, horizon: 0 }
       : this.#replay(authority, snapshot, now, clockOffset, receivedAt, maxHorizon, pit);
-    if (this.displayedState && (wasContactBlocked !== this.contactBlocked
+    // Automated commands are not transmitted. Use the renderer's interpolated
+    // pose instead of speculatively replaying the driver's last command.
+    const target = this.buffered && bufferedState ? { ...bufferedState,
+      temporaryAutopilot: authority.temporaryAutopilot, isBot: authority.isBot } : replay.state;
+    const clockChanged = this.authority && this.authority.clockOffset !== clockOffset;
+    if (this.displayedState && (wasBuffered !== this.buffered || wasContactBlocked !== this.contactBlocked
       || (this.contactBlocked && sourceTick !== this.sourceTick))) {
-      this.#correctVisual(this.displayedState, replay.state, this.contactBlocked);
-    } else if (this.authority && sourceTick !== this.sourceTick) {
-      const prior = this.#replay(this.authority.car, this.authority.snapshot, now, clockOffset, this.authority.receivedAt, maxHorizon, pit).state;
-      this.#correctVisual({ ...prior, x: prior.x + this.offset.x, y: prior.y + this.offset.y, angle: prior.angle + this.offset.angle }, replay.state);
+      this.#correctVisual(this.displayedState, target, this.contactBlocked);
+    } else if (this.authority && (sourceTick !== this.sourceTick || clockChanged)) {
+      // Reconstruct the prior displayed timeline with its own clock mapping.
+      // A first pong or later correction must not jump the replay horizon.
+      const prior = this.#replay(this.authority.car, this.authority.snapshot, now, this.authority.clockOffset, this.authority.receivedAt, maxHorizon, pit).state;
+      this.#correctVisual({ ...prior, x: prior.x + this.offset.x, y: prior.y + this.offset.y, angle: prior.angle + this.offset.angle }, target);
     }
     const decay = Math.exp(-dt / this.correctionTime);
     for (const key of ["x", "y", "angle"]) this.offset[key] *= decay;
-    this.authority = this.contactBlocked ? null : { car: authority, snapshot, receivedAt };
+    this.authority = this.contactBlocked || this.buffered ? null : { car: authority, snapshot, receivedAt, clockOffset };
     this.sourceTick = sourceTick;
     this.lastAt = now;
     this.horizon = replay.horizon;
@@ -140,7 +151,7 @@ export class LocalPrediction {
     let keep = 0;
     for (let i = 0; i < this.history.length; i++) if (this.history[i].sequence <= ack) keep = i;
     if (keep > 0) this.history.splice(0, keep);
-    this.displayedState = { ...replay.state, x: replay.state.x + this.offset.x, y: replay.state.y + this.offset.y, angle: replay.state.angle + this.offset.angle };
+    this.displayedState = { ...target, x: target.x + this.offset.x, y: target.y + this.offset.y, angle: target.angle + this.offset.angle };
     return this.displayedState;
   }
 }

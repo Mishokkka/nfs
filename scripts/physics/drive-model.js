@@ -2,6 +2,17 @@ const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 const angleWrap = (angle) => Math.atan2(Math.sin(angle), Math.cos(angle));
 const dot = (ax, ay, bx, by) => ax * bx + ay * by;
 
+/** Mechanical steering lock, independent of tyre grip. A high-grip tyre must
+ * not let a slow car pivot around a point inside its own wheelbase. */
+export function steeringLockAngle(physics) {
+  const rate = Number.isFinite(Number(physics?.steerRate)) ? Math.max(0, Number(physics.steerRate)) : 1.4;
+  return rate > 0 ? clamp(rate * .14, .20, .32) : 0;
+}
+
+function wheelbaseFor(physics) {
+  return Math.max(12, Number(physics?.wheelbase) || (Number(physics?.collisionHalfLength) || 25) * 33 / 28);
+}
+
 /** Shared racing tyre budget in world units/s². Speed support is deliberately
  * milder than a modern F1 car, with a finite combined braking/cornering budget.
  * Authority, prediction, garage estimates and bot planning use this function.
@@ -60,8 +71,8 @@ export function applyDriveModel(state, input, physics, dt, modifiers = {}) {
   const forwardSpeedBeforeAcceleration = forwardSpeed;
 
   const speedRatio = clamp(Math.abs(forwardSpeed) / maxSpeed, 0, 1.4);
-  // Tyres need forward/reverse motion to turn the chassis. A parked car cannot
-  // rotate on the spot just because a steering key is held.
+  // Intentional drift retains its speed-dependent yaw response. Ordinary
+  // steering uses wheelbase and front-wheel geometry below.
   const lowSpeedAuthority = clamp(Math.abs(forwardSpeed) / 72, 0, 1.04);
   // High-speed cornering should demand commitment. The raw steer rate still
   // defines how lively a chassis feels, but as speed climbs the available yaw
@@ -130,6 +141,16 @@ export function applyDriveModel(state, input, physics, dt, modifiers = {}) {
   // limiting, rather than a throttle request that no longer produces thrust.
   acceleration = step > 0 ? (forwardSpeed - forwardSpeedBeforeAcceleration) / step : 0;
 
+  // Steering must use motion remaining after passive resistance. Computing yaw
+  // from a pre-drag speed allowed a creeping/stalled car to rotate even when
+  // rolling resistance removed all of its displacement later in the same tick.
+  const drag = longitudinalDrag * speedRatio * speedRatio * Math.sign(forwardSpeed);
+  forwardSpeed -= drag * 55 * step;
+  if (Math.abs(forwardSpeed) > 0) {
+    const rolling = Math.min(Math.abs(forwardSpeed), rollingDrag * step);
+    forwardSpeed -= Math.sign(forwardSpeed) * rolling;
+  }
+
   const requestedSteering = clamp(Number(input.steer) || 0, -1, 1);
   const rackResponse = (0.045 + speedRatio * 0.035)
     * Math.pow(clamp((Number(p.mass) || 1200) / 1200, 0.5, 2), 0.25)
@@ -189,9 +210,22 @@ export function applyDriveModel(state, input, physics, dt, modifiers = {}) {
   const counterSteering = driftAmount > 0.04 && steering * driftDirection < -0.10;
   const sameDirectionSteering = driftAmount > 0.04 && steering * driftDirection > 0.10;
   const driftYawMultiplier = 1 - driftAmount * 0.28 + (enteringDrift ? driftAmount * 0.06 : 0);
-  state.angularVelocity = (Number(state.angularVelocity) || 0)
-    + steering * steerRate * steerAuthority * steeringMultiplier * yawResponseMultiplier
-      * driftYawMultiplier * directionSign * step * (5.2 + 2.6 * (1 - driftAmount));
+  const wheelbase = wheelbaseFor(p);
+  const wheelLock = clamp(steeringLockAngle(p) * steeringMultiplier, 0, .55);
+  const geometricYaw = forwardSpeed / wheelbase * Math.tan(steering * wheelLock);
+  const steeringActive = Math.abs(requestedSteering) > .001 || Math.abs(state.steeringPosition) > .001
+    || Math.abs(previousSteer) > .001;
+  if (driftAmount > .04) {
+    state.angularVelocity = (Number(state.angularVelocity) || 0)
+      + steering * steerRate * steerAuthority * steeringMultiplier * yawResponseMultiplier
+        * driftYawMultiplier * directionSign * step * (5.2 + 2.6 * (1 - driftAmount));
+  } else {
+    // Bicycle steering: yaw = v / wheelbase * tan(front-wheel angle). Grip
+    // limits the fast corner, wheel geometry limits the slow manoeuvre.
+    const response = clamp(7.5 * recovery * angularDampingMultiplier * yawResponseMultiplier
+      / Math.sqrt(spinResistance) / Math.pow(clamp((Number(p.mass) || 1200) / 1200, .5, 2), .25), 2, 18);
+    state.angularVelocity = geometricYaw + ((Number(state.angularVelocity) || 0) - geometricYaw) * Math.exp(-response * step);
+  }
 
   if (driftAmount > 0) {
     const throttle = clamp(Number(input.throttle) || 0, 0, 1);
@@ -206,17 +240,19 @@ export function applyDriveModel(state, input, physics, dt, modifiers = {}) {
   const baseAngularDamping = 4.7 * spinResistance * recovery * angularDampingMultiplier;
   const driftDampingScale = 1 - driftAmount * 0.48;
   const counterDamping = counterSteering ? (1.9 + driftControl * 2.25) * driftAmount : 0;
-  state.angularVelocity *= Math.exp(-(baseAngularDamping * driftDampingScale + counterDamping) * step);
+  if (driftAmount > .04) state.angularVelocity *= Math.exp(-(baseAngularDamping * driftDampingScale + counterDamping) * step);
   // A finite tyre-force budget makes fast corners open out. Acceleration and
   // braking consume part of that budget, so slowing before a turn matters.
   const lateralAccelerationLimit = lateralAccelerationBudget(p, gripMultiplier, acceleration, forwardSpeed);
   const yawLimit = lateralAccelerationLimit / Math.max(32, Math.abs(forwardSpeed)) * (1 + driftAmount * 0.65);
-  const supportedYaw = clamp(state.angularVelocity, -yawLimit, yawLimit);
-  // Rack smoothing already makes ordinary steering progressive. A second soft
-  // limiter allowed yaw to exceed tyre support every tick, accumulating large
-  // sideways slip even without Ctrl. Keep that freedom only for explicit drift.
+  const geometryLimit = Math.abs(forwardSpeed) / wheelbase * Math.tan(wheelLock);
+  const ordinaryLimit = steeringActive ? Math.min(yawLimit, geometryLimit) : yawLimit;
+  const supportedYaw = clamp(state.angularVelocity, -(driftAmount > .04 ? yawLimit : ordinaryLimit), driftAmount > .04 ? yawLimit : ordinaryLimit);
+  // Ordinary steering respects the wheel/tyre ceiling. With a neutral rack,
+  // external angular momentum instead decays through the time-based response
+  // above; even an infinitesimal tick must not instantly truncate an impact.
   if (driftAmount > .04) state.angularVelocity += (supportedYaw - state.angularVelocity) * (1 - Math.exp(-step * 12));
-  else state.angularVelocity = supportedYaw;
+  else if (steeringActive) state.angularVelocity = supportedYaw;
   const inertialVx = forwardX * forwardSpeed + rightX * lateralSpeed;
   const inertialVy = forwardY * forwardSpeed + rightY * lateralSpeed;
   state.angle = angleWrap((Number(state.angle) || 0) + state.angularVelocity * step);
@@ -267,13 +303,6 @@ export function applyDriveModel(state, input, physics, dt, modifiers = {}) {
     state.angularVelocity += spinDirection * spinExcess * (0.85 + speedRatio * 1.15)
       / Math.sqrt(Math.max(0.35, spinResistance)) * step;
     driftAmount = Math.max(driftAmount, 0.68 + spinExcess * 0.32);
-  }
-
-  const drag = longitudinalDrag * speedRatio * speedRatio * Math.sign(forwardSpeed);
-  forwardSpeed -= drag * 55 * step;
-  if (Math.abs(forwardSpeed) > 0) {
-    const rolling = Math.min(Math.abs(forwardSpeed), rollingDrag * step);
-    forwardSpeed -= Math.sign(forwardSpeed) * rolling;
   }
 
   state.vx = updatedForwardX * forwardSpeed + updatedRightX * lateralSpeed;

@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import { cloneDefaultBuild, resolveBuild } from "../scripts/catalog.js";
 import { deriveCarPhysics, buildRaceCarMeta, neutralInput, RaceSimulation } from "../scripts/physics.js";
-import { advanceCarMotion } from "../scripts/physics/car-motion.js";
+import { advanceCarMotion, applyTerrainForces } from "../scripts/physics/car-motion.js";
 import { computeBotInput } from "../scripts/physics/bot-controller.js";
+import { applyDriveModel } from "../scripts/physics/drive-model.js";
 import { generateTrack, sampleTrack, nearestTrackPoint } from "../scripts/track.js";
 
 const build = cloneDefaultBuild();
@@ -166,6 +167,91 @@ for(const frame of ['allantry','arrow','spider','keel','bull','turtle']) {
   const disturbed={...carAt(80/kmh),vy:70,health:p.maxHealth,charge:p.maxCharge};
   for(let tick=0;tick<48;tick++)run(disturbed,{throttle:.5});
   assert.ok(Math.abs(disturbed.slipAngle)<Math.PI/180,frame+' failed to recover a lateral disturbance');
+}
+
+// Tyre grip cannot replace mechanical steering geometry. Hold longitudinal
+// speed in this probe so engine/rolling resistance cannot hide a pivot.
+const arcProbe=(p,kmhSpeed,steer=1,extra={})=>{
+  const car={...carAt(kmhSpeed/kmh),...extra};let distance=0,turn=0;
+  for(let tick=0;tick<180;tick++) {
+    const lateral=-Math.sin(car.angle)*car.vx+Math.cos(car.angle)*car.vy;
+    car.vx=Math.cos(car.angle)*kmhSpeed/kmh-Math.sin(car.angle)*lateral;
+    car.vy=Math.sin(car.angle)*kmhSpeed/kmh+Math.cos(car.angle)*lateral;
+    const x=car.x,y=car.y,angle=car.angle;
+    applyDriveModel(car,{...neutralInput(),steer},p,dt);
+    if(tick>=60){distance+=Math.hypot(car.x-x,car.y-y);turn+=Math.atan2(Math.sin(car.angle-angle),Math.cos(car.angle-angle));}
+  }
+  return {radius:distance/Math.max(1e-12,Math.abs(turn))*kmh/3.6,yaw:turn/2,car};
+};
+for(const frame of ['allantry','arrow','spider','keel','bull','turtle']) {
+  const p=deriveCarPhysics(resolveBuild({...cloneDefaultBuild(),frame}));
+  const radii=[];
+  for(const speed of [.5,1,3,5,10,15,20]) {
+    const forward=arcProbe(p,speed),reverse=arcProbe(p,-speed);
+    assert.ok(forward.radius>4.5 && reverse.radius>4.5,frame+' pivoted inside a car-sized radius');
+    assert.ok(forward.yaw>0 && reverse.yaw<0,frame+' reversed steering in the wrong direction');
+    assert.ok(Math.abs(forward.radius-reverse.radius)<.2,frame+' used a different reverse wheelbase');
+    radii.push(forward.radius);
+  }
+  assert.ok(Math.max(...radii)/Math.min(...radii)<1.08,frame+' slow turn radius collapsed at a speed threshold');
+  const full=arcProbe(p,5),half=arcProbe(p,5,.5);
+  assert.ok(half.radius>full.radius*1.8,frame+' ignored the front-wheel angle');
+  const parked=carAt(0);
+  for(let tick=0;tick<120;tick++)applyDriveModel(parked,{...neutralInput(),steer:1,drift:true},p,dt);
+  assert.equal(parked.angle,0,frame+' rotated while stationary');
+  assert.equal(parked.driftAmount,0,frame+' initiated drift without forward motion');
+  const stalled=carAt(0);
+  for(let tick=0;tick<120;tick++)applyDriveModel(stalled,{...neutralInput(),throttle:.005,steer:1},p,dt);
+  assert.equal(stalled.x,0,frame+' moved below rolling resistance');
+  assert.equal(stalled.angle,0,frame+' steered without any displacement');
+  const stopping={...arcProbe(p,15).car};
+  let stoppedAngle=null;
+  for(let tick=0;tick<240;tick++) {
+    applyDriveModel(stopping,{...neutralInput(),steer:1,brake:true},p,dt);
+    if(Math.hypot(stopping.vx,stopping.vy)<.01&&stoppedAngle===null)stoppedAngle=stopping.angle;
+    if(stoppedAngle!==null)assert.ok(Math.abs(stopping.angle-stoppedAngle)<1e-8,frame+' kept steering after stopping');
+  }
+  assert.notEqual(stoppedAngle,null,frame+' did not stop in the steering regression');
+}
+const lowGripArc=arcProbe({...physics,lateralGrip:1},5),highGripArc=arcProbe({...physics,lateralGrip:30},5);
+// Tyres change lateral compliance, so the actual path can differ slightly.
+// The mechanical yaw request itself must stay independent of tyre grip.
+assert.ok(Math.abs(lowGripArc.yaw-highGripArc.yaw)<1e-8,'tyre grip changed the mechanical steering angle');
+assert.ok(highGripArc.radius>lowGripArc.radius*.99,'more tyre grip collapsed the mechanical turning circle');
+const shortArc=arcProbe({...physics,wheelbase:24},5),longArc=arcProbe({...physics,wheelbase:45},5);
+assert.ok(longArc.radius/shortArc.radius>1.8,'wheelbase did not constrain the turning arc');
+
+// A neutral rack must dissipate an impact's rotation over time, rather than
+// truncating the entire angular velocity to the tyre ceiling even as dt -> 0.
+{
+  const tiny=carAt(600);tiny.angularVelocity=4;
+  applyDriveModel(tiny,neutralInput(),physics,1e-6);
+  assert.ok(tiny.angularVelocity>3.999,'neutral tyres instantly deleted impact rotation');
+  const samples=[];
+  for(const hz of [60,120]) {
+    const car=carAt(600);car.angularVelocity=4;
+    for(let tick=0;tick<hz/2;tick++)applyDriveModel(car,neutralInput(),physics,1/hz);
+    samples.push(car.angularVelocity);
+  }
+  assert.ok(Math.abs(samples[0]-samples[1])<1e-8,'neutral angular recovery depends on timestep');
+}
+
+// Sand crawl assistance obeys the same pedal priority as the main drivetrain,
+// including velocity after a tick (not just the already-integrated position).
+for(const pedals of [{throttle:1,brake:true},{throttle:1,reverse:true}]) {
+  for(const speed of [0,80/kmh]) {
+    const car={...carAt(speed),surfaceType:'sand',surfaceSeverity:1};
+    const reference={...car};
+    const input={...neutralInput(),...pedals,boost:true};
+    for(let tick=0;tick<300;tick++) {
+      advanceCarMotion(car,input,physics,dt);
+      applyTerrainForces(car,input,physics,dt);
+      advanceCarMotion(reference,{...neutralInput(),brake:true},physics,dt);
+      applyTerrainForces(reference,{...neutralInput(),brake:true},physics,dt);
+      for(const key of ['x','y','vx','vy','angle','angularVelocity'])assert.ok(Math.abs(car[key]-reference[key])<1e-8,'sand crawl defeated brake priority at '+key);
+    }
+    assert.equal(car.vx,0);assert.equal(car.vy,0);
+  }
 }
 
 console.log("handling-tests: ok (balance targets, momentum, brake priority, reverse, pit limiter, bot tyre budget)");

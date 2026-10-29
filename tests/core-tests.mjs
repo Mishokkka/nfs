@@ -1388,14 +1388,19 @@ for (const scenario of [
   assert.ok(drift.yaw > 0.55, `Ctrl drift produced too little yaw: ${drift.yaw}`);
   assert.ok(drift.speed > 150, `Ctrl drift deleted too much speed: ${drift.speed}`);
 
+  let unwoundYaw = drift.yaw;
   for (let tick = 0; tick < 20; tick += 1) {
     applyDriveModel(state, {
       ...neutralInput(), throttle: 0.15, steer: -0.65, drift: false
     }, physics, 1 / 60, { ...modifiers, previousSteer: state.lastSteer });
     state.lastSteer = -0.65;
+    unwoundYaw = Math.min(unwoundYaw, Math.abs(state.angularVelocity));
   }
-  assert.ok(Math.abs(state.angularVelocity) < drift.yaw * 0.62,
-    `countersteer failed to reduce yaw: ${state.angularVelocity}/${drift.yaw}`);
+  assert.ok(unwoundYaw < drift.yaw * 0.2, `countersteer failed to unwind yaw: ${unwoundYaw}/${drift.yaw}`);
+  // Once grip returns, a held opposite rack can legitimately turn the other
+  // way. It must not retain the old slide or overshoot its original rotation.
+  assert.ok(state.angularVelocity < 0 && Math.abs(state.angularVelocity) < drift.yaw,
+    `countersteer retained or amplified the old rotation: ${state.angularVelocity}/${drift.yaw}`);
   assert.ok(Math.abs(state.slipAngle) < drift.slip * 0.58,
     `countersteer failed to reduce slip: ${state.slipAngle}/${drift.slip}`);
   assert.ok(state.driftAmount < drift.amount * 0.45, "releasing Ctrl did not exit the drift state");
