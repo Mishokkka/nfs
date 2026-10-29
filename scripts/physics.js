@@ -1,4 +1,5 @@
-import { PHYSICS_HZ, CAR_COLORS, INPUT_TIMEOUT_SECONDS } from "./constants.js";
+import { PHYSICS_HZ, CAR_COLORS, INPUT_TIMEOUT_SECONDS, SURFACE_TYPES } from "./constants.js";
+import { sceneryContact } from "./scenery-geometry.js";
 import { resolveBuild } from "./catalog.js";
 import {
   nearestTrackPoint,
@@ -9,14 +10,57 @@ import {
   runoffSurfaceForSide,
   wallSegmentActiveRange,
   wallBoundaryPoint,
-  WALL_COLLISION_ALPHA
+  WALL_COLLISION_ALPHA,
+  RUNOFF_SURFACES,
+  roadWidthAt
 } from "./track.js";
 import { computeBotInput, shouldBotPit } from "./physics/bot-controller.js";
-import { applyDriveModel } from "./physics/drive-model.js";
+import { advanceCarMotion, terrainModifiers, applyTerrainForces } from "./physics/car-motion.js";
 
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 const dot = (ax, ay, bx, by) => ax * bx + ay * by;
 const cross = (ax, ay, bx, by) => ax * by - ay * bx;
+const CHECKPOINT_STATIC_FIELDS = new Set(["id", "userId", "name", "driverName", "build", "resolved", "physics", "prediction", "appearance", "color", "rng", "routeContext"]);
+const CHECKPOINT_NULLABLE_STRINGS = new Set(["pitWord", "pitAttemptId"]);
+const checkpointRoute = route => route == null ? null : Object.fromEntries(["mainNearest", "pitNearest"].map(key => [key,
+  route[key] == null ? null : { index: route[key].index, progress: route[key].progress,
+    signedDistance: route[key].signedDistance, point: { ...route[key].point } }]));
+const CHECKPOINT_POINT_KEYS = "x y tx ty nx ny cumulative roadWidth grassWidth grassWidthLeft grassWidthRight surfaceLeft surfaceRight wallLeftAlpha wallRightAlpha wallLeftX wallLeftY wallRightX wallRightY mainProgressUnwrapped".split(" ");
+
+/** Attach immutable per-race presentation/prediction data only where needed.
+ * Worker frames reuse a single metadata message instead of cloning it at 30 Hz. */
+function copyCarMetadata(row, car) {
+  row.prediction = car.prediction;
+  row.appearance = car.appearance;
+  row.maxHealth = car.physics.maxHealth;
+  row.maxCharge = car.physics.maxCharge;
+  row.color = car.color;
+  row.name = car.name;
+  row.driverName = car.driverName;
+  row.heatWarning = Boolean(car.resolved.traits.heatWarning);
+  row.pitStopsRequired = car.pitStopsRequired;
+  return row;
+}
+
+function validCheckpointRoute(route, track) {
+  if (route === null) return true;
+  if (!route?.mainNearest) return false;
+  return [[route.mainNearest, track.samples.length], [route.pitNearest, track.pit.samples.length]].every(([nearest, size]) =>
+    nearest === null || (Number.isInteger(nearest.index) && nearest.index >= 0 && nearest.index < size
+      && [nearest.progress, nearest.signedDistance].every(value => Number.isFinite(value) && Math.abs(value) <= 1e9)
+      && nearest.point && Object.keys(nearest.point).length === CHECKPOINT_POINT_KEYS.length
+      && CHECKPOINT_POINT_KEYS.every(key => key.startsWith("surface") ? RUNOFF_SURFACES.includes(nearest.point[key])
+        : (key === "mainProgressUnwrapped" && nearest.point[key] === null) || (Number.isFinite(nearest.point[key]) && Math.abs(nearest.point[key]) <= 1e9))));
+}
+
+function validCheckpointValue(key, value, initial) {
+  if (key === "currentInput") return value && typeof value === "object"
+    && JSON.stringify(sanitizeInput(value)) === JSON.stringify(value);
+  if (CHECKPOINT_NULLABLE_STRINGS.has(key)) return value === null || (typeof value === "string" && value.length <= 80);
+  if (initial === null) return value === null || (Number.isFinite(value) && Math.abs(value) <= 1e9);
+  if (typeof initial === "number") return Number.isFinite(value) && Math.abs(value) <= 1e9;
+  return typeof value === typeof initial && (typeof value !== "string" || value.length <= 80);
+}
 
 function closestPointOnSegment(point, start, end) {
   const sx = end.x - start.x;
@@ -113,48 +157,9 @@ function velocityAtPoint(car, x, y) {
   };
 }
 const GLOBAL_SPEED_SCALE = 1.25;
-const GLOBAL_ACCELERATION_SCALE = 1.0;
+const GLOBAL_ACCELERATION_SCALE = 0.68;
+const GLOBAL_BRAKING_SCALE = 0.42;
 
-const TERRAIN_PROFILES = Object.freeze({
-  road: Object.freeze({ accelerationLoss: 0, steeringLoss: 0, topSpeedLoss: 0, gripLoss: 0, yawGain: 0, dampingShift: 0, dragBase: 0, dragStrength: 0 }),
-  grass: Object.freeze({ accelerationLoss: 0.45, steeringLoss: 0.34, topSpeedLoss: 0.42, gripLoss: 0.72, yawGain: 0.48, dampingShift: -0.68, dragBase: 0.18, dragStrength: 1.38 }),
-  gravel: Object.freeze({ accelerationLoss: 0.64, steeringLoss: 0.42, topSpeedLoss: 0.64, gripLoss: 0.66, yawGain: 0.22, dampingShift: -0.34, dragBase: 0.42, dragStrength: 2.82 }),
-  sand: Object.freeze({ accelerationLoss: 0.86, steeringLoss: 0.46, topSpeedLoss: 0.82, gripLoss: 0.34, yawGain: -0.18, dampingShift: 1.18, dragBase: 0.70, dragStrength: 5.20 })
-});
-
-function terrainModifiers(car, physics, speed = null) {
-  const p = physics ?? car?.physics ?? {};
-  const rawSeverity = clamp(Number(car?.surfaceSeverity) || 0, 0, 1);
-  const effective = clamp(rawSeverity / Math.max(1, Number(p.offroadGrip) || 1), 0, 1);
-  const currentSpeed = speed == null ? Math.hypot(Number(car?.vx) || 0, Number(car?.vy) || 0) : Math.abs(Number(speed) || 0);
-  const speedRatio = clamp(currentSpeed / Math.max(1, Number(p.maxSpeed) || 420), 0, 1.4);
-  const type = TERRAIN_PROFILES[car?.surfaceType] ? car.surfaceType : (effective > 0.001 ? "grass" : "road");
-  const profile = TERRAIN_PROFILES[type];
-  const highSpeed = clamp((speedRatio - 0.22) / 0.88, 0, 1);
-  const gripLoss = type === "grass"
-    ? profile.gripLoss * (0.52 + highSpeed * 0.72)
-    : profile.gripLoss * (0.82 + highSpeed * 0.18);
-  const sandCrawlAssist = type === "sand"
-    ? effective * 0.52 * (1 - clamp(speedRatio / 0.20, 0, 1))
-    : 0;
-  return {
-    type,
-    severity: effective,
-    speedRatio,
-    // Deep sand still destroys pace, but a stationary car must retain enough
-    // tractive effort to crawl back toward the asphalt. The extra low-speed
-    // term fades completely before the car reaches racing speed.
-    acceleration: Math.max(0.08, 1 - effective * profile.accelerationLoss + sandCrawlAssist),
-    steering: Math.max(0.18, 1 - effective * profile.steeringLoss * (0.78 + highSpeed * 0.32)),
-    topSpeed: Math.max(0.12, 1 - effective * profile.topSpeedLoss),
-    grip: Math.max(0.06, 1 - effective * gripLoss),
-    yawResponse: Math.max(0.28, 1 + effective * profile.yawGain * (0.42 + highSpeed * 0.78)),
-    angularDamping: Math.max(0.16, 1 + effective * profile.dampingShift * (0.45 + highSpeed * 0.75)),
-    dragRate: effective > 0.001
-      ? profile.dragBase * effective + profile.dragStrength * Math.pow(effective, 1.28) * (0.54 + speedRatio * 0.52)
-      : 0
-  };
-}
 const PIT_WORDS = Object.freeze([
   "кристалл", "болид", "вираж", "скорость", "поршень", "шестерня", "искрение", "гонщик",
   "питстоп", "разряд", "трасса", "Аллантре", "турбина", "механик", "форсаж", "сцепление",
@@ -162,6 +167,10 @@ const PIT_WORDS = Object.freeze([
   "engine", "circuit", "driver", "traction", "coolant", "turbine", "chassis", "resonance"
 ]);
 
+/** Map normalized part/driver ratings to shared world-unit physics parameters.
+ * Engine and passive-loss scales preserve terminal speed while launch and
+ * service-brake strengths remain independent balance controls.
+ */
 export function deriveCarPhysics(resolved) {
   const { stats, traits, driverStats } = resolved;
   const reflexes = clamp(Number(driverStats.reflexes) || 1, 1, 6);
@@ -181,19 +190,22 @@ export function deriveCarPhysics(resolved) {
     maxSpeed: (260 + stats.speed * 30) * traits.topSpeed * (1 + (technique - 1) * 0.005) * GLOBAL_SPEED_SCALE,
     acceleration: (18 + stats.acceleration * 16) * (1 + (reflexes - 1) * 0.04) * GLOBAL_ACCELERATION_SCALE,
     reverseAcceleration: 58 * GLOBAL_ACCELERATION_SCALE,
-    braking: 245 * (1 + (reflexes - 1) * 0.03) * GLOBAL_SPEED_SCALE,
+    braking: 245 * (1 + (reflexes - 1) * 0.03) * GLOBAL_SPEED_SCALE * GLOBAL_BRAKING_SCALE,
     steerRate: (0.88 + stats.handling * 0.14) * (1 + (technique - 1) * 0.028),
     lateralGrip: (1.55 + stats.control * 0.42)
       * traits.cornerGrip
       * (1 + (technique - 1) * 0.016 + (composure - 1) * 0.022),
-    longitudinalDrag: 0.25,
-    rollingDrag: 16 * GLOBAL_SPEED_SCALE,
+    // Match passive losses to the softer engine: launch takes longer without
+    // quietly lowering the attainable top speed of low-torque builds.
+    longitudinalDrag: 0.25 * GLOBAL_ACCELERATION_SCALE,
+    rollingDrag: 16 * GLOBAL_SPEED_SCALE * GLOBAL_ACCELERATION_SCALE,
     mass,
     momentOfInertia,
     maxHealth: (55 + stats.durability * 14) * traits.durabilityMult,
     radius,
     collisionHalfWidth,
     collisionHalfLength,
+    wheelbase: collisionHalfLength * 33 / 28,
     maxCharge: 100 * traits.charge * (1 + (attunement - 1) * 0.017),
     cooling: 5.0 * traits.cooling * (1 + (attunement - 1) * 0.05),
     heatRate: 40 * traits.heatRate * (1 - (attunement - 1) * 0.03),
@@ -208,6 +220,9 @@ export function deriveCarPhysics(resolved) {
   };
 }
 
+/** Resolve a build once into static presentation and prediction parameters.
+ * Body proportions use the same physical dimensions as the collision capsule.
+ */
 export function buildRaceCarMeta(entry, index = 0) {
   const resolved = resolveBuild(entry?.build);
   const physics = deriveCarPhysics(resolved);
@@ -217,15 +232,19 @@ export function buildRaceCarMeta(entry, index = 0) {
     name: String(entry?.name || `Болид ${index + 1}`).trim().slice(0, 80),
     driverName: String(entry?.build?.driver?.name || entry?.name || `Гонщик ${index + 1}`).trim().slice(0, 80),
     color: String(entry?.color || CAR_COLORS[index % CAR_COLORS.length]).slice(0, 32),
+    appearance: { frame: resolved.build.frame, number: index + 1, halfLength: physics.collisionHalfLength, halfWidth: physics.collisionHalfWidth },
     maxHealth: physics.maxHealth,
     maxCharge: physics.maxCharge,
     heatWarning: Boolean(resolved.traits.heatWarning),
     prediction: {
+      mass: physics.mass,
+      recuperation: resolved.traits.recuperation || 0,
       maxSpeed: physics.maxSpeed,
       acceleration: physics.acceleration,
       reverseAcceleration: physics.reverseAcceleration,
       braking: physics.braking,
       steerRate: physics.steerRate,
+      wheelbase: physics.wheelbase,
       lateralGrip: physics.lateralGrip,
       longitudinalDrag: physics.longitudinalDrag,
       rollingDrag: physics.rollingDrag,
@@ -278,7 +297,7 @@ export class RaceSimulation {
     const startIndex = (this.track.samples.length - 5 - Math.floor(index / 2) * 7 + this.track.samples.length) % this.track.samples.length;
     const start = sampleTrack(this.track, startIndex);
     const lane = index % 2 === 0 ? -1 : 1;
-    const offset = lane * Math.min(42, this.track.width * 0.19);
+    const offset = lane * Math.min(42, roadWidthAt(start, this.track.width) * 0.19);
     return {
       id: entry.id,
       userId: entry.userId ?? null,
@@ -287,6 +306,8 @@ export class RaceSimulation {
       build: entry.build,
       resolved,
       physics,
+      prediction: buildRaceCarMeta(entry, index).prediction,
+      appearance: { frame: resolved.build.frame, number: index + 1, halfLength: physics.collisionHalfLength, halfWidth: physics.collisionHalfWidth },
       color: entry.color ?? CAR_COLORS[index % CAR_COLORS.length],
       isBot: Boolean(entry.isBot),
       botSkill,
@@ -334,6 +355,7 @@ export class RaceSimulation {
       rng: seededRng(entry.botSeed ?? `${this.track.seed}:${entry.id}:${index}`),
       cornerAccumulator: 0,
       lastSteer: 0,
+      steeringPosition: 0,
       burstTimer: 0,
       startBoostTimer: 0,
       pitState: "track",
@@ -576,98 +598,13 @@ export class RaceSimulation {
     input = sanitizeInput(input);
     const p = car.physics;
     const previousPosition = { x: car.x, y: car.y };
-    const forwardX = Math.cos(car.angle);
-    const forwardY = Math.sin(car.angle);
-    let forwardSpeed = dot(car.vx, car.vy, forwardX, forwardY);
-
-    const terrain = terrainModifiers(car, p, Math.abs(forwardSpeed));
-
-    if (car.overheated && car.heat <= 48) car.overheated = false;
-    const heatStress = clamp((car.heat - 68) / 32, 0, 1);
-    const thermalAcceleration = car.overheated ? 0.58 : 1 - heatStress * 0.28;
-    const thermalSteering = car.overheated ? 0.72 : 1 - heatStress * 0.13;
-    const thermalTopSpeed = car.overheated ? 0.78 : 1 - heatStress * 0.08;
-
-    const ramSteerPenalty = input.ram ? (car.resolved.traits.ramSteerPenalty || 0.55) : 1;
-    const healthPenalty = car.health < p.maxHealth * 0.25 && !car.criticalGrace ? 0.78 : 1;
-    const lastLapBoost = car.resolved.traits.lastLap && car.lap === this.laps - 1 ? 1.04 : 1;
-    const lowHealthBoost = car.resolved.traits.lowHealthBoost && car.health < p.maxHealth * 0.3 ? car.resolved.traits.lowHealthBoost : 1;
-
-    let extraAcceleration = 0;
     const draft = car.pitState === "track" ? this.#draftEffect(car, dt) : { acceleration: 0, pursuit: false };
-    extraAcceleration += draft.acceleration;
-    if (draft.pursuit) extraAcceleration += p.acceleration * 0.07;
-
-    const wantsReverse = input.reverse || input.throttle < 0;
-    const brakingForReverse = wantsReverse && forwardSpeed > 7;
-    if (input.brake || brakingForReverse) {
-      if (car.resolved.traits.recuperation && car.charge < p.maxCharge && Math.abs(forwardSpeed) > 8) {
-        car.charge = Math.min(p.maxCharge, car.charge + Math.abs(forwardSpeed) * 0.018 * car.resolved.traits.recuperation * dt);
-      }
-    }
-
-    car.boostActive = false;
-    const requestedBoost = car.pitState === "track"
-      && input.boost && input.throttle > 0 && !car.overheated && car.charge > 0.001;
-    let boostAccelerationMultiplier = 0;
-    let boostTopSpeedMultiplier = 1;
-    if (requestedBoost) {
-      const requestedCharge = p.boostDrain * dt;
-      const boostFraction = clamp(car.charge / Math.max(0.0001, requestedCharge), 0, 1);
-      if (boostFraction > 0.001) {
-        car.boostActive = true;
-        boostAccelerationMultiplier = 0.95 * p.boostPower * lowHealthBoost * boostFraction;
-        boostTopSpeedMultiplier = 1.17 * p.boostPower;
-        car.charge = Math.max(0, car.charge - requestedCharge * boostFraction);
-        car.heat = Math.min(112, car.heat + p.heatRate * dt * boostFraction);
-      }
-    }
-    if (!car.boostActive) car.heat = Math.max(0, car.heat - p.cooling * dt);
-    if (car.heat >= 100) {
-      car.overheated = true;
-      car.boostActive = false;
-      boostTopSpeedMultiplier = 1;
-    }
-
-    if (car.startBoostTimer > 0) {
-      car.startBoostTimer -= dt;
-      extraAcceleration += p.acceleration * 0.3;
-    }
-    if (car.burstTimer > 0) {
-      car.burstTimer -= dt;
-      extraAcceleration += p.acceleration * 0.35;
-    }
-
-    const pitLimit = car.pitState !== "track" ? this.track.pit.speedLimit : Infinity;
-    const drive = applyDriveModel(car, input, p, dt, {
-      accelerationMultiplier: healthPenalty * thermalAcceleration * terrain.acceleration * lastLapBoost,
-      steeringMultiplier: ramSteerPenalty * thermalSteering * terrain.steering * (car.resolved.traits.precision ? 1.04 : 1),
-      topSpeedMultiplier: thermalTopSpeed * terrain.topSpeed * lastLapBoost,
-      gripMultiplier: terrain.grip,
-      yawResponseMultiplier: terrain.yawResponse,
-      angularDampingMultiplier: terrain.angularDamping,
-      brakeGripMultiplier: car.resolved.traits.lateBrake ? 1.22 : 1,
-      driftEnabled: car.pitState === "track" && terrain.type === "road" && !car.isBot && !car.temporaryAutopilot,
-      driftAssist: Math.max(0.75, Number(car.resolved.traits.drift) || 1),
-      driftControl: Math.max(0.45, Math.sqrt(p.spinResistance * p.recovery)
-        * (1 + (Number(car.resolved.traits.drift) || 1) - 1) * 0.75),
-      extraAcceleration,
-      boostAccelerationMultiplier,
-      boostTopSpeedMultiplier,
-      speedLimit: pitLimit,
-      speedLimitDeceleration: car.pitState !== "track" ? Number(this.track.pit.speedLimitDeceleration ?? 96) : 0,
-      previousSteer: car.lastSteer,
-      smoothSteer: Boolean(car.resolved.traits.smoothSteer)
+    const drive = advanceCarMotion(car, input, p, dt, {
+      traits: car.resolved.traits, laps: this.laps, pit: this.track.pit,
+      extraAcceleration: draft.acceleration + (draft.pursuit ? p.acceleration * 0.07 : 0)
     });
-    forwardSpeed = drive.forwardSpeed;
+    let forwardSpeed = drive.forwardSpeed;
     const steering = drive.steering;
-    if (terrain.type !== "road" || car.pitState !== "track") {
-      car.driftAmount = Math.max(0, Number(car.driftAmount || 0) - dt * 2.8);
-      if (car.driftAmount <= 0.01) {
-        car.driftAmount = 0;
-        car.driftDirection = 0;
-      }
-    }
 
     // Measure the route after movement. The result is reused by bot steering on
     // the next fixed step, so every car performs one geometry query per tick
@@ -686,7 +623,7 @@ export class RaceSimulation {
       car.botRecoveryRequested = false;
       if (this.collisionMode === "recovery" && car.pitState === "track") {
         const point = mainNearest.point;
-        const lane = clamp(car.botLaneBias || 0, -0.12, 0.12) * this.track.width;
+        const lane = clamp(car.botLaneBias || 0, -0.12, 0.12) * roadWidthAt(point, this.track.width);
         car.x = point.x + point.nx * lane;
         car.y = point.y + point.ny * lane;
         car.angle = Math.atan2(point.ty, point.tx);
@@ -757,8 +694,9 @@ export class RaceSimulation {
         && pitNearest.index <= Math.min(this.track.pit.samples.length - 1, this.track.pit.entryTriggerEnd + 3);
       const separated = Number(branchPoint?.separation ?? 0) >= 0.86;
       const insidePitAsphalt = pitNearest.distance <= this.track.pit.width * 0.44;
-      const outsideMainAsphalt = mainNearest.distance >= this.track.width * 0.56;
-      const onPitSide = mainNearest.signedDistance * Number(this.track.pit.side || 1) >= this.track.width * 0.36;
+      const mainWidth = roadWidthAt(mainNearest.point, this.track.width);
+      const outsideMainAsphalt = mainNearest.distance >= mainWidth * 0.56;
+      const onPitSide = mainNearest.signedDistance * Number(this.track.pit.side || 1) >= mainWidth * 0.36;
       const clearlyCloserToPit = pitNearest.distance + Math.max(14, this.track.pit.width * 0.14) < mainNearest.distance;
       const movingAlongPit = dot(car.vx, car.vy, Number(branchPoint?.tx) || 0, Number(branchPoint?.ty) || 0) > 2;
       // Entering the branch is a swept gate crossing, not a proximity test. This
@@ -1105,7 +1043,7 @@ export class RaceSimulation {
       && embeddedSpeed < 56;
     if (needsRecovery && recoveryCandidate?.nearest) {
       const point = recoveryCandidate.nearest.point;
-      const lane = car.pitState === "track" ? clamp(car.botLaneBias || 0, -0.18, 0.18) * this.track.width : 0;
+      const lane = car.pitState === "track" ? clamp(car.botLaneBias || 0, -0.18, 0.18) * roadWidthAt(point, this.track.width) : 0;
       car.x = point.x + point.nx * lane;
       car.y = point.y + point.ny * lane;
       car.angle = Math.atan2(point.ty, point.tx);
@@ -1134,25 +1072,9 @@ export class RaceSimulation {
       const capsule = carCapsule(car);
       for (const obstacle of obstacles) {
         if (!obstacle?.solid) continue;
-        const closest = closestPointOnSegment(obstacle, capsule.start, capsule.end);
-        let nx = closest.x - obstacle.x;
-        let ny = closest.y - obstacle.y;
-        let distance = Math.hypot(nx, ny);
-        const combinedRadius = capsule.halfWidth + Math.max(4, Number(obstacle.collisionRadius) || 12);
-        if (distance >= combinedRadius) continue;
-        if (distance < 0.001) {
-          const speed = Math.hypot(car.vx, car.vy);
-          nx = speed > 0.1 ? -car.vx / speed : Math.cos(car.angle + Math.PI * 0.5);
-          ny = speed > 0.1 ? -car.vy / speed : Math.sin(car.angle + Math.PI * 0.5);
-          distance = 0.001;
-        } else {
-          nx /= distance;
-          ny /= distance;
-        }
-        const penetration = combinedRadius - distance;
-        const obstacleRadius = Math.max(4, Number(obstacle.collisionRadius) || 12);
-        const contactX = obstacle.x + nx * obstacleRadius;
-        const contactY = obstacle.y + ny * obstacleRadius;
+        const contact = sceneryContact(capsule, obstacle, car);
+        if (!contact) continue;
+        const { nx, ny, penetration, contactX, contactY } = contact;
         const pointVelocity = velocityAtPoint(car, contactX, contactY);
         const impact = Math.max(0, -dot(pointVelocity.x, pointVelocity.y, nx, ny));
         if (!best || penetration > best.penetration) {
@@ -1186,11 +1108,11 @@ export class RaceSimulation {
     const makeCandidate = (nearest, roadWidth, fallbackGrass, route) => {
       if (!nearest) return null;
       const side = Number(nearest.signedDistance) >= 0 ? 1 : -1;
-      const halfRoad = roadWidth * 0.5;
       const point = nearest.point ?? {};
+      const halfRoad = roadWidthAt(point, roadWidth) * 0.5;
       const sideGrass = side > 0 ? point.grassWidthLeft : point.grassWidthRight;
       const grassWidth = Math.max(0, Number(sideGrass ?? point.grassWidth ?? fallbackGrass ?? 0));
-      const surfaceType = route === "pit" ? "grass" : runoffSurfaceForSide(point, side);
+      const surfaceType = runoffSurfaceForSide(point, side);
       const wallAlpha = Math.max(0, Math.min(1, Number(side > 0 ? point.wallLeftAlpha ?? 1 : point.wallRightAlpha ?? 1)));
       const lateral = Math.max(0, Number(nearest.distance) || Math.abs(nearest.signedDistance));
       return {
@@ -1243,75 +1165,22 @@ export class RaceSimulation {
     const terrain = terrainModifiers(car, car.physics, currentSpeed);
     const effectiveSeverity = terrain.severity;
     car.surfaceKickCooldown = Math.max(0, Number(car.surfaceKickCooldown || 0) - dt);
-    if (effectiveSeverity > 0.008) {
-      const damping = Math.exp(-terrain.dragRate * dt);
-      car.vx *= damping;
-      car.vy *= damping;
-      const rightX = -Math.sin(car.angle);
-      const rightY = Math.cos(car.angle);
-      const lateralSpeed = dot(car.vx, car.vy, rightX, rightY);
-
-      if (terrain.type === "grass") {
-        // Grass is not the heaviest surface, but at racing speed it offers very
-        // little lateral support. Countersteer can save the car; a large slip
-        // angle or an abrupt steering input keeps adding yaw until it spins.
-        const highSpeed = clamp((terrain.speedRatio - 0.28) / 0.82, 0, 1);
-        const slipRatio = clamp(Math.abs(lateralSpeed) / Math.max(34, currentSpeed * 0.34), 0, 1.4);
-        const steer = clamp(Number(car.currentInput?.steer) || 0, -1, 1);
-        const instabilitySource = Math.abs(lateralSpeed) > 0.5 ? lateralSpeed : steer;
-        if (Math.abs(instabilitySource) > 0.001) {
-          const slipDirection = Math.sign(instabilitySource);
-          car.angularVelocity += slipDirection * effectiveSeverity * highSpeed
-            * (0.16 + slipRatio * 0.62 + Math.abs(steer) * 0.25) * dt;
-        }
-        // Two wheels on asphalt and two on grass should feel nervous again, but
-        // without the old positional snap. Use a small yaw bias only while the
-        // contact is genuinely split and the driver is already loading the car
-        // with speed, steering or lateral slip.
-        const splitContact = clamp(1 - Math.abs(grassContact - 0.5) / 0.5, 0, 1);
-        const splitLoad = Math.max(Math.abs(steer) * 0.82, slipRatio * 0.94);
-        if (splitContact > 0.04 && highSpeed > 0.08 && splitLoad > 0.06) {
-          const vergeYaw = Number(car.surfaceSide || surface.side || 0) >= 0 ? 1 : -1;
-          car.angularVelocity += vergeYaw * splitContact * highSpeed * effectiveSeverity
-            * (0.030 + splitLoad * 0.070) * dt;
-        }
-      } else if (terrain.type === "sand") {
-        // Loose sand piles in front of the wheels. It kills speed and yaw, making
-        // escape possible only with a straight wheel and sustained throttle.
-        car.angularVelocity *= Math.exp(-(1.6 + effectiveSeverity * 3.8) * dt);
-        const lateralDamping = Math.exp(-(1.2 + effectiveSeverity * 4.2) * dt);
-        const forwardX = Math.cos(car.angle);
-        const forwardY = Math.sin(car.angle);
-        const forwardSpeed = dot(car.vx, car.vy, forwardX, forwardY);
-        const reducedLateral = lateralSpeed * lateralDamping;
-        car.vx = forwardX * forwardSpeed + rightX * reducedLateral;
-        car.vy = forwardY * forwardSpeed + rightY * reducedLateral;
-        // Static rolling resistance used to exceed the weakest engine's entire
-        // sand-adjusted output. Preserve the heavy bogging at speed, but give a
-        // straight, throttled car a small low-speed digging force so it can leave.
-        const throttle = clamp(Number(car.currentInput?.throttle) || 0, 0, 1);
-        const crawlWindow = 1 - clamp(currentSpeed / 92, 0, 1);
-        if (throttle > 0.05 && crawlWindow > 0) {
-          const crawlAcceleration = (24 + car.physics.acceleration * 0.22)
-            * throttle * crawlWindow * Math.sqrt(effectiveSeverity);
-          car.vx += forwardX * crawlAcceleration * dt;
-          car.vy += forwardY * crawlAcceleration * dt;
-        }
-      } else if (terrain.type === "gravel") {
-        // A buried stone can kick one front wheel. The event is random but has a
-        // cooldown, so gravel feels treacherous rather than like constant noise.
-        const chancePerSecond = (0.16 + terrain.speedRatio * 0.78) * effectiveSeverity;
-        if (effectiveSeverity > 0.24 && currentSpeed > 72 && car.offroadTimer > 0.35
-          && car.surfaceKickCooldown <= 0 && car.rng() < chancePerSecond * dt) {
-          const direction = car.rng() < 0.5 ? -1 : 1;
-          const impulse = (0.50 + car.rng() * 0.85) * (0.65 + terrain.speedRatio * 0.95)
-            * Math.sqrt(effectiveSeverity) / Math.pow(Math.max(0.45, car.physics.spinResistance), 0.35);
-          car.angularVelocity += direction * impulse;
-          const lateralKick = currentSpeed * (0.010 + car.rng() * 0.022) * effectiveSeverity;
-          car.vx += rightX * direction * lateralKick;
-          car.vy += rightY * direction * lateralKick;
-          car.surfaceKickCooldown = 0.65 + car.rng() * 0.9;
-        }
+    applyTerrainForces(car, car.currentInput, car.physics, dt, terrain);
+    if (effectiveSeverity > 0.008 && terrain.type === "gravel") {
+      const rightX = -Math.sin(car.angle), rightY = Math.cos(car.angle);
+      // A buried stone can kick one front wheel. The event is random but has a
+      // cooldown, so gravel feels treacherous rather than like constant noise.
+      const chancePerSecond = (0.16 + terrain.speedRatio * 0.78) * effectiveSeverity;
+      if (effectiveSeverity > 0.24 && currentSpeed > 72 && car.offroadTimer > 0.35
+        && car.surfaceKickCooldown <= 0 && car.rng() < chancePerSecond * dt) {
+        const direction = car.rng() < 0.5 ? -1 : 1;
+        const impulse = (0.50 + car.rng() * 0.85) * (0.65 + terrain.speedRatio * 0.95)
+          * Math.sqrt(effectiveSeverity) / Math.pow(Math.max(0.45, car.physics.spinResistance), 0.35);
+        car.angularVelocity += direction * impulse;
+        const lateralKick = currentSpeed * (0.010 + car.rng() * 0.022) * effectiveSeverity;
+        car.vx += rightX * direction * lateralKick;
+        car.vy += rightY * direction * lateralKick;
+        car.surfaceKickCooldown = 0.65 + car.rng() * 0.9;
       }
     }
 
@@ -1319,7 +1188,7 @@ export class RaceSimulation {
       && car.offroadTimer > 1.6
       && Math.hypot(car.vx, car.vy) < 48) {
       const point = surface.nearest.point;
-      const lane = car.pitState === "track" ? clamp(car.botLaneBias || 0, -0.14, 0.14) * this.track.width : 0;
+      const lane = car.pitState === "track" ? clamp(car.botLaneBias || 0, -0.14, 0.14) * roadWidthAt(point, this.track.width) : 0;
       car.x = point.x + point.nx * lane;
       car.y = point.y + point.ny * lane;
       car.angle = Math.atan2(point.ty, point.tx);
@@ -1357,8 +1226,9 @@ export class RaceSimulation {
       const along = dot(dx, dy, gate.tx, gate.ty);
       const lateral = dot(dx, dy, gate.nx, gate.ny);
       const tangentSpeed = dot(car.vx, car.vy, gate.tx, gate.ty);
-      const alongTolerance = Math.max(38, this.track.width * 0.22);
-      const lateralTolerance = this.track.width * 0.5 + Number(gate.grassWidth ?? this.track.grassWidth ?? 0) + car.physics.radius;
+      const gateWidth = roadWidthAt(gate, this.track.width);
+      const alongTolerance = Math.max(38, gateWidth * 0.22);
+      const lateralTolerance = gateWidth * 0.5 + Number(gate.grassWidth ?? this.track.grassWidth ?? 0) + car.physics.radius;
       return Math.abs(along) <= alongTolerance
         && Math.abs(lateral) <= lateralTolerance
         && tangentSpeed > -30
@@ -1423,7 +1293,7 @@ export class RaceSimulation {
     const hasCornerEffect = car.resolved.traits.cornerCharge || car.resolved.traits.exitBurst;
     if (hasCornerEffect) {
       const turning = Math.abs(steering) > 0.45 && speed > car.physics.maxSpeed * 0.38;
-      if (turning && Math.abs(nearest.signedDistance) < this.track.width * 0.28) {
+      if (turning && Math.abs(nearest.signedDistance) < roadWidthAt(nearest.point, this.track.width) * 0.28) {
         car.cornerAccumulator += dt;
       } else if (car.cornerAccumulator > 0.55) {
         if (car.resolved.traits.cornerCharge) {
@@ -1631,7 +1501,73 @@ export class RaceSimulation {
     });
   }
 
-  snapshot() {
+  /** Full authority state, separate from the compact presentation snapshot. */
+  exportCheckpoint() {
+    return {
+      format: 1,
+      track: [this.track.seed, this.track.samples.length, this.track.totalLength],
+      options: [this.laps, this.collisionMode, this.botDifficulty, this.requiredPitStops],
+      tick: this.tick, time: this.time, simulationTime: this.simulationTime,
+      countdown: this.countdown, started: this.started, finished: this.finished,
+      finishOrder: [...this.finishOrder],
+      cars: this.cars.map(car => ({ id: car.id, rng: car.rng.getState(), route: checkpointRoute(car.routeContext),
+        state: Object.fromEntries(Object.entries(car).filter(([key]) => !CHECKPOINT_STATIC_FIELDS.has(key))
+          .map(([key, value]) => [key, key === "currentInput" ? { ...value } : value])) }))
+    };
+  }
+
+  /** Validate everything before applying anything. Static build/track data is rebuilt. */
+  restoreCheckpoint(saved, { resetInputs = false } = {}) {
+    const fail = () => { throw new Error("Сохранение гонки повреждено или несовместимо"); };
+    const expected = this.exportCheckpoint();
+    if (!saved || saved.format !== 1 || JSON.stringify(saved.track) !== JSON.stringify(expected.track)
+      || JSON.stringify(saved.options) !== JSON.stringify(expected.options)
+      || !Number.isSafeInteger(saved.tick) || saved.tick < 0 || saved.tick > 1e9
+      || ![saved.time, saved.simulationTime, saved.countdown].every(value => Number.isFinite(value) && value >= 0 && value <= 1e9)
+      || saved.countdown > 3.4 || typeof saved.started !== "boolean" || typeof saved.finished !== "boolean"
+      || !Array.isArray(saved.cars) || saved.cars.length !== this.cars.length
+      || !Array.isArray(saved.finishOrder) || new Set(saved.finishOrder).size !== saved.finishOrder.length
+      || saved.finishOrder.some(id => !this.cars.some(car => car.id === id))) fail();
+    for (let index = 0; index < this.cars.length; index++) {
+      const row = saved.cars[index], template = expected.cars[index];
+      if (row?.id !== template.id || !Number.isInteger(row.rng) || row.rng < 1 || row.rng > 0xffffffff
+        || !validCheckpointRoute(row.route, this.track)
+        || !row.state || Object.keys(row.state).length !== Object.keys(template.state).length
+        || Object.entries(template.state).some(([key, initial]) => !Object.hasOwn(row.state, key)
+          || !validCheckpointValue(key, row.state[key], initial))) fail();
+      if (!["track", "entering", "service", "exit"].includes(row.state.pitState)
+        || !Number.isInteger(row.state.lap) || row.state.lap < 0 || row.state.lap > this.laps
+        || !Number.isInteger(row.state.nextSector) || row.state.nextSector < 0 || row.state.nextSector > this.track.sectors.length
+        || !Number.isInteger(row.state.trackIndex) || row.state.trackIndex < 0 || row.state.trackIndex >= this.track.samples.length
+        || !Number.isInteger(row.state.pitIndex) || row.state.pitIndex < 0 || row.state.pitIndex >= this.track.pit.samples.length
+        || row.state.pitStopsRequired !== this.requiredPitStops || !Number.isInteger(row.state.pitStopsCompleted)
+        || row.state.pitStopsCompleted < 0 || row.state.pitStopsCompleted > this.requiredPitStops
+        || (row.state.pitState === "service" && (!row.state.pitWord || !row.state.pitAttemptId))
+        || !SURFACE_TYPES.includes(row.state.surfaceType)
+        || row.state.heat < 0 || row.state.heat > 112
+        || row.state.health < 0 || row.state.health > this.cars[index].physics.maxHealth
+        || row.state.charge < 0 || row.state.charge > this.cars[index].physics.maxCharge) fail();
+    }
+    for (const key of ["tick", "time", "simulationTime", "countdown", "started", "finished"]) this[key] = saved[key];
+    this.finishOrder = [...saved.finishOrder];
+    this.cars.forEach((car, index) => {
+      Object.assign(car, saved.cars[index].state, { currentInput: { ...saved.cars[index].state.currentInput } });
+      car.rng.setState(saved.cars[index].rng);
+      car.routeContext = checkpointRoute(saved.cars[index].route);
+      if (resetInputs && !car.isBot && !car.abandoned) {
+        car.currentInput = neutralInput();
+        car.lastInputSequence = -1;
+        car.inputAge = 0;
+      }
+    });
+    return this;
+  }
+
+  carMetadata() {
+    return this.cars.map(car => copyCarMetadata({ id: car.id }, car));
+  }
+
+  snapshot({ includeMetadata = true } = {}) {
     return {
       tick: this.tick,
       simulationTime: this.simulationTime,
@@ -1642,17 +1578,25 @@ export class RaceSimulation {
       laps: this.laps,
       requiredPitStops: this.requiredPitStops,
       finishOrder: [...this.finishOrder],
-      cars: this.cars.map((car) => ({
+      cars: this.cars.map((car) => {
+        const row = {
         id: car.id,
         x: car.x,
         y: car.y,
         vx: car.vx,
         vy: car.vy,
         angle: car.angle,
+        angularVelocity: car.angularVelocity,
+        steeringPosition: car.steeringPosition,
+        lastSteer: car.lastSteer,
+        driftDirection: car.driftDirection,
+        surfaceType: car.surfaceType,
+        surfaceSide: car.surfaceSide,
+        criticalGrace: car.criticalGrace,
+        startBoostTimer: car.startBoostTimer,
+        burstTimer: car.burstTimer,
         health: car.health,
-        maxHealth: car.physics.maxHealth,
         charge: car.charge,
-        maxCharge: car.physics.maxCharge,
         heat: car.heat,
         overheated: car.overheated,
         lap: car.lap,
@@ -1667,19 +1611,14 @@ export class RaceSimulation {
         finishTime: car.finishTime,
         finishBlocked: car.finishBlocked,
         disabled: car.disabled,
-        color: car.color,
-        name: car.name,
-        driverName: car.driverName,
         isBot: car.isBot,
         temporaryAutopilot: car.temporaryAutopilot,
         abandoned: car.abandoned,
-        heatWarning: Boolean(car.resolved.traits.heatWarning),
         ram: Boolean(car.currentInput?.ram),
         boost: Boolean(car.boostActive),
         pitState: car.pitState,
         pitProgress: car.pitProgress,
         pitInServiceZone: car.pitState !== "track" && this.#isInsidePitServiceZone(car),
-        pitStopsRequired: car.pitStopsRequired,
         pitStopsCompleted: car.pitStopsCompleted,
         pitWord: car.pitState === "service" ? car.pitWord : null,
         pitAttemptId: car.pitState === "service" ? car.pitAttemptId : null,
@@ -1688,7 +1627,9 @@ export class RaceSimulation {
         driftAmount: car.driftAmount,
         slipAngle: car.slipAngle,
         wallContactTimer: car.wallContactTimer
-      }))
+        };
+        return includeMetadata ? copyCarMetadata(row, car) : row;
+      })
     };
   }
 }

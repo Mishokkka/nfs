@@ -480,7 +480,9 @@ function forwardSpeed(car) {
     maximumGrass = Math.max(maximumGrass, car.surfaceSeverity);
   }
   assert.equal(car.health, health);
-  assert.ok(Math.hypot(car.vx, car.vy) < 200, `grass speed was ${Math.hypot(car.vx, car.vy)}`);
+  // Coasting over grass loses speed without an unbraked >1 g stop in 0.5 s.
+  const grassSpeed = Math.hypot(car.vx, car.vy);
+  assert.ok(grassSpeed > 255 && grassSpeed < 290, `grass coast speed was ${grassSpeed}`);
   assert.ok(maximumGrass > 0.30);
 }
 
@@ -615,13 +617,17 @@ function forwardSpeed(car) {
     trackIndex: 150
   });
   const initialB = Math.hypot(b.vx, b.vy);
+  let peakSpinA = 0, peakSpinB = 0;
   for (let tick = 0; tick < 8; tick += 1) {
     simulation.setInput(a.id, neutralInput());
     simulation.setInput(b.id, neutralInput());
     simulation.step(1 / 60);
+    peakSpinA = Math.max(peakSpinA,Math.abs(a.angularVelocity));
+    peakSpinB = Math.max(peakSpinB,Math.abs(b.angularVelocity));
   }
   assert.ok(Math.hypot(b.vx, b.vy) > initialB + 45, "rear car did not transfer momentum");
-  assert.ok(Math.abs(a.angularVelocity) > 0.25 && Math.abs(b.angularVelocity) > 0.25, "glancing collision caused no spin");
+  assert.ok(peakSpinA > .5 && peakSpinB > .5 && Math.abs(a.angle-heading) > .04 && Math.abs(b.angle-heading) > .04,
+    "glancing collision caused no rotation before tyre recovery");
   assert.ok(a.health < a.physics.maxHealth && b.health < b.physics.maxHealth, "collision caused no damage");
   assert.ok(Math.hypot(a.x - b.x, a.y - b.y) > a.physics.collisionHalfWidth + b.physics.collisionHalfWidth,
     "cars remained interpenetrating");
@@ -1322,7 +1328,9 @@ for (const scenario of [
     vy: 0,
     trackIndex: sampleIndex
   });
-  for (let tick = 0; tick < 210; tick += 1) {
+  // The moderated launch needs an extra second after emerging from deep sand;
+  // keep the same escape/usable-speed contract rather than boosting off-road power.
+  for (let tick = 0; tick < 270; tick += 1) {
     simulation.setInput(car.id, { ...neutralInput(), throttle: 1 });
     simulation.step(1 / 60);
   }
@@ -1380,14 +1388,19 @@ for (const scenario of [
   assert.ok(drift.yaw > 0.55, `Ctrl drift produced too little yaw: ${drift.yaw}`);
   assert.ok(drift.speed > 150, `Ctrl drift deleted too much speed: ${drift.speed}`);
 
+  let unwoundYaw = drift.yaw;
   for (let tick = 0; tick < 20; tick += 1) {
     applyDriveModel(state, {
       ...neutralInput(), throttle: 0.15, steer: -0.65, drift: false
     }, physics, 1 / 60, { ...modifiers, previousSteer: state.lastSteer });
     state.lastSteer = -0.65;
+    unwoundYaw = Math.min(unwoundYaw, Math.abs(state.angularVelocity));
   }
-  assert.ok(Math.abs(state.angularVelocity) < drift.yaw * 0.62,
-    `countersteer failed to reduce yaw: ${state.angularVelocity}/${drift.yaw}`);
+  assert.ok(unwoundYaw < drift.yaw * 0.2, `countersteer failed to unwind yaw: ${unwoundYaw}/${drift.yaw}`);
+  // Once grip returns, a held opposite rack can legitimately turn the other
+  // way. It must not retain the old slide or overshoot its original rotation.
+  assert.ok(state.angularVelocity < 0 && Math.abs(state.angularVelocity) < drift.yaw,
+    `countersteer retained or amplified the old rotation: ${state.angularVelocity}/${drift.yaw}`);
   assert.ok(Math.abs(state.slipAngle) < drift.slip * 0.58,
     `countersteer failed to reduce slip: ${state.slipAngle}/${drift.slip}`);
   assert.ok(state.driftAmount < drift.amount * 0.45, "releasing Ctrl did not exit the drift state");

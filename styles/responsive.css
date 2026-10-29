@@ -274,3 +274,27 @@
     width: 160px;
   }
 }
+
+/* The resizable Foundry window, rather than the browser viewport, owns layout. */
+@container race (max-width: 1050px) {
+  .nfs-camera-switch {
+    top: auto;
+    right: 14px;
+    bottom: 172px;
+    left: auto;
+    transform: none;
+  }
+  .nfs-camera-switch__button span { display: none; }
+  .nfs-controls-help {
+    left: 14px;
+    right: 250px;
+    bottom: 60px;
+    transform: none;
+    flex-wrap: wrap;
+    gap: 9px;
+  }
+  .nfs-controls-help span { flex: 0 0 auto; }
+  .nfs-controls-help span:last-child { flex: 0 1 auto; }
+  .nfs-input-status { top: 126px; }
+  .nfs-network-status { top: 168px; }
+}

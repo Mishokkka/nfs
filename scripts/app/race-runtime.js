@@ -26,8 +26,11 @@ export class RaceRuntime {
     this.simulation = null;
     this.simulationWorker = null;
     this.workerReady = false;
+    this.workerMetadata = new Map();
     this.workerInitEntries = null;
     this.workerStartupTimer = null;
+    this.initialCheckpoint = null;
+    this.checkpointTimer = null;
     this.renderer = null;
     this.previousSimulationSnapshot = null;
     this.currentSimulationSnapshot = null;
@@ -42,6 +45,8 @@ export class RaceRuntime {
     this.hiddenAccumulator = 0;
     this.resultsSent = false;
     this.lastInputSequence = new Map();
+    this.networkStatus = null;
+    this.lastConnectionCheckAt = -Infinity;
     try {
       this.cameraMode = game.settings.get(MODULE_ID, "cameraMode") || "overview";
       this.minimapEnabled = game.settings.get(MODULE_ID, "minimapEnabled") !== false;
@@ -82,7 +87,7 @@ export class RaceRuntime {
     };
   }
 
-  start({ config, entries, host, practice = false, raceId = null, initialSnapshot = null, assignedCarId = null }) {
+  start({ config, entries, host, practice = false, raceId = null, initialSnapshot = null, assignedCarId = null, checkpoint = null, allowLocalControl = true }) {
     this.stop();
     this.practice = Boolean(practice);
     this.isHost = Boolean(host);
@@ -92,6 +97,7 @@ export class RaceRuntime {
       build: normalizeBuild(entry.build, { repairPoints: true })
     }));
     this.currentRaceId = raceId;
+    this.initialCheckpoint = checkpoint;
     this.track = generateTrack(this.config.seed, this.config.trackComplexity, this.config.environmentTheme);
     const expectedCarId = assignedCarId == null ? null : String(assignedCarId);
     const ownedEntries = safeEntries.filter((entry) => String(entry.userId ?? "") === String(game.user.id));
@@ -102,17 +108,22 @@ export class RaceRuntime {
     this.localCarId = expectedCarId && assignedCarAvailable && ownedEntries.some((entry) => String(entry.id) === expectedCarId)
       ? expectedCarId
       : (!expectedCarId && ownedEntries.length === 1 ? String(ownedEntries[0].id) : null);
+    if (!allowLocalControl) this.localCarId = null;
     this.controlConfirmed = Boolean(this.practice || host);
+    if (!this.controlConfirmed && this.localCarId) this.network.beginControlSession?.(this.localCarId);
     this.pendingInitialSnapshot = initialSnapshot;
     this.resultsSent = false;
     this.lastInputSequence.clear();
 
     if (host && typeof Worker !== "undefined") this.#startWorker(safeEntries);
     else if (host) this.#startMainThreadSimulation(safeEntries);
+    if (host && !practice) this.checkpointTimer = window.setInterval(() => {
+      this.#saveMainCheckpoint();
+    }, 500);
   }
 
   restoreSnapshot(snapshot) {
-    if (!snapshot) return;
+    if (!snapshot || this.isHost) return;
     this.pendingInitialSnapshot = snapshot;
     this.currentSimulationSnapshot = snapshot;
     this.renderer?.pushSnapshot(snapshot);
@@ -127,14 +138,15 @@ export class RaceRuntime {
       this.pitUi.mount(root);
       this.hud.mount(root);
       this.audio.mount(root);
+      this.networkStatus = root.querySelector("[data-network-status]");
       this.renderer = new RaceRenderer(canvas, this.track, {
         localCarId: this.localCarId,
         onHud: (car, snapshot) => this.hud.update(car, snapshot),
         cameraMode: this.cameraMode,
         minimapEnabled: this.minimapEnabled,
-        enableLocalPrediction: !this.practice && !this.isHost,
-        networkRenderDelay: this.isHost ? 0.032 : 0.08,
-        maxExtrapolation: this.isHost ? 0.10 : 0.30,
+        enableLocalPrediction: !this.simulation,
+        networkRenderDelay: this.isHost ? 0.032 : 0.06,
+        maxExtrapolation: this.isHost ? 0.10 : 0.25,
         performanceOverlay: this.performanceOverlay,
         smoothAuthoritativePresentation: Boolean(this.simulationWorker)
       });
@@ -148,6 +160,7 @@ export class RaceRuntime {
         this.renderer.pushSnapshot(this.pendingInitialSnapshot);
       }
 
+      this.renderer.setNetworkTiming(this.network.timing);
       this.input.mount(canvas, root);
       if (this.localCarId) {
         this.input.focus();
@@ -155,8 +168,7 @@ export class RaceRuntime {
           if (this.simulationWorker) this.simulationWorker.postMessage({ type: "claim-control", carId: this.localCarId });
           else this.simulation?.claimControl(this.localCarId);
           this.controlConfirmed = true;
-        } else {
-          this.controlConfirmed = false;
+        } else if (!this.controlConfirmed) {
           this.network.requestControlAssignment();
         }
       } else if (!this.practice) {
@@ -185,15 +197,18 @@ export class RaceRuntime {
     this.lastInputSequence.delete(message.carId);
     if (this.simulationWorker) this.simulationWorker.postMessage({ type: "claim-control", carId: message.carId });
     else this.simulation?.claimControl(message.carId);
+    this.#saveMainCheckpoint();
   }
 
   handleControlAssignment(message) {
     if (!message || String(message.raceId ?? "") !== String(this.currentRaceId ?? "")) return;
     const carId = String(message.carId ?? "");
     if (!carId || carId !== String(this.localCarId ?? "")) return;
+    if (this.controlConfirmed) return;
     this.controlConfirmed = true;
     this.renderer?.setLocalCarId(carId);
-    this.network.claimControl(carId);
+    // The host applied the session claim before sending this confirmation.
+    // A second claim here could reset a live sequence window after new input.
     this.input.dispatch(undefined, { force: true });
   }
 
@@ -206,6 +221,7 @@ export class RaceRuntime {
       handed = Boolean(this.simulation?.handToBot(message.carId, 1));
     }
     if (handed) ui.notifications.info(`${game.users?.get(message.userId)?.name ?? "Игрок"} покинул заезд. Управление болидом передано автоматону.`);
+    this.#saveMainCheckpoint();
   }
 
   handlePitComplete(message) {
@@ -213,6 +229,7 @@ export class RaceRuntime {
       type: "pit-complete", carId: message.carId, word: message.word, attemptId: message.attemptId
     });
     else this.simulation?.completePitStop(message.carId, message.word, message.attemptId);
+    this.#saveMainCheckpoint();
   }
 
   handleSnapshot(snapshot) {
@@ -324,6 +341,9 @@ export class RaceRuntime {
   }
 
   stop({ preserveIdentity = false } = {}) {
+    if (this.checkpointTimer) window.clearInterval(this.checkpointTimer);
+    this.checkpointTimer = null;
+    this.initialCheckpoint = null;
     this.#unmountView();
     this.input.reset();
     if (this.hiddenTimer) window.clearInterval(this.hiddenTimer);
@@ -340,6 +360,7 @@ export class RaceRuntime {
     this.simulationWorker = null;
     this.workerReady = false;
     if (this.workerStartupTimer) window.clearTimeout(this.workerStartupTimer);
+    this.workerMetadata.clear();
     this.workerStartupTimer = null;
     this.workerInitEntries = null;
     this.previousSimulationSnapshot = null;
@@ -371,6 +392,19 @@ export class RaceRuntime {
     this.hud.destroy();
     this.pitUi.destroy();
     this.audio.stop();
+    this.networkStatus = null;
+    this.lastConnectionCheckAt = -Infinity;
+  }
+
+  #updateConnectionStatus(now) {
+    if (!this.networkStatus || now - this.lastConnectionCheckAt < 250) return;
+    this.lastConnectionCheckAt = now;
+    const age = this.simulation ? 0 : now - (this.renderer?.snapshotAt ?? now);
+    const text = age < 350 ? "" : this.isHost
+      ? "Симуляция задерживается…"
+      : age < 1500 ? "Ожидаем данные ведущего…" : "Ведущий не отвечает. Проверьте связь или вернитесь в лобби.";
+    if (this.networkStatus.textContent !== text) this.networkStatus.textContent = text;
+    this.networkStatus.hidden = !text;
   }
 
   #startMainThreadSimulation(entries) {
@@ -382,9 +416,18 @@ export class RaceRuntime {
       botDifficulty: this.config.botDifficulty,
       requiredPitStops: this.config.requiredPitStops
     });
+    if (this.initialCheckpoint) this.simulation.restoreCheckpoint(this.initialCheckpoint, { resetInputs: true });
+    this.initialCheckpoint = null;
     this.currentSimulationSnapshot = this.simulation.snapshot();
     this.previousSimulationSnapshot = this.currentSimulationSnapshot;
     this.pendingInitialSnapshot = this.currentSimulationSnapshot;
+    this.#saveMainCheckpoint();
+  }
+
+  #saveMainCheckpoint() {
+    if (!this.practice && this.simulation && !this.simulation.finished) {
+      this.network.saveRecoveryCheckpoint(JSON.stringify(this.simulation.exportCheckpoint()));
+    }
   }
 
   #startWorker(entries) {
@@ -398,7 +441,8 @@ export class RaceRuntime {
       this.simulationWorker.addEventListener("message", this.#onWorkerMessage);
       this.simulationWorker.addEventListener("error", this.#onWorkerError);
       this.simulationWorker.postMessage({
-        type: "init", raceId: this.currentRaceId, track: this.track, entries, config: this.config
+        type: "init", raceId: this.currentRaceId, track: this.track, entries, config: this.config,
+        checkpoint: this.initialCheckpoint, checkpoints: !this.practice, snapshotFlowControl: true, compactSnapshots: true
       });
       this.workerStartupTimer = window.setTimeout(() => {
         if (!this.workerReady && this.simulationWorker) this.#fallbackWorker(new Error("Фоновая симуляция не ответила при запуске"));
@@ -420,6 +464,7 @@ export class RaceRuntime {
     this.simulationWorker = null;
     this.workerReady = false;
     this.#startMainThreadSimulation(this.workerInitEntries ?? []);
+    this.workerMetadata.clear();
     this.renderer?.setSmoothAuthoritativePresentation(false);
     this.renderer?.setSimulationFrame(this.currentSimulationSnapshot, this.currentSimulationSnapshot, 0);
     ui.notifications.warn("Большие Гонки: Web Worker недоступен, симуляция продолжена в основном потоке.");
@@ -428,6 +473,14 @@ export class RaceRuntime {
   #onWorkerMessage = (event) => {
     const message = event.data ?? {};
     if (String(message.raceId ?? "") !== String(this.currentRaceId ?? "")) return;
+    if (message.type === "metadata") {
+      this.workerMetadata = new Map((message.cars ?? []).map(car => [car.id, car]));
+      return;
+    }
+    if (message.type === "checkpoint") {
+      if (!this.practice && this.network.isHost) this.network.saveRecoveryCheckpoint(message.checkpoint);
+      return;
+    }
     if (message.type === "ready") {
       this.workerReady = true;
       if (this.workerStartupTimer) window.clearTimeout(this.workerStartupTimer);
@@ -435,6 +488,7 @@ export class RaceRuntime {
       // Entries are already owned by the worker. Keeping the normalized builds
       // here doubled the retained race setup until teardown.
       this.workerInitEntries = null;
+      this.initialCheckpoint = null;
       return;
     }
     if (message.type === "error") {
@@ -443,26 +497,38 @@ export class RaceRuntime {
       else this.showError(error, this.renderer?.canvas?.closest?.(".fbl-need-for-speed"));
       return;
     }
-    if ((message.type !== "snapshot" && message.type !== "finished") || !message.snapshot) return;
-    const priorSnapshot = this.currentSimulationSnapshot;
-    this.previousSimulationSnapshot = priorSnapshot ?? message.snapshot;
-    this.currentSimulationSnapshot = message.snapshot;
-    this.pendingInitialSnapshot = message.snapshot;
-    this.audio.update(message.snapshot);
-    const now = performance.now();
-    this.lastWorkerSnapshotAt = now;
-    // Worker snapshots are timestamped at production and enter the same bounded
-    // presentation buffer as network frames. This decouples visible motion from
-    // message-delivery jitter and prevents alpha from resetting on every packet.
-    this.renderer?.pushSnapshot(message.snapshot, { source: "worker", generatedAt: message.generatedAt });
-    if (!this.practice && this.network.isHost) {
-      // The worker already publishes on the fixed simulation cadence. Forward
-      // each authoritative snapshot directly instead of applying a second wall-
-      // clock gate that can accidentally turn 30 Hz into an uneven 15-30 Hz stream.
-      this.lastSnapshotSent = now;
-      this.network.sendSnapshot(message.snapshot);
+    if (!["snapshot", "state", "finished"].includes(message.type) || !message.snapshot) return;
+    const sourceWorker = this.simulationWorker;
+    try {
+      if (message.compact) message.snapshot = { ...message.snapshot, cars: message.snapshot.cars.map(car => {
+        const metadata = this.workerMetadata.get(car.id);
+        if (!metadata) throw new Error("Worker snapshot arrived without car metadata");
+        return { ...metadata, ...car };
+      }) };
+      const priorSnapshot = this.currentSimulationSnapshot;
+      this.previousSimulationSnapshot = priorSnapshot ?? message.snapshot;
+      this.currentSimulationSnapshot = message.snapshot;
+      this.pendingInitialSnapshot = message.snapshot;
+      this.audio.update(message.snapshot);
+      const now = performance.now();
+      this.lastWorkerSnapshotAt = now;
+      // Worker snapshots are timestamped at production and enter the same bounded
+      // presentation buffer as network frames. This decouples visible motion from
+      // message-delivery jitter and prevents alpha from resetting on every packet.
+      this.renderer?.pushSnapshot(message.snapshot, { source: "worker", generatedAt: message.generatedAt });
+      if (!this.practice && this.network.isHost) {
+        // The worker already publishes on the fixed simulation cadence. Forward
+        // each consumed snapshot directly instead of applying a second wall-
+        // clock gate that can accidentally turn 30 Hz into an uneven 15-30 Hz stream.
+        this.lastSnapshotSent = now;
+        this.network.sendSnapshot(message.snapshot, { generatedAt: message.generatedAt });
+      }
+      if (message.type === "finished" && !this.resultsSent) this.#finish(message.snapshot);
+    } finally {
+      if (message.type === "snapshot" && Number.isFinite(message.snapshotId) && sourceWorker === this.simulationWorker) {
+        sourceWorker?.postMessage({ type: "snapshot-consumed", raceId: message.raceId, snapshotId: message.snapshotId });
+      }
     }
-    if (message.type === "finished" && !this.resultsSent) this.#finish(message.snapshot);
   };
 
   #onWorkerError = (event) => {
@@ -488,7 +554,10 @@ export class RaceRuntime {
     if (this.simulationWorker) this.simulationWorker.postMessage({
       type: "pit-complete", carId: this.localCarId, word, attemptId
     });
-    else if (this.simulation) this.simulation.completePitStop(this.localCarId, word, attemptId);
+    else if (this.simulation) {
+      this.simulation.completePitStop(this.localCarId, word, attemptId);
+      this.#saveMainCheckpoint();
+    }
     else this.network.completePitStop(this.localCarId, word, attemptId);
   }
 
@@ -572,8 +641,9 @@ export class RaceRuntime {
         this.accumulator += elapsed;
         const fixedDt = 1 / PHYSICS_HZ;
         let steps = 0;
-        const previous = this.currentSimulationSnapshot ?? this.simulation.snapshot();
+        let previous = this.currentSimulationSnapshot ?? this.simulation.snapshot();
         while (this.accumulator >= fixedDt && steps < 6) {
+          if (steps > 0) previous = this.simulation.snapshot();
           this.simulation.step(fixedDt);
           this.accumulator -= fixedDt;
           steps += 1;
@@ -596,6 +666,7 @@ export class RaceRuntime {
         }
       }
       this.renderer?.render(time);
+      this.#updateConnectionStatus(time);
       this.raceFrame = requestAnimationFrame(this.#raceLoop);
     } catch (error) {
       this.showError(error, this.renderer?.canvas?.closest?.(".fbl-need-for-speed"));

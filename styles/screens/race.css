@@ -1,6 +1,8 @@
 /* Гоночный Canvas, HUD, камера, уведомления и пит-стоп. */
 
 .nfs-race-stage {
+  container-type: inline-size;
+  container-name: race;
   position: relative;
   min-height: 0;
   overflow: hidden;
@@ -9,6 +11,7 @@
   background: #090d0f;
 }
 
+
 .nfs-race-stage canvas {
   display: block;
   width: 100%;
@@ -16,6 +19,24 @@
   contain: strict;
   outline: none;
 }
+
+.nfs-network-status {
+  position: absolute;
+  top: 96px;
+  left: 50%;
+  z-index: 8;
+  transform: translateX(-50%);
+  max-width: calc(100% - 32px);
+  padding: 8px 14px;
+  border: 1px solid #c79047;
+  border-radius: 8px;
+  color: #ffe6b5;
+  background: #191711ed;
+  text-align: center;
+  pointer-events: none;
+}
+
+.nfs-network-status[hidden] { display: none; }
 
 .nfs-race-error {
   position: absolute;

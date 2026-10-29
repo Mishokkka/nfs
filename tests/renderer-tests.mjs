@@ -7,8 +7,9 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 globalThis.foundry = { utils: { deepClone: structuredClone } };
 globalThis.Path2D = class {
-  moveTo() {}
-  lineTo() {}
+  constructor() { this.commands=[]; }
+  moveTo(x,y) { this.commands.push(["move",x,y]); }
+  lineTo(x,y) { this.commands.push(["line",x,y]); }
   quadraticCurveTo() {}
   arc() {}
   closePath() {}
@@ -67,7 +68,91 @@ globalThis.document = { createElement: () => {
 
 const { generateTrack } = await import(pathToFileURL(path.join(root, "scripts/track.js")).href);
 const { RaceRenderer } = await import(pathToFileURL(path.join(root, "scripts/renderer.js")).href);
+const { VehicleSprites } = await import(pathToFileURL(path.join(root, "scripts/rendering/vehicle-sprites.js")).href);
+const { TrackArt } = await import(pathToFileURL(path.join(root, "scripts/rendering/track-art.js")).href);
 const track = generateTrack("renderer-countdown", 2);
+
+// Dense urban scenery is still baked into bounded static layers. Pavers add
+// one small texture; closing a city view must release it with the old assets.
+{
+  const city = generateTrack("city-render-budget",3,"city");
+  const urbanRenderer = new RaceRenderer(makeCanvas(),city);
+  const painted=[],context=makeContext();context.fill=path=>painted.push(path);
+  urbanRenderer.art.paintRoad(context,urbanRenderer.trackPath,city.width);
+  assert.deepEqual(painted,urbanRenderer.art.roadBands,"city asphalt fell back to a constant-width stroke");
+  const asphalt=urbanRenderer.art.roadBands[2].commands;
+  for(const index of [0,Math.floor(city.samples.length/3),Math.floor(city.samples.length*2/3)]) {
+    const p=city.samples[index],vertex=asphalt[index];
+    assert.ok(Math.abs(((vertex[1]-p.x)*p.nx+(vertex[2]-p.y)*p.ny)*2-p.roadWidth)<1e-7,"drawn asphalt width differs from physics");
+  }
+  assert.equal(urbanRenderer.art.canvases.length,3);
+  assert.ok(urbanRenderer.art.cityClosures.length>0 && urbanRenderer.art.cityClosures.length<=64);
+  const textures=[...urbanRenderer.art.canvases];
+  urbanRenderer.destroy();
+  for(const canvas of textures)assert.equal(canvas.width*canvas.height,1);
+  assert.equal(urbanRenderer.art.cityClosures.length,0);
+}
+
+// Surface transitions must occur at the same midpoint in static paint and
+// nearest-point terrain queries, rather than one sample apart.
+{
+  const t=generateTrack('surface-seam-paint',2),p=t.samples[0],q=t.samples[1];
+  p.surfaceLeft='grass';q.surfaceLeft='sand';
+  const r=new RaceRenderer(makeCanvas(),t);
+  const expected={x:(p.x+p.nx*t.width/2+q.x+q.nx*t.width/2)/2,y:(p.y+p.ny*t.width/2+q.y+q.ny*t.width/2)/2};
+  for(const material of ['grass','sand'])assert.ok(r.runoffSurfacePaths[material].commands.some(([,x,y])=>Math.hypot(x-expected.x,y-expected.y)<1e-7),'paint omitted the shared material seam');
+  const {nearestTrackPoint}=await import(pathToFileURL(path.join(root,'scripts/track.js')).href);
+  for(const [fraction,material] of [[.25,'grass'],[.75,'sand']])assert.equal(nearestTrackPoint(t,p.x+(q.x-p.x)*fraction,p.y+(q.y-p.y)*fraction,0).point.surfaceLeft,material);
+  r.destroy();
+}
+
+// Continuous telemetry must not allocate paint. Only three discrete damage
+// variants can exist for each of the twelve cars, with a hard LRU memory bound.
+{
+  const sprites = new VehicleSprites();
+  const frames = ["arrow", "spider", "keel", "bull", "turtle", "allantry"];
+  const bodies = [];
+  for (let i = 0; i < 12; i++) {
+    const car = { color: "#6ab", health: 100, maxHealth: 100,
+      appearance: { frame: frames[i % 6], number: i + 1, halfLength: 26, halfWidth: 14 } };
+    for (const damage of [{}, { health: 24 }, { disabled: true }]) {
+      const first = sprites.get({ ...car, ...damage });
+      bodies.push(first);
+      const before = createdCanvasCount;
+      for (let tick = 0; tick < 30; tick++) {
+        assert.equal(sprites.get({ ...car, ...damage, x: tick * 10, angle: tick * .03,
+          place: 1 + tick % 12, heat: tick * 3, boost: Boolean(tick % 2), ram: true }), first);
+        sprites.drawSteeringWheels(makeContext(), { ...car, steeringPosition: Math.sin(tick) });
+      }
+      assert.equal(createdCanvasCount, before, "continuous state rebuilt a chassis canvas");
+    }
+  }
+  assert.equal(sprites.bodies.size, 36);
+  assert.equal(sprites.generated, 36);
+  assert.ok(bodies.reduce((pixels, canvas) => pixels + canvas.width * canvas.height, 0) * 4 < 3_250_000,
+    "body sprites exceeded their 3.25 MB RGBA budget");
+  sprites.get({ color: "invalid-color", health: 100, maxHealth: 100 });
+  assert.equal(sprites.bodies.size, 36, "cache grew beyond twelve cars with three damage states");
+  assert.equal(bodies[0].width, 1, "evicted backing store was not released");
+  const shared = [sprites.halo, sprites.flame, sprites.hotCore, sprites.frontWheel];
+  sprites.destroy(); sprites.destroy();
+  assert.equal(sprites.bodies.size, 0);
+  for (const canvas of [...bodies, ...shared]) assert.equal(canvas.width * canvas.height, 1);
+
+  const art = new TrackArt(track);
+  const sources = art.canvases.slice();
+  assert.equal(sources.length, 2);
+  const before = createdCanvasCount;
+  for (let i = 0; i < 20; i++) {
+    art.paintRoad(makeContext(), new Path2D(), track.width);
+    art.paintMarkings(makeContext());
+  }
+  assert.equal(createdCanvasCount, before, "static painting allocated another texture");
+  art.destroy(); art.destroy();
+  for (const canvas of sources) assert.equal(canvas.width * canvas.height, 1);
+  assert.equal(art.asphalt, null);
+  assert.equal(art.grid, null);
+}
 
 
 // Network reconciliation must remain continuous. Reintroducing a fixed fraction
@@ -78,13 +163,7 @@ const track = generateTrack("renderer-countdown", 2);
   const physicsSource = fs.readFileSync(path.join(root, "scripts/physics.js"), "utf8");
   const hudSource = fs.readFileSync(path.join(root, "scripts/app/race-hud.js"), "utf8");
   const raceCss = fs.readFileSync(path.join(root, "styles/screens/race.css"), "utf8");
-  assert.match(rendererSource, /correctionX:\s*clamp\(errorX/, "prediction correction must be bounded");
-  assert.match(rendererSource, /smoothingFactor\(step, Number\(state\.correctionTime\)/, "prediction correction must use time-based smoothing");
   assert.doesNotMatch(rendererSource, /state\.x\s*\+=\s*\(authoritative\.x\s*-\s*state\.x\)\s*\*/, "fixed-fraction reconciliation returned");
-  assert.match(rendererSource, /import \{ applyDriveModel \} from "\.\/physics\/drive-model\.js"/, "renderer must share the production drive model");
-  assert.match(physicsSource, /import \{ applyDriveModel \} from "\.\/physics\/drive-model\.js"/, "authoritative physics must use the shared drive model");
-  assert.match(rendererSource, /applyDriveModel\(state, input/, "renderer prediction no longer invokes the drive model");
-  assert.match(physicsSource, /applyDriveModel\(car, input/, "authoritative simulation no longer invokes the drive model");
   assert.doesNotMatch(rendererSource, /forwardSpeed \*= Math\.exp\(-0\.045/, "obsolete duplicate drag model returned");
   assert.doesNotMatch(rendererSource, /1000 \/ 45/, "hard-coded 45 Hz renderer timing returned");
   assert.match(rendererSource, /this\.#drawHighResolutionTrackTiles\(ctx, worldScale\)/, "high-resolution track tile rendering is missing");
@@ -101,14 +180,13 @@ const track = generateTrack("renderer-countdown", 2);
   assert.doesNotMatch(rendererSource, /elapsed < this\.renderInterval - 1/, "legacy interval-skipping gate returned");
   assert.match(rendererSource, /trackTileReuses/, "track tile reuse telemetry is missing");
   assert.match(rendererSource, /TRACK_TILE_OVERLAP_PX/, "track tile overlap guard is missing");
-  const staticTrackPaint = rendererSource.slice(rendererSource.indexOf("#paintStaticTrack(ctx)"), rendererSource.indexOf("\n  #drawScenery(ctx) {"));
-  assert.ok(staticTrackPaint.indexOf("#drawBoundaryWallGeometry") < staticTrackPaint.indexOf("this.#drawScenery(ctx)"),
+  const staticTrackPaint = rendererSource.slice(rendererSource.indexOf("  #paintStaticTrack("), rendererSource.indexOf("\n  #drawScenery("));
+  assert.ok(staticTrackPaint.indexOf("#drawBoundaryWallGeometry") < staticTrackPaint.indexOf("this.#drawScenery("),
     "solid scenery must be painted after fence geometry");
   assert.match(rendererSource, /RAF p50/);
   assert.match(rendererSource, /#drawRaceHud\(ctx, focus, snapshot, width, height\)/);
   assert.doesNotMatch(rendererSource, /surfaceSeverity\s*>\s*0\.06\s*\|\|\s*wallContactTimer/,
     "ordinary runoff must not disable client prediction");
-  assert.match(rendererSource, /const unsafeContact = wallContactTimer > 0\.02/);
   assert.match(hudSource, /mode: "canvas"/);
   assert.match(hudSource, /domWrites: 0/);
   assert.doesNotMatch(hudSource, /requestIdleCallback/);
@@ -184,7 +262,13 @@ const track = generateTrack("renderer-countdown", 2);
   assert.equal(afterOvertake.labelCacheMisses, afterFirstLabel.labelCacheMisses, "rank changes must not allocate another label canvas");
   assert.equal(afterOvertake.labelCacheSize, afterFirstLabel.labelCacheSize);
   assert.ok(afterOvertake.labelCacheHits >= 2);
+  assert.equal(afterOvertake.vehicleSpritesGenerated, afterFirstLabel.vehicleSpritesGenerated,
+    "overtaking rebuilt chassis paint");
+  assert.ok(afterOvertake.vehicleSpriteHits >= 2);
+  const artSources = [...renderer.art.canvases, ...renderer.vehicleSprites.bodies.values(),
+    renderer.vehicleSprites.halo, renderer.vehicleSprites.flame, renderer.vehicleSprites.hotCore, renderer.vehicleSprites.frontWheel];
   renderer.destroy();
+  for (const canvas of artSources) assert.equal(canvas.width * canvas.height, 1);
 }
 
 
@@ -380,5 +464,142 @@ for (let index = 0; index < 6; index += 1) {
   assert.equal(mainCanvas.height, 1);
 }
 assert.equal(rafCallbacks.size, 0);
+
+
+// The backing-store budget applies even below one physical pixel per CSS pixel.
+for (const [width, height] of [[2560, 1440], [3840, 2160], [7680, 4320], [40000, 100]]) {
+  const canvas = makeCanvas(); canvas.getBoundingClientRect = () => ({ width, height });
+  const renderer = new RaceRenderer(canvas, track);
+  assert.ok(canvas.width * canvas.height <= 3_200_000, `pixel budget exceeded at ${width}x${height}`);
+  renderer.destroy();
+}
+
+// Jitter expands the buffer within its bound; presentation never rewinds. A
+// host clock stall must not leave the all-time minimum clock estimate in use.
+{
+  const original = Object.getOwnPropertyDescriptor(globalThis, "performance");
+  let now = 1000;
+  Object.defineProperty(globalThis, "performance", { configurable: true, value: { now: () => now, timeOrigin: 0 } });
+  const renderer = new RaceRenderer(makeCanvas(), track, { networkRenderDelay: 0.06, maxExtrapolation: 0.25 });
+  let lastTarget = -Infinity;
+  const frame = (tick, time) => ({ tick, simulationTime: time, time, cars: [], started: true, countdown: 0 });
+  for (let index = 0; index < 80; index++) {
+    now = 1000 + index * 1000 / 30 + (index % 4 === 0 ? 20 : 0);
+    renderer.pushSnapshot(frame(index * 2, index / 30)); renderer.render(now);
+    assert.ok(renderer.playbackTargetTime >= lastTarget);
+    lastTarget = renderer.playbackTargetTime;
+  }
+  assert.ok(renderer.networkRenderDelay > 0.065 && renderer.networkRenderDelay <= 0.18);
+  renderer.setNetworkTiming({ clockOffset: 1, rttMs: 80 });
+  now += 3000;
+  renderer.pushSnapshot(frame(162, 2.7));
+  assert.equal(renderer.networkTiming, null);
+  assert.ok(renderer.playbackClockOffset > 3);
+  renderer.destroy();
+  Object.defineProperty(globalThis, "performance", original);
+}
+
+// Exercise actual pong timing -> renderer clocks. A synchronized host clock
+// excludes delivery time; a 60 ms jitter buffer alone cannot cover that age.
+{
+  const originalPerformance=Object.getOwnPropertyDescriptor(globalThis,'performance');
+  const originalGame=globalThis.game;
+  let now=1000;
+  Object.defineProperty(globalThis,'performance',{configurable:true,value:{now:()=>now,timeOrigin:0}});
+  const {RaceNetwork}=await import('../scripts/network.js');
+  const {PROTOCOL_VERSION}=await import('../scripts/constants.js');
+  const profiles=[... [10,80,160,200,260].map(rtt=>({rtt,down:rtt/2})),{rtt:160,down:140},{rtt:160,down:20}];
+  const metrics=[];
+  for(const fps of [60,144])for(const profile of profiles) {
+    let receive;
+    globalThis.game={user:{id:'player'},socket:{on:(_,handler)=>receive=handler,off:()=>{},emit:()=>{}}};
+    window.setInterval=()=>1;window.clearInterval=()=>{};
+    const network=new RaceNetwork();network.initialize();
+    network.lobby={id:'timing-lobby',hostId:'host',hostEpoch:0};
+    network.activeRace={raceId:'timing-race',phase:'race',hostId:'host'};
+    const renderer=new RaceRenderer(makeCanvas(),track,{networkRenderDelay:.06,enableLocalPrediction:false});
+    network.on('timing',timing=>renderer.setNetworkTiming(timing));
+    let nextSource=0,nextRender=0,measured=0,extrapolated=0,lastTarget=-Infinity;
+    for(let ms=0;ms<=6000;ms++) {
+      now=1000+ms;
+      while(nextSource*1000/30+profile.down<=ms+1e-6) {
+        const time=nextSource/30;
+        renderer.pushSnapshot({tick:nextSource*2,simulationTime:time,time,cars:[],started:true,countdown:0});
+        nextSource++;
+      }
+      if(ms===250) {
+        const nonce='timing-'+fps+'-'+profile.down+'-'+profile.rtt;
+        network.pendingProbes.set(nonce,now-profile.rtt);
+        receive({id:nonce,type:'race-pong',protocolVersion:PROTOCOL_VERSION,senderId:'host',targetId:'player',hostEpoch:0,
+          lobbyId:'timing-lobby',raceId:'timing-race',nonce,simulationTime:(ms-profile.down)/1000});
+        assert.ok(network.timing,'actual pong was not accepted');
+      }
+      if(ms+1e-6>=nextRender) {
+        nextRender+=1000/fps;
+        renderer.render(now);
+        if(renderer.playbackTargetTime!==null) {
+          assert.ok(renderer.playbackTargetTime>=lastTarget,'timing update rewound the renderer');
+          lastTarget=renderer.playbackTargetTime;
+        }
+        if(ms>=3000){measured++;if(renderer.presentationExtrapolated)extrapolated++;}
+      }
+    }
+    const fraction=extrapolated/measured;
+    assert.ok(fraction<.02,`stable RTT ${profile.rtt}, downlink ${profile.down}, ${fps} Hz extrapolated ${fraction*100}%`);
+    assert.ok(renderer.getPerformanceStats().totalRenderDelayMs>=profile.rtt/2+59,'delivery delay was omitted from telemetry');
+    metrics.push({fps,rttMs:profile.rtt,downlinkMs:profile.down,extrapolationPercent:+(fraction*100).toFixed(2)});
+    renderer.destroy();network.destroy();
+  }
+  console.log('timing-renderer-matrix: '+JSON.stringify(metrics));
+  globalThis.game=originalGame;
+  delete window.setInterval;delete window.clearInterval;
+  Object.defineProperty(globalThis,'performance',originalPerformance);
+}
+
+// One-way input loss hands control to authority's temporary bot. Show its
+// buffered motion at display cadence, then smoothly resume local prediction.
+for(const fps of [60,144]) {
+  const originalPerformance=Object.getOwnPropertyDescriptor(globalThis,'performance');
+  let now=1000;
+  Object.defineProperty(globalThis,'performance',{configurable:true,value:{now:()=>now,timeOrigin:0}});
+  const {buildRaceCarMeta,neutralInput}=await import('../scripts/physics.js');
+  const {cloneDefaultBuild}=await import('../scripts/catalog.js');
+  const meta=buildRaceCarMeta({id:'handover',build:cloneDefaultBuild()});
+  const renderer=new RaceRenderer(makeCanvas(),track,{localCarId:meta.id,networkRenderDelay:.06});
+  renderer.setNetworkTiming({clockOffset:1,rttMs:160});
+  renderer.setLocalInput({...neutralInput(),throttle:1,steer:-1},1);
+  let nextSource=0,nextRender=0,previous=null,maxStep=0,intermediateMoves=0,wasAutopilot=false;
+  for(let ms=0;ms<=5000;ms++) {
+    now=1000+ms;
+    while(nextSource*1000/30+80<=ms+1e-6) {
+      const time=nextSource/30,autopilot=time>=1&&time<3;
+      const car={...meta,x:track.start.x+300*time,y:track.start.y,vx:300,vy:0,angle:0,angularVelocity:0,
+        health:meta.maxHealth,charge:meta.maxCharge,heat:0,lap:0,pitState:'track',surfaceType:'road',surfaceSeverity:0,
+        steeringPosition:0,driftAmount:0,temporaryAutopilot:autopilot,inputSequence:time>=3?2:0};
+      renderer.pushSnapshot({tick:nextSource*2,simulationTime:time,time,cars:[car],started:true,countdown:0,laps:3});
+      nextSource++;
+    }
+    if(ms===2950)renderer.setLocalInput({...neutralInput(),throttle:1},2);
+    if(ms+1e-6<nextRender)continue;
+    nextRender+=1000/fps;renderer.render(now);
+    if(renderer.lastDrawAt!==now)continue;
+    const displayed=renderer.predictor.displayedState,source=renderer.currentSnapshot?.cars[0];
+    if(!displayed)continue;
+    if(source.temporaryAutopilot) {
+      wasAutopilot=true;
+      assert.equal(renderer.predictionBlocked,true);
+      assert.equal(renderer.predictionState.angle,0,'driver command rotated authority autopilot in replay');
+      assert.equal(renderer.predictor.horizon,0);
+      if(ms>1600&&ms<2900&&previous&&displayed.x>previous.x+.01)intermediateMoves++;
+    }
+    if(previous&&ms>500)maxStep=Math.max(maxStep,Math.hypot(displayed.x-previous.x,displayed.y-previous.y));
+    previous={...displayed};
+  }
+  assert.ok(wasAutopilot);
+  assert.ok(intermediateMoves>Math.min(fps,60)*.8,'autopilot was displayed only on snapshot arrivals');
+  assert.equal(renderer.predictionBlocked,false,'manual prediction did not return');
+  assert.ok(maxStep<22,`handover snapped at ${fps} Hz: ${maxStep}`);
+  renderer.destroy();Object.defineProperty(globalThis,'performance',originalPerformance);
+}
 
 console.log("renderer-tests: ok");

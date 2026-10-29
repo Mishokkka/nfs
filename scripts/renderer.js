@@ -5,12 +5,20 @@ import {
   runoffSurfaceForSide,
   boundaryPoint,
   wallBoundaryPoint,
-  wallSegmentActiveRange
+  wallSegmentActiveRange,
+  RUNOFF_SURFACES,
+  roadWidthAt,
+  roadEdgePoint
 } from "./track.js";
-import { applyDriveModel } from "./physics/drive-model.js";
+import { LocalPrediction } from "./netcode/local-prediction.js";
+import { VehicleSprites, REAR_CORE_X } from "./rendering/vehicle-sprites.js";
+import { TrackArt } from "./rendering/track-art.js";
+import { GripFeedback } from "./rendering/grip-feedback.js";
+import { paintBuilding } from "./rendering/building-art.js";
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 const angleDelta = (target, current) => Math.atan2(Math.sin(target - current), Math.cos(target - current));
 const smoothingFactor = (dt, timeConstant) => 1 - Math.exp(-Math.max(0, dt) / Math.max(0.001, timeConstant));
+/** Format nonnegative centiseconds; missing lap times stay visibly unknown. */
 const formatRaceTime = (seconds) => {
   if (!Number.isFinite(seconds)) return "—";
   const totalCentiseconds = Math.max(0, Math.round(seconds * 100));
@@ -67,6 +75,7 @@ export class RaceRenderer {
     this.track = track;
     this.localCarId = localCarId;
     this.onHud = onHud;
+    this.gripFeedback = new GripFeedback();
     this.cameraMode = CAMERA_MODES.has(cameraMode) ? cameraMode : "overview";
     this.minimapEnabled = Boolean(minimapEnabled);
     this.previousSnapshot = null;
@@ -84,8 +93,15 @@ export class RaceRenderer {
     this.playbackTargetAt = 0;
     this.playbackOffsetSample = null;
     this.enableLocalPrediction = Boolean(enableLocalPrediction);
-    this.networkRenderDelay = Number.isFinite(Number(networkRenderDelay)) ? clamp(Number(networkRenderDelay), 0, 0.5) : 0.11;
-    this.maxExtrapolation = Number.isFinite(Number(maxExtrapolation)) ? clamp(Number(maxExtrapolation), 0.02, 0.6) : 0.34;
+    this.predictor = new LocalPrediction();
+    this.networkTiming = null;
+    this.networkRenderDelay = Number.isFinite(networkRenderDelay) ? clamp(Number(networkRenderDelay), 0, 0.5) : 0.11;
+    this.baseRenderDelay = this.networkRenderDelay;
+    this.jitterSamples = [];
+    this.clockSamples = [];
+    this.presentationExtrapolated = false;
+    this.presentationRecoveryUntil = 0;
+    this.maxExtrapolation = Number.isFinite(maxExtrapolation) ? clamp(Number(maxExtrapolation), 0.02, 0.6) : 0.34;
     this.smoothAuthoritativePresentation = Boolean(smoothAuthoritativePresentation);
     this.lastDrawAt = performance.now();
     this.lastRenderedAt = 0;
@@ -153,7 +169,6 @@ export class RaceRenderer {
     this.localInputSequence = 0;
     this.predictionState = null;
     this.predictionBlocked = false;
-    this.predictionClearSince = 0;
     this.predictionError = 0;
     this.predictionCorrection = 0;
     this.trackTiles = new Map();
@@ -202,10 +217,12 @@ export class RaceRenderer {
       initialized: false
     };
 
+    this.art = new TrackArt(this.track);
+    this.vehicleSprites = new VehicleSprites();
     this.trackPath = this.#buildTrackPath(this.track.samples, true);
     this.pitPath = this.#buildTrackPath(this.track.pit?.samples ?? [], false);
     this.runoffSurfacePaths = this.#buildRunoffSurfacePaths(this.track.samples, this.track.width, true);
-    this.pitRunoffSurfacePaths = this.#buildRunoffSurfacePaths(this.track.pit?.samples ?? [], this.track.pit?.width ?? 0, false, "grass");
+    this.pitRunoffSurfacePaths = this.#buildRunoffSurfacePaths(this.track.pit?.samples ?? [], this.track.pit?.width ?? 0, false);
     this.runoffTextureGeometry = this.#buildRunoffTextureGeometry(this.track.samples, this.track.width);
     this.wallGeometry = [
       this.#buildBoundaryWallGeometry(this.track.samples, this.track.width, 1, true, "wallLeftAlpha"),
@@ -241,9 +258,9 @@ export class RaceRenderer {
     const next = id == null ? null : String(id);
     if (next === this.localCarId) return;
     this.localCarId = next;
+    this.predictor.reset();
     this.predictionState = null;
     this.predictionBlocked = false;
-    this.predictionClearSince = 0;
   }
 
   setLocalInput(input, sequence = 0) {
@@ -257,6 +274,7 @@ export class RaceRenderer {
       drift: Boolean(input?.drift)
     };
     this.localInputSequence = Math.max(this.localInputSequence, Math.floor(Number(sequence) || 0));
+    this.predictor.submit(this.localInput, this.localInputSequence);
   }
 
   setCameraMode(mode) {
@@ -304,6 +322,16 @@ export class RaceRenderer {
       predictionError: this.predictionError,
       predictionCorrection: this.predictionCorrection,
       predictionBlocked: this.predictionBlocked,
+      predictionHorizonMs: this.predictor.horizon * 1000,
+      pendingInputs: this.predictor.history.filter(command => command.sequence > (this.predictor.state?.inputSequence ?? -1)).length,
+      renderDelayMs: this.networkRenderDelay * 1000,
+      downlinkDelayMs: this.#downlinkDelay() * 1000,
+      totalRenderDelayMs: (this.networkRenderDelay + this.#downlinkDelay()) * 1000,
+      rttMs: this.networkTiming?.rttMs ?? null,
+      snapshotAgeMs: Math.max(0, performance.now() - this.snapshotAt),
+      vehicleSpriteCacheSize: this.vehicleSprites.bodies.size,
+      vehicleSpriteHits: this.vehicleSprites.hits,
+      vehicleSpritesGenerated: this.vehicleSprites.generated,
       labelCacheSize: this.labelCache.size,
       labelCacheHits: this.labelCacheHits,
       labelCacheMisses: this.labelCacheMisses,
@@ -406,7 +434,7 @@ export class RaceRenderer {
     }
     this.currentSnapshot = snapshot;
     this.snapshotAt = now;
-    const generatedEpoch = Number(generatedAt);
+    const generatedEpoch = Number.isFinite(generatedAt) ? generatedAt : NaN;
     const generatedMainTime = Number.isFinite(generatedEpoch)
       ? generatedEpoch - Number(performance.timeOrigin || 0)
       : now;
@@ -420,16 +448,31 @@ export class RaceRenderer {
       this.playbackTargetTime = null;
       this.playbackTargetAt = 0;
       this.playbackOffsetSample = null;
+      this.clockSamples.length = 0;
+      this.jitterSamples.length = 0;
+    }
+    if (last && (now - last.receivedAt) / 1000 - (clock - last.time) > 0.5) {
+      this.clockSamples.length = 0;
+      this.networkTiming = null;
     }
     const offsetSample = presentationAt / 1000 - clock;
     if (Number.isFinite(offsetSample)) {
-      this.playbackOffsetSample = offsetSample;
-      // Packet latency can only increase this sample. Retaining the lowest
-      // observed value estimates the stable clock offset without letting a late
-      // packet rewind the scene. Worker production timestamps use the same path.
-      if (!Number.isFinite(this.playbackClockOffset) || offsetSample < this.playbackClockOffset) {
-        this.playbackClockOffset = offsetSample;
+      this.clockSamples.push({ at: now, offset: offsetSample });
+      while (this.clockSamples.length > 90 || (this.clockSamples[0]?.at < now - 3000)) this.clockSamples.shift();
+      // A rolling minimum can follow a stalled host clock; an all-time minimum
+      // permanently extrapolated ahead after even one simulation pause.
+      this.playbackClockOffset = Math.min(...this.clockSamples.map(sample => sample.offset));
+      if (last) {
+        const variation = Math.abs((now - last.receivedAt) / 1000 - (clock - last.time));
+        this.jitterSamples.push(Math.min(0.25, variation));
+        if (this.jitterSamples.length > 60) this.jitterSamples.shift();
+        const sorted = this.jitterSamples.slice().sort((a, b) => a - b);
+        const jitter = sorted[Math.floor((sorted.length - 1) * 0.9)] || 0;
+        const target = clamp(this.baseRenderDelay + jitter, this.baseRenderDelay, sourceName === "worker" ? 0.08 : 0.18);
+        this.networkRenderDelay += (target - this.networkRenderDelay) * (target > this.networkRenderDelay ? 0.3 : 0.02);
       }
+      this.playbackOffsetSample = offsetSample;
+
     }
     this.snapshotBuffer.push({ snapshot, receivedAt: now, presentationAt, time: clock, source: sourceName });
     if (this.snapshotBuffer.length > 36) this.snapshotBuffer.splice(0, this.snapshotBuffer.length - 36);
@@ -637,6 +680,9 @@ export class RaceRenderer {
     }
   }
 
+  /** Cancel presentation work and release static tiles, labels and chassis art.
+   * Repeated teardown is safe when a window closes during an asynchronous resize.
+   */
   destroy() {
     if (this.destroyed) return;
     this.destroyed = true;
@@ -651,6 +697,8 @@ export class RaceRenderer {
     // can leave several 2K textures alive between races in Chromium/Electron.
     // Shrinking every store releases that memory immediately.
     this.#clearLabelCache();
+    this.vehicleSprites.destroy();
+    this.art.destroy();
     this.presentationCars.clear();
     this.activePresentationIds.clear();
     this.blendedCars.length = 0;
@@ -673,8 +721,10 @@ export class RaceRenderer {
     this.retainedTrackTileKeys.clear();
     this.predictionState = null;
     this.predictionBlocked = false;
-    this.predictionClearSince = 0;
     this.snapshotBuffer.length = 0;
+    this.predictor.reset();
+    this.jitterSamples.length = 0;
+    this.clockSamples.length = 0;
     this.rafIntervals.length = 0;
     this.renderIntervals.length = 0;
     this.renderCosts.length = 0;
@@ -726,9 +776,9 @@ export class RaceRenderer {
     // fill-rate and VRAM without bound.
     const cssPixels = Math.max(1, rect.width * rect.height);
     const pixelBudgetScale = Math.sqrt(MAX_CANVAS_PIXELS / cssPixels);
-    const requestedScale = clamp(Math.min(window.devicePixelRatio || 1, MAX_OUTPUT_SCALE, pixelBudgetScale), 1, MAX_OUTPUT_SCALE);
-    const width = Math.max(320, Math.round(rect.width * requestedScale));
-    const height = Math.max(240, Math.round(rect.height * requestedScale));
+    const requestedScale = Math.max(0.01, Math.min(window.devicePixelRatio || 1, MAX_OUTPUT_SCALE, pixelBudgetScale));
+    const width = Math.max(1, Math.floor(rect.width * requestedScale));
+    const height = Math.max(1, Math.floor(rect.height * requestedScale));
     if (this.canvas.width !== width || this.canvas.height !== height) {
       this.canvas.width = width;
       this.canvas.height = height;
@@ -767,10 +817,9 @@ export class RaceRenderer {
 
 
   #buildRunoffSurfacePaths(points, roadWidth, closed = true, forcedSurface = null) {
-    const paths = { grass: new Path2D(), sand: new Path2D(), gravel: new Path2D() };
+    const paths = Object.fromEntries(RUNOFF_SURFACES.map(type => [type, new Path2D()]));
     if (!points?.length) return paths;
     const segmentCount = closed ? points.length : Math.max(0, points.length - 1);
-    const halfRoad = Math.max(0, Number(roadWidth) || 0) * 0.5;
     for (let index = 0; index < segmentCount; index += 1) {
       const nextIndex = closed ? (index + 1) % points.length : index + 1;
       const point = points[index];
@@ -778,16 +827,20 @@ export class RaceRenderer {
       for (const side of [1, -1]) {
         if (grassWidthForSide(point, side) <= 0.5 && grassWidthForSide(next, side) <= 0.5) continue;
         const type = forcedSurface ?? runoffSurfaceForSide(point, side);
-        const path = paths[type] ?? paths.grass;
-        const innerA = { x: point.x + point.nx * halfRoad * side, y: point.y + point.ny * halfRoad * side };
-        const innerB = { x: next.x + next.nx * halfRoad * side, y: next.y + next.ny * halfRoad * side };
+        const nextType = forcedSurface ?? runoffSurfaceForSide(next, side);
+        const innerA = roadEdgePoint(point,roadWidth,side);
+        const innerB = roadEdgePoint(next,roadWidth,side);
         const outerA = wallBoundaryPoint(point, roadWidth, side);
         const outerB = wallBoundaryPoint(next, roadWidth, side);
-        path.moveTo(innerA.x, innerA.y);
-        path.lineTo(innerB.x, innerB.y);
-        path.lineTo(outerB.x, outerB.y);
-        path.lineTo(outerA.x, outerA.y);
-        path.closePath();
+        // Terrain queries switch material halfway along a segment. Split the
+        // visual patch at that same position rather than a whole sample later.
+        const slices = type === nextType ? [[type,0,1]] : [[type,0,.5],[nextType,.5,1]];
+        const mix = (a,b,t) => ({x:a.x+(b.x-a.x)*t,y:a.y+(b.y-a.y)*t});
+        for(const [material,start,end] of slices) {
+          const path=paths[material]??paths.grass;
+          const a=mix(innerA,innerB,start),b=mix(innerA,innerB,end),c=mix(outerA,outerB,end),d=mix(outerA,outerB,start);
+          path.moveTo(a.x,a.y);path.lineTo(b.x,b.y);path.lineTo(c.x,c.y);path.lineTo(d.x,d.y);path.closePath();
+        }
       }
     }
     return paths;
@@ -808,7 +861,7 @@ export class RaceRenderer {
         const type = runoffSurfaceForSide(point, side);
         const noise = Math.sin(index * 12.9898 + side * 78.233) * 43758.5453;
         const unit = noise - Math.floor(noise);
-        const offset = roadWidth * 0.5 + width * (0.16 + unit * 0.70);
+        const offset = roadWidthAt(point,roadWidth) * 0.5 + width * (0.16 + unit * 0.70);
         const centerX = point.x + point.nx * offset * side;
         const centerY = point.y + point.ny * offset * side;
         if (type === "grass") {
@@ -823,7 +876,7 @@ export class RaceRenderer {
           const bow = (unit - 0.5) * 5;
           path.moveTo(centerX - point.tx * length * 0.5, centerY - point.ty * length * 0.5);
           path.quadraticCurveTo(centerX + point.nx * bow, centerY + point.ny * bow, centerX + point.tx * length * 0.5, centerY + point.ty * length * 0.5);
-        } else {
+        } else if (type === "gravel") {
           const path = geometry.gravel[Math.floor(unit * geometry.gravel.length) % geometry.gravel.length];
           const radius = 1.4 + unit * 2.8;
           path.moveTo(centerX + radius, centerY);
@@ -918,9 +971,9 @@ export class RaceRenderer {
   #drawBoundaryWallGeometry(ctx, geometry) {
     if (!geometry) return;
     const layers = [
-      { color: "#292725", width: 10, alpha: 1 },
-      { color: "#aaa497", width: 4, alpha: 1 },
-      { color: "rgba(238, 227, 196, 0.72)", width: 1.5, alpha: 0.92, dash: [18, 12] }
+      { color: "#17252b", width: 10, alpha: 1 },
+      { color: "#9faeaa", width: 4, alpha: 1 },
+      { color: "#e9e9d4bd", width: 1.5, alpha: 0.92, dash: [18, 12] }
     ];
     ctx.save();
     ctx.lineCap = "round";
@@ -944,7 +997,7 @@ export class RaceRenderer {
     if (!ctx) return;
     const maxTrackGrass = maximumRunoffWidth(this.track.samples);
     const maxPitGrass = maximumRunoffWidth(this.track.pit?.samples);
-    const padding = Math.max(this.track.width * 0.5 + maxTrackGrass, (this.track.pit?.width ?? 0) * 0.5 + maxPitGrass) + 72;
+    const padding = Math.max(Math.max(this.track.width,...this.track.samples.map(p=>roadWidthAt(p,this.track.width))) * 0.5 + maxTrackGrass, (this.track.pit?.width ?? 0) * 0.5 + maxPitGrass) + 72;
     const minX = this.track.bounds.minX - padding;
     const minY = this.track.bounds.minY - padding;
     const worldWidth = this.track.bounds.maxX - this.track.bounds.minX + padding * 2;
@@ -1025,10 +1078,13 @@ export class RaceRenderer {
     const ctx = this.backgroundContext;
     if (!ctx) return;
     const gradient = ctx.createRadialGradient(width * 0.5, height * 0.42, 10, width * 0.5, height * 0.5, Math.max(width, height));
-    gradient.addColorStop(0, "#312b24");
-    gradient.addColorStop(1, "#12100e");
+    gradient.addColorStop(0, this.art.palette.light);
+    gradient.addColorStop(1, this.art.palette.ground);
     ctx.fillStyle = gradient;
     ctx.fillRect(0, 0, width, height);
+    if (this.art.ground) {
+      ctx.globalAlpha = 0.18; ctx.fillStyle = this.art.ground; ctx.fillRect(0, 0, width, height); ctx.globalAlpha = 1;
+    }
   }
 
   #blendSnapshots(previous, current, alpha) {
@@ -1057,8 +1113,17 @@ export class RaceRenderer {
       const indexed = previousCars[index];
       const old = indexed?.id === car.id ? indexed : previousCars.find((entry) => entry.id === car.id);
       if (!old) continue;
-      target.x = old.x + (car.x - old.x) * t;
-      target.y = old.y + (car.y - old.y) * t;
+      const span = Math.max(0, this.#snapshotClock(current) - this.#snapshotClock(previous));
+      const continuous = span <= 0.15 && car.pitState === old.pitState && !car.wallContactTimer
+        && Math.hypot(car.x - old.x, car.y - old.y) < 160;
+      for (const [position, velocity] of [["x", "vx"], ["y", "vy"]]) {
+        const linear = old[position] + (car[position] - old[position]) * t;
+        if (!continuous) { target[position] = linear; continue; }
+        const t2 = t * t, t3 = t2 * t;
+        const hermite = (2 * t3 - 3 * t2 + 1) * old[position] + (t3 - 2 * t2 + t) * old[velocity] * span
+          + (-2 * t3 + 3 * t2) * car[position] + (t3 - t2) * car[velocity] * span;
+        target[position] = clamp(hermite, Math.min(old[position], car[position]) - 4, Math.max(old[position], car[position]) + 4);
+      }
       target.vx = old.vx + (car.vx - old.vx) * t;
       target.vy = old.vy + (car.vy - old.vy) * t;
       target.angle = old.angle + angleDelta(car.angle, old.angle) * t;
@@ -1078,6 +1143,16 @@ export class RaceRenderer {
     return a + (b - a) * t;
   }
 
+  #downlinkDelay() {
+    const offset = this.networkTiming?.clockOffset;
+    if (!Number.isFinite(offset)) return 0; // Arrival-based mapping already includes delivery.
+    // Prefer observed low-latency frame age; RTT/2 only seeds the estimate when
+    // no frame has arrived. This also works with asymmetric transport delays.
+    return Number.isFinite(this.playbackClockOffset)
+      ? Math.max(0, this.playbackClockOffset - offset)
+      : Math.max(0, Number(this.networkTiming?.rttMs) || 0) / 2000;
+  }
+
   #interpolatedSnapshot(now) {
     if (this.simulationFrame) {
       const { previous, current, alpha } = this.simulationFrame;
@@ -1087,10 +1162,10 @@ export class RaceRenderer {
     const buffer = this.snapshotBuffer;
     if (!buffer.length) return this.currentSnapshot;
     const latest = buffer[buffer.length - 1];
-    const offset = Number(this.playbackClockOffset);
+    const offset = this.networkTiming?.clockOffset ?? this.playbackClockOffset;
     const fallbackSourceAt = Number.isFinite(latest.presentationAt) ? latest.presentationAt : latest.receivedAt;
     const rawTargetTime = Number.isFinite(offset)
-      ? now / 1000 - offset - this.networkRenderDelay
+      ? now / 1000 - offset - this.#downlinkDelay() - this.networkRenderDelay
       : latest.time + Math.max(0, now - fallbackSourceAt) / 1000 - this.networkRenderDelay;
 
     let targetTime = rawTargetTime;
@@ -1112,10 +1187,13 @@ export class RaceRenderer {
       const b = buffer[index + 1];
       if (targetTime < a.time || targetTime > b.time) continue;
       const span = Math.max(0.0001, b.time - a.time);
+      if (this.presentationExtrapolated) this.presentationRecoveryUntil = now + 120;
+      this.presentationExtrapolated = false;
       return this.#blendSnapshots(a.snapshot, b.snapshot, (targetTime - a.time) / span);
     }
 
     if (targetTime <= buffer[0].time) return buffer[0].snapshot;
+    this.presentationExtrapolated = true;
     return this.#extrapolateSnapshot(latest.snapshot, Math.min(this.maxExtrapolation, targetTime - latest.time));
   }
 
@@ -1162,7 +1240,8 @@ export class RaceRenderer {
         this.presentationCars.set(car.id, displayed);
       } else {
         const distance = Math.hypot(car.x - displayed.x, car.y - displayed.y);
-        const factor = distance > 520 ? 1 : smoothingFactor(dt, car.id === this.localCarId ? 0.045 : 0.065);
+        const recovering = this.presentationExtrapolated || performance.now() < this.presentationRecoveryUntil;
+        const factor = distance > 520 || !recovering ? 1 : smoothingFactor(dt, 0.04);
         const x = displayed.x + (car.x - displayed.x) * factor;
         const y = displayed.y + (car.y - displayed.y) * factor;
         const vx = displayed.vx + (car.vx - displayed.vx) * factor;
@@ -1261,223 +1340,26 @@ export class RaceRenderer {
   }
 
 
-  #applyLocalPrediction(snapshot, now, dt) {
+  setNetworkTiming(timing) {
+    this.networkTiming = timing;
+  }
+
+  #applyLocalPrediction(snapshot, now) {
     if (!snapshot || !this.localCarId || this.simulationFrame || !this.enableLocalPrediction) return snapshot;
-    const authoritative = this.currentSnapshot?.cars?.find((car) => car.id === this.localCarId)
-      ?? snapshot.cars?.find((car) => car.id === this.localCarId);
-    if (!authoritative) {
-      this.predictionState = null;
-      return snapshot;
-    }
-
-    const surfaceSeverity = Number(authoritative.surfaceSeverity) || 0;
-    const wallContactTimer = Number(authoritative.wallContactTimer) || 0;
-    // Terrain is a normal driving state, not a reason to disable local prediction.
-    // The previous surfaceSeverity gate returned the client to the delayed
-    // authoritative presentation buffer for roughly 160 ms, then restored the
-    // predicted pose. Only remote players therefore appeared to jump backwards
-    // on entering grass, sand or gravel and immediately spring forwards again.
-    const unsafeContact = wallContactTimer > 0.02;
-    const contactCleared = wallContactTimer < 0.005;
-    if (unsafeContact) {
-      this.predictionBlocked = true;
-      this.predictionClearSince = 0;
-    } else if (this.predictionBlocked) {
-      if (contactCleared) {
-        if (!this.predictionClearSince) this.predictionClearSince = now;
-        if (now - this.predictionClearSince >= 120) {
-          this.predictionBlocked = false;
-          this.predictionClearSince = 0;
-        }
-      } else this.predictionClearSince = 0;
-    }
-
-    if (authoritative.finished || authoritative.disabled || authoritative.pitState === "service"
-      || this.predictionBlocked || !snapshot.started) {
-      this.predictionState = {
-        ...authoritative,
-        angularVelocity: 0,
-        driftAmount: 0,
-        driftDirection: 0,
-        slipAngle: 0,
-        lastSteer: 0,
-        lastAt: now,
-        sourceTick: Number(this.currentSnapshot?.tick ?? snapshot.tick)
-      };
-      this.predictionError = 0;
-      this.predictionCorrection = 0;
-      return snapshot;
-    }
-
-    const sourceTick = Number(this.currentSnapshot?.tick ?? snapshot.tick) || 0;
-    const p = authoritative.prediction ?? {};
-    let state = this.predictionState;
-    if (!state) {
-      state = {
-        ...authoritative,
-        angularVelocity: 0,
-        driftAmount: 0,
-        driftDirection: 0,
-        slipAngle: 0,
-        lastSteer: 0,
-        correctionX: 0,
-        correctionY: 0,
-        correctionVx: 0,
-        correctionVy: 0,
-        correctionAngle: 0,
-        correctionTime: 0.18,
-        lastAt: now,
-        sourceTick
-      };
-      this.predictionState = state;
-    } else if (state.sourceTick !== sourceTick) {
-      const errorX = authoritative.x - state.x;
-      const errorY = authoritative.y - state.y;
-      const error = Math.hypot(errorX, errorY);
-      this.predictionError = error;
-      if (error > 260 || authoritative.pitState !== state.pitState) {
-        Object.assign(state, authoritative, {
-          angularVelocity: 0,
-          driftAmount: 0,
-          driftDirection: 0,
-          slipAngle: 0,
-            lastSteer: 0,
-          correctionX: 0,
-          correctionY: 0,
-          correctionVx: 0,
-          correctionVy: 0,
-          correctionAngle: 0
-        });
-      } else {
-        const acknowledged = Number(authoritative.inputSequence) >= this.localInputSequence;
-        const motion = {
-          x: state.x,
-          y: state.y,
-          vx: state.vx,
-          vy: state.vy,
-          angle: state.angle,
-          angularVelocity: state.angularVelocity ?? 0,
-          driftAmount: state.driftAmount ?? 0,
-          driftDirection: state.driftDirection ?? 0,
-          slipAngle: state.slipAngle ?? 0,
-          lastSteer: state.lastSteer ?? 0
-        };
-        Object.assign(state, authoritative, motion, {
-          // Reconciliation is stored as a decaying error rather than applied as
-          // an instant position jump every network tick.
-          correctionX: clamp(errorX, -180, 180),
-          correctionY: clamp(errorY, -180, 180),
-          correctionVx: clamp(authoritative.vx - state.vx, -220, 220),
-          correctionVy: clamp(authoritative.vy - state.vy, -220, 220),
-          correctionAngle: clamp(angleDelta(authoritative.angle, state.angle), -0.7, 0.7),
-          correctionTime: acknowledged ? 0.14 : 0.24
-        });
-      }
-      state.sourceTick = sourceTick;
-    }
-
-    const step = clamp(dt, 0, 0.05);
-    if (step > 0) {
-      const reconcile = smoothingFactor(step, Number(state.correctionTime) || 0.18);
-      const correctionX = Number(state.correctionX) || 0;
-      const correctionY = Number(state.correctionY) || 0;
-      const correctionVx = Number(state.correctionVx) || 0;
-      const correctionVy = Number(state.correctionVy) || 0;
-      const correctionAngle = Number(state.correctionAngle) || 0;
-      state.x += correctionX * reconcile;
-      state.y += correctionY * reconcile;
-      state.vx += correctionVx * reconcile;
-      state.vy += correctionVy * reconcile;
-      state.angle += correctionAngle * reconcile;
-      state.correctionX = correctionX * (1 - reconcile);
-      state.correctionY = correctionY * (1 - reconcile);
-      state.correctionVx = correctionVx * (1 - reconcile);
-      state.correctionVy = correctionVy * (1 - reconcile);
-      state.correctionAngle = correctionAngle * (1 - reconcile);
-      this.predictionCorrection = Math.hypot(state.correctionX, state.correctionY);
-
-      const input = this.localInput;
-      const maxSpeed = Math.max(80, Number(p.maxSpeed) || 420);
-      const maxHealth = Math.max(1, Number(state.maxHealth) || 100);
-      const heat = Math.max(0, Number(state.heat) || 0);
-      if (state.overheated && heat <= 48) state.overheated = false;
-      const heatStress = clamp((heat - 68) / 32, 0, 1);
-      const thermalAcceleration = state.overheated ? 0.58 : 1 - heatStress * 0.28;
-      const thermalSteering = state.overheated ? 0.72 : 1 - heatStress * 0.13;
-      const thermalTopSpeed = state.overheated ? 0.78 : 1 - heatStress * 0.08;
-      const terrainSeverity = clamp(surfaceSeverity / Math.max(1, Number(p.offroadGrip) || 1), 0, 1);
-      const terrainAcceleration = 1 - terrainSeverity * 0.68;
-      const terrainSteering = 1 - terrainSeverity * 0.48;
-      const terrainTopSpeed = 1 - terrainSeverity * 0.58;
-      const terrainGrip = 1 - terrainSeverity * 0.78;
-      const healthPenalty = Number(state.health) < maxHealth * 0.25 ? 0.78 : 1;
-      const lastLapBoost = p.lastLap && Number(state.lap) === Number(snapshot.laps) - 1 ? 1.04 : 1;
-      const lowHealthBoost = Number(state.health) < maxHealth * 0.3 ? Math.max(1, Number(p.lowHealthBoost) || 1) : 1;
-
-      const boostDrain = Math.max(0.01, Number(p.boostDrain) || 25);
-      const requestedCharge = boostDrain * step;
-      const boostRequested = state.pitState === "track"
-        && input.boost && input.throttle > 0 && !state.overheated && Number(state.charge) > 0.001;
-      const boostFraction = boostRequested
-        ? clamp(Number(state.charge) / Math.max(0.0001, requestedCharge), 0, 1)
-        : 0;
-      let boostActive = boostFraction > 0.001;
-      if (boostActive) {
-        state.charge = Math.max(0, Number(state.charge) - requestedCharge * boostFraction);
-        state.heat = Math.min(112, heat + Math.max(0, Number(p.heatRate) || 40) * step * boostFraction);
-      } else {
-        state.heat = Math.max(0, heat - Math.max(0, Number(p.cooling) || 5) * step);
-      }
-      if (state.heat >= 100) {
-        state.overheated = true;
-        boostActive = false;
-      }
-
-      const drive = applyDriveModel(state, input, {
-        maxSpeed,
-        acceleration: Math.max(20, Number(p.acceleration) || 240),
-        reverseAcceleration: Math.max(20, Number(p.reverseAcceleration) || 95),
-        braking: Math.max(20, Number(p.braking) || 300),
-        steerRate: Math.max(0.1, Number(p.steerRate) || 1.5),
-        lateralGrip: Math.max(0.01, Number(p.lateralGrip) || 2.8),
-        longitudinalDrag: Math.max(0, Number(p.longitudinalDrag) || 0.25),
-        rollingDrag: Math.max(0, Number(p.rollingDrag) || 20),
-        spinResistance: Math.max(0.01, Number(p.spinResistance) || 1),
-        recovery: Math.max(0.2, Number(p.recovery) || 1)
-      }, step, {
-        accelerationMultiplier: healthPenalty * thermalAcceleration * terrainAcceleration * lastLapBoost,
-        steeringMultiplier: (input.ram ? Math.max(0.01, Number(p.ramSteerPenalty) || 0.55) : 1)
-          * thermalSteering * terrainSteering * (p.precision ? 1.04 : 1),
-        topSpeedMultiplier: thermalTopSpeed * terrainTopSpeed * lastLapBoost,
-        gripMultiplier: terrainGrip,
-        brakeGripMultiplier: p.lateBrake ? 1.22 : 1,
-        driftEnabled: state.pitState === "track" && terrainSeverity < 0.035,
-        driftAssist: Math.max(0.75, Number(p.drift) || 1),
-        driftControl: Math.max(0.45, Math.sqrt(
-          Math.max(0.01, Number(p.spinResistance) || 1)
-          * Math.max(0.01, Number(p.recovery) || 1)
-        ) * (1 + (Math.max(0.75, Number(p.drift) || 1) - 1) * 0.75)),
-        boostAccelerationMultiplier: boostFraction > 0
-          ? 0.95 * Math.max(0.3, Number(p.boostPower) || 1) * lowHealthBoost * boostFraction
-          : 0,
-        boostTopSpeedMultiplier: boostActive ? 1.17 * Math.max(0.3, Number(p.boostPower) || 1) : 1,
-        speedLimit: state.pitState !== "track" ? Number(this.track.pit?.speedLimit ?? Infinity) : Infinity,
-        speedLimitDeceleration: state.pitState !== "track" ? Number(this.track.pit?.speedLimitDeceleration ?? 96) : 0,
-        previousSteer: state.lastSteer,
-        smoothSteer: Boolean(p.smoothSteer)
-      });
-      state.lastAt = now;
-    }
-
-    const cars = snapshot.cars.map((car) => car.id === this.localCarId ? {
-      ...car,
-      x: state.x, y: state.y, vx: state.vx, vy: state.vy, angle: state.angle,
-      driftAmount: state.driftAmount, slipAngle: state.slipAngle,
-      surfaceSeverity: state.surfaceSeverity,
-      surfaceType: state.surfaceType,
-      surfaceSide: state.surfaceSide
-    } : car);
-    return { ...snapshot, cars };
+    const authoritative = this.currentSnapshot?.cars?.find(car => car.id === this.localCarId);
+    if (!authoritative) return snapshot;
+    const source = this.currentSnapshot;
+    const local = this.predictor.sample(authoritative, source, {
+      now, receivedAt: this.snapshotAt,
+      clockOffset: this.networkTiming?.clockOffset ?? this.playbackClockOffset,
+      maxHorizon: 0.25, pit: this.track.pit,
+      bufferedState: snapshot.cars?.find(car => car.id === this.localCarId)
+    });
+    this.predictionState = this.predictor.state;
+    this.predictionError = this.predictor.error;
+    this.predictionCorrection = Math.hypot(this.predictor.offset.x, this.predictor.offset.y);
+    this.predictionBlocked = this.predictor.blocked;
+    return { ...snapshot, cars: snapshot.cars.map(car => car.id === this.localCarId ? { ...car, ...local } : car) };
   }
 
   #trackTileKey(tileX, tileY) {
@@ -1497,7 +1379,7 @@ export class RaceRenderer {
           grassWidthForSide(a, 1), grassWidthForSide(a, -1),
           grassWidthForSide(b, 1), grassWidthForSide(b, -1)
         );
-        const radius = roadWidth * 0.5 + grassRadius + 24;
+        const radius = Math.max(roadWidthAt(a,roadWidth),roadWidthAt(b,roadWidth)) * 0.5 + grassRadius + 24;
         const minTileX = Math.floor((Math.min(a.x, b.x) - radius) / TRACK_TILE_WORLD_SIZE);
         const maxTileX = Math.floor((Math.max(a.x, b.x) + radius) / TRACK_TILE_WORLD_SIZE);
         const minTileY = Math.floor((Math.min(a.y, b.y) - radius) / TRACK_TILE_WORLD_SIZE);
@@ -1509,7 +1391,9 @@ export class RaceRenderer {
     };
     markPolyline(this.track.samples, this.track.width, true);
     markPolyline(this.track.pit?.samples ?? [], this.track.pit?.width ?? 0, false);
-    for (const obstacle of this.track.scenery ?? []) {
+    for(const road of this.track.city?.roads ?? [])markPolyline(road.points,road.width+this.track.city.sidewalk*2,false);
+    const parks=(this.track.city?.parks??[]).map(p=>({...p,visualRadius:Math.hypot(p.width,p.height)/2}));
+    for (const obstacle of [...(this.track.scenery ?? []),...parks]) {
       const radius = Math.max(12, Number(obstacle.visualRadius) || Number(obstacle.collisionRadius) || 12) + 18;
       const minTileX = Math.floor((obstacle.x - radius) / TRACK_TILE_WORLD_SIZE);
       const maxTileX = Math.floor((obstacle.x + radius) / TRACK_TILE_WORLD_SIZE);
@@ -1582,7 +1466,7 @@ export class RaceRenderer {
     ctx.beginPath();
     ctx.rect(worldX, worldY, worldSize, worldSize);
     ctx.clip();
-    this.#paintStaticTrack(ctx);
+    this.#paintStaticTrack(ctx, { minX: worldX, minY: worldY, maxX: worldX + worldSize, maxY: worldY + worldSize });
     ctx.restore();
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     this.trackTileGenerated += 1;
@@ -1776,7 +1660,7 @@ export class RaceRenderer {
       snapshot = this.#smoothNetworkSnapshot(snapshot, presentationDt);
     }
     if (!this.simulationFrame) {
-      snapshot = this.#applyLocalPrediction(snapshot, now, rawDt);
+      snapshot = this.#applyLocalPrediction(snapshot, now);
     }
     snapshot = this.#stabilizeRaceOrder(snapshot, now);
 
@@ -1846,52 +1730,32 @@ export class RaceRenderer {
     ctx.restore();
   }
 
-  #paintStaticTrack(ctx) {
+  #paintStaticTrack(ctx, clipBounds = null) {
     ctx.lineJoin = "round";
     ctx.lineCap = "round";
+    this.art.paintCity(ctx);
 
     // Runoff is a true variable-width ribbon. Near the finish line and through
     // the committed pit lane its width collapses to zero, so the same perimeter
     // wall visibly converges onto the asphalt edge.
     const surfaceFills = {
-      grass: "#45552f",
-      sand: "#a88a58",
-      gravel: "#706d64"
+      grass: this.art.palette.grass,
+      sand: "#b09a6d",
+      gravel: "#737e78",
+      paving: this.art.paving ?? "#888576"
     };
-    for (const type of ["grass", "sand", "gravel"]) {
+    for (const type of RUNOFF_SURFACES) {
       ctx.fillStyle = surfaceFills[type];
       ctx.fill(this.runoffSurfacePaths?.[type] ?? new Path2D());
       ctx.fill(this.pitRunoffSurfacePaths?.[type] ?? new Path2D());
     }
     this.#drawRunoffTextures(ctx);
 
-    // Paint the branch first. Its shared beginning is hidden by the main road;
-    // as the centreline separates, the pit lane appears as a gradual fork.
-    if (this.track.pit?.samples?.length) {
-      ctx.strokeStyle = "#756d5d";
-      ctx.lineWidth = this.track.pit.width + 8;
-      ctx.stroke(this.pitPath);
-      ctx.strokeStyle = "#9b927f";
-      ctx.lineWidth = this.track.pit.width;
-      ctx.stroke(this.pitPath);
-      ctx.strokeStyle = "rgba(238, 221, 167, 0.68)";
-      ctx.lineWidth = 2;
-      ctx.setLineDash([10, 12]);
-      ctx.stroke(this.pitPath);
-      ctx.setLineDash([]);
-    }
-
-    ctx.strokeStyle = "#5c5246";
-    ctx.lineWidth = this.track.width + 10;
-    ctx.stroke(this.trackPath);
-    ctx.strokeStyle = "#b09a72";
-    ctx.lineWidth = this.track.width;
-    ctx.stroke(this.trackPath);
-    ctx.strokeStyle = "rgba(54, 41, 28, 0.34)";
-    ctx.lineWidth = 3;
-    ctx.setLineDash([18, 22]);
-    ctx.stroke(this.trackPath);
-    ctx.setLineDash([]);
+    // Existing tile caches own all surface detail; paint the branch first so
+    // the main road still masks the shared entry geometry.
+    if (this.track.pit?.samples?.length) this.art.paintRoad(ctx, this.pitPath, this.track.pit.width, true);
+    this.art.paintRoad(ctx, this.trackPath, this.track.width);
+    this.art.paintMarkings(ctx);
 
     // The circuit-side wall opens exactly where the pit branch diverges and
     // rejoins. The outer pit wall replaces it continuously; the inner pit wall
@@ -1904,66 +1768,52 @@ export class RaceRenderer {
       ctx.translate(service.x, service.y);
       ctx.rotate(Math.atan2(service.ty, service.tx));
       const serviceHalfLength = Number(this.track.pit.serviceHalfLength ?? 52);
-      ctx.fillStyle = "rgba(38, 118, 137, 0.45)";
+      ctx.fillStyle = "rgba(38, 118, 137, 0.60)";
       ctx.fillRect(-serviceHalfLength, -this.track.pit.width * 0.48, serviceHalfLength * 2, this.track.pit.width * 0.96);
       ctx.strokeStyle = "rgba(144, 230, 247, 0.85)";
       ctx.lineWidth = 3;
       ctx.strokeRect(-serviceHalfLength, -this.track.pit.width * 0.48, serviceHalfLength * 2, this.track.pit.width * 0.96);
+      ctx.font = "bold 13px Arial, sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+      ctx.fillStyle = "#d7f6efc0"; ctx.fillText("PIT", 0, 0);
       ctx.restore();
     }
 
     // Solid scenery is deliberately painted after every fence layer. A building,
     // tree crown or column therefore masks a rail behind it instead of being cut
     // in half by a fence drawn later in the static pass.
-    this.#drawScenery(ctx);
+    this.art.paintCityClosures(ctx, clipBounds);
+    this.#drawScenery(ctx, clipBounds);
 
     const start = this.track.samples[0];
-    const half = this.track.width * 0.48;
+    const half = roadWidthAt(start,this.track.width) * 0.48;
     const squares = 10;
     const squareWidth = (half * 2) / squares;
-    for (let i = 0; i < squares; i += 1) {
-      const offset = -half + squareWidth * (i + 0.5);
-      ctx.fillStyle = i % 2 === 0 ? "#eee4cb" : "#2a2621";
-      ctx.save();
-      ctx.translate(start.x + start.nx * offset, start.y + start.ny * offset);
-      ctx.rotate(Math.atan2(start.ty, start.tx));
-      ctx.fillRect(-7, -squareWidth / 2, 14, squareWidth);
-      ctx.restore();
+    ctx.save();
+    ctx.translate(start.x, start.y); ctx.rotate(Math.atan2(start.ty, start.tx));
+    for (let row = 0; row < 2; row++) for (let i = 0; i < squares; i++) {
+      ctx.fillStyle = (i + row) % 2 === 0 ? "#eeeede" : "#17242c";
+      ctx.fillRect(-7 + row * 7, -half + i * squareWidth, 7, squareWidth);
     }
+    ctx.restore();
   }
 
-  #drawScenery(ctx) {
+
+  #drawScenery(ctx, clipBounds = null) {
     const obstacles = this.track.scenery ?? [];
     if (!obstacles.length) return;
-    const drawRoof = (ctx, width, height, roof, wall) => {
-      ctx.fillStyle = "rgba(12, 10, 8, 0.28)";
-      ctx.fillRect(-width * 0.48 + 5, -height * 0.48 + 7, width * 0.96, height * 0.96);
-      ctx.fillStyle = wall;
-      ctx.fillRect(-width * 0.5, -height * 0.5, width, height);
-      ctx.strokeStyle = "rgba(35, 27, 21, 0.85)";
-      ctx.lineWidth = 3;
-      ctx.strokeRect(-width * 0.5, -height * 0.5, width, height);
-      ctx.fillStyle = roof;
-      ctx.beginPath();
-      ctx.moveTo(-width * 0.56, -height * 0.08);
-      ctx.lineTo(0, -height * 0.62);
-      ctx.lineTo(width * 0.56, -height * 0.08);
-      ctx.lineTo(width * 0.56, height * 0.18);
-      ctx.lineTo(0, -height * 0.34);
-      ctx.lineTo(-width * 0.56, height * 0.18);
-      ctx.closePath();
-      ctx.fill();
-      ctx.stroke();
-    };
 
     for (const obstacle of obstacles) {
+      const bound = (Number(obstacle.visualRadius) || 24) + 12;
+      if (clipBounds && (obstacle.x + bound < clipBounds.minX || obstacle.x - bound > clipBounds.maxX
+        || obstacle.y + bound < clipBounds.minY || obstacle.y - bound > clipBounds.maxY)) continue;
       const scale = Math.max(0.4, Number(obstacle.scale) || 1);
-      const width = Math.max(12, Number(obstacle.width) || Number(obstacle.visualRadius) * 1.5 || 24);
-      const height = Math.max(12, Number(obstacle.height) || Number(obstacle.visualRadius) * 1.5 || 24);
       const visualRadius = Math.max(9, Number(obstacle.visualRadius) || 18);
       ctx.save();
       ctx.translate(obstacle.x, obstacle.y);
       ctx.rotate(Number(obstacle.angle) || 0);
+      if (obstacle.collisionShape === "box") {
+        paintBuilding(ctx, obstacle); ctx.restore(); continue;
+      }
       ctx.fillStyle = "rgba(7, 6, 5, 0.28)";
       ctx.beginPath();
       ctx.ellipse(5, 8, visualRadius * 0.92, visualRadius * 0.55, 0, 0, Math.PI * 2);
@@ -2061,19 +1911,6 @@ export class RaceRenderer {
           ctx.stroke();
           break;
         }
-        case "house":
-          drawRoof(ctx, width, height, "#695043", "#a28c6a");
-          break;
-        case "barn":
-          drawRoof(ctx, width, height, "#6c3c31", "#8b684f");
-          ctx.fillStyle = "#33251d";
-          ctx.fillRect(-width * 0.13, height * 0.08, width * 0.26, height * 0.42);
-          break;
-        case "workshop":
-          drawRoof(ctx, width, height, "#4e5556", "#716f66");
-          ctx.fillStyle = "#252b2c";
-          ctx.fillRect(width * 0.18, -height * 0.62, width * 0.14, height * 0.28);
-          break;
         case "tank": {
           ctx.fillStyle = "#62645d";
           ctx.strokeStyle = "#272925";
@@ -2087,36 +1924,6 @@ export class RaceRenderer {
           ctx.beginPath();
           ctx.arc(0, 0, visualRadius * 0.48, 0, Math.PI * 2);
           ctx.stroke();
-          break;
-        }
-        case "tower":
-        case "timingTower": {
-          ctx.fillStyle = obstacle.kind === "timingTower" ? "#665a49" : "#777269";
-          ctx.strokeStyle = "#292722";
-          ctx.lineWidth = 3;
-          ctx.fillRect(-width * 0.46, -height * 0.5, width * 0.92, height);
-          ctx.strokeRect(-width * 0.46, -height * 0.5, width * 0.92, height);
-          ctx.fillStyle = "#252a2d";
-          for (let row = -1; row <= 1; row += 1) {
-            ctx.fillRect(-width * 0.24, row * height * 0.22 - height * 0.07, width * 0.48, height * 0.12);
-          }
-          break;
-        }
-        case "grandstand": {
-          ctx.fillStyle = "#5f5548";
-          ctx.strokeStyle = "#28231e";
-          ctx.lineWidth = 3;
-          ctx.fillRect(-width * 0.5, -height * 0.5, width, height);
-          ctx.strokeRect(-width * 0.5, -height * 0.5, width, height);
-          for (let row = 0; row < 5; row += 1) {
-            ctx.strokeStyle = row % 2 ? "#9f8e69" : "#40372e";
-            ctx.lineWidth = 3;
-            const y = -height * 0.36 + row * height * 0.18;
-            ctx.beginPath();
-            ctx.moveTo(-width * 0.42, y);
-            ctx.lineTo(width * 0.42, y);
-            ctx.stroke();
-          }
           break;
         }
         default:
@@ -2140,67 +1947,30 @@ export class RaceRenderer {
     if (local) this.#drawCar(ctx, local, now);
   }
 
+  /** Draw cached chassis art; only temporary boost, heat and ram stay dynamic. */
   #drawCar(ctx, car, now) {
-    ctx.save();
-    ctx.translate(car.x, car.y);
-    ctx.rotate(car.angle);
-
-    if (car.id === this.localCarId) {
-      ctx.fillStyle = "rgba(255, 236, 164, 0.14)";
-      ctx.beginPath();
-      ctx.ellipse(0, 0, 31, 22, 0, 0, Math.PI * 2);
-      ctx.fill();
-    }
-
+    ctx.save(); ctx.translate(car.x, car.y); ctx.rotate(car.angle);
+    const bodyScale = clamp(Number(car.appearance?.halfLength) || 26, 18, 36) / 28;
+    const coreX = REAR_CORE_X * bodyScale;
+    if (car.id === this.localCarId) ctx.drawImage(this.vehicleSprites.halo, -38, -28, 76, 56);
     if (car.boost && !car.disabled) {
-      const pulse = 0.5 + 0.5 * Math.sin(now * 0.026 + car.x * 0.01);
-      const length = 40 + pulse * 11;
-      ctx.fillStyle = "rgba(75, 205, 243, 0.46)";
-      ctx.beginPath();
-      ctx.moveTo(-15, -9);
-      ctx.lineTo(-15 - length, 0);
-      ctx.lineTo(-15, 9);
-      ctx.closePath();
-      ctx.fill();
-      ctx.fillStyle = "rgba(184, 246, 255, 0.88)";
-      ctx.beginPath();
-      ctx.moveTo(-14, -4);
-      ctx.lineTo(-35 - pulse * 8, 0);
-      ctx.lineTo(-14, 4);
-      ctx.closePath();
-      ctx.fill();
+      const length = 44 + (0.5 + 0.5 * Math.sin(now * 0.026)) * 14;
+      ctx.drawImage(this.vehicleSprites.flame, coreX - 4 * bodyScale - length, -13, length, 26);
     }
-
-    ctx.fillStyle = car.disabled ? "#393633" : car.color;
-    ctx.strokeStyle = car.ram ? "#fff0aa" : "#171411";
-    ctx.lineWidth = car.ram ? 4 : 3;
-    ctx.beginPath();
-    ctx.moveTo(24, 0);
-    ctx.lineTo(9, -13);
-    ctx.lineTo(-15, -12);
-    ctx.lineTo(-23, -6);
-    ctx.lineTo(-23, 6);
-    ctx.lineTo(-15, 12);
-    ctx.lineTo(9, 13);
-    ctx.closePath();
-    ctx.fill();
-    ctx.stroke();
-
-    ctx.fillStyle = car.heat > 82 ? "#ff754d" : "#a8ebff";
-    ctx.beginPath();
-    ctx.arc(-1, 0, 6, 0, Math.PI * 2);
-    ctx.fill();
-
-    ctx.fillStyle = "#15120f";
-    ctx.fillRect(-12, -15, 8, 5);
-    ctx.fillRect(9, -15, 8, 5);
-    ctx.fillRect(-12, 10, 8, 5);
-    ctx.fillRect(9, 10, 8, 5);
+    this.vehicleSprites.drawSteeringWheels(ctx, car);
+    ctx.drawImage(this.vehicleSprites.get(car), -44, -32, 88, 64);
+    if (car.heat > 82 && !car.disabled) {
+      const glowSize = 18 * bodyScale;
+      ctx.drawImage(this.vehicleSprites.hotCore, coreX - glowSize / 2, -glowSize / 2, glowSize, glowSize);
+    }
+    if (car.ram && !car.disabled) {
+      const x = (car.appearance?.halfLength ?? 26) * 0.85;
+      const y = (car.appearance?.halfWidth ?? 14) * 0.8;
+      ctx.strokeStyle = "#ffe8a2"; ctx.lineWidth = 2.6;
+      ctx.beginPath(); ctx.moveTo(x - 3, -y); ctx.lineTo(x, 0); ctx.lineTo(x - 3, y); ctx.stroke();
+    }
     ctx.restore();
   }
-
-
-
 
   #drawCarLabels(ctx, cars, width, height, worldScale) {
     const verticalOffset = 31 * this.outputScale;
@@ -2335,22 +2105,7 @@ export class RaceRenderer {
     if (car.pitState === "exit") return "Пит-лейн · ограничение 60 км/ч";
     if (car.temporaryAutopilot) return "Временный автопилот";
     if (car.overheated) return "Ядро перегрето";
-    const angle = Number(car.angle) || 0;
-    const forwardX = Math.cos(angle);
-    const forwardY = Math.sin(angle);
-    const rightX = -forwardY;
-    const rightY = forwardX;
-    const vx = Number(car.vx) || 0;
-    const vy = Number(car.vy) || 0;
-    const forwardSpeed = vx * forwardX + vy * forwardY;
-    const lateralSpeed = vx * rightX + vy * rightY;
-    const slipDegrees = Math.abs(Math.atan2(lateralSpeed, Math.max(22, Math.abs(forwardSpeed)))) * 180 / Math.PI;
-    const speedKmh = Math.hypot(vx, vy) * (0.62 / 3);
-    const driftAmount = Number(car.driftAmount) || 0;
-    if (speedKmh > 70 && driftAmount > 0.18 && slipDegrees >= 14) {
-      return slipDegrees >= 34 ? "Срыв заноса: контррулите и отпустите газ" : `Управляемый занос · ${Math.round(slipDegrees)}°`;
-    }
-    return "";
+    return this.gripFeedback.update(car, performance.now());
   }
 
   #drawHudPanel(ctx, x, y, width, height, label, value, { valueColor = "#f2f6f7", valueSize = 16 } = {}) {
@@ -2422,8 +2177,8 @@ export class RaceRenderer {
     const timingY = margin + panelHeight + gap;
     const timingValues = [
       ["Текущий круг", formatRaceTime(Number(car.currentLapTime))],
-      ["Последний", formatRaceTime(Number(car.lastLapTime))],
-      ["Лучший", formatRaceTime(Number(car.bestLapTime))]
+      ["Последний", formatRaceTime(car.lastLapTime)],
+      ["Лучший", formatRaceTime(car.bestLapTime)]
     ];
     for (let index = 0; index < timingValues.length; index += 1) {
       const [label, value] = timingValues[index];

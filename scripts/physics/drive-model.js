@@ -2,6 +2,30 @@ const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 const angleWrap = (angle) => Math.atan2(Math.sin(angle), Math.cos(angle));
 const dot = (ax, ay, bx, by) => ax * bx + ay * by;
 
+/** Mechanical steering lock, independent of tyre grip. A high-grip tyre must
+ * not let a slow car pivot around a point inside its own wheelbase. */
+export function steeringLockAngle(physics) {
+  const rate = Number.isFinite(Number(physics?.steerRate)) ? Math.max(0, Number(physics.steerRate)) : 1.4;
+  return rate > 0 ? clamp(rate * .14, .20, .32) : 0;
+}
+
+function wheelbaseFor(physics) {
+  return Math.max(12, Number(physics?.wheelbase) || (Number(physics?.collisionHalfLength) || 25) * 33 / 28);
+}
+
+/** Shared racing tyre budget in world units/s². Speed support is deliberately
+ * milder than a modern F1 car, with a finite combined braking/cornering budget.
+ * Authority, prediction, garage estimates and bot planning use this function.
+ */
+export function lateralAccelerationBudget(physics, gripMultiplier = 1, longitudinalAcceleration = 0, speed = 0) {
+  const grip = Math.max(0.01, Number(physics?.lateralGrip) || 1);
+  const base = clamp(280 + grip * 20, 300, 500);
+  const speedSupport = 1 + .42 * Math.min(1.4, (Math.abs(speed) / 620) ** 2);
+  const longitudinalLoad = clamp(Math.abs(longitudinalAcceleration)
+    / Math.max(1, (Number(physics?.braking) || 1) * 1.5), 0, 0.98);
+  return base * speedSupport * Math.max(0.01, gripMultiplier) * Math.sqrt(Math.max(0.18, 1 - longitudinalLoad * longitudinalLoad));
+}
+
 /**
  * Deterministic kinematic core shared by the authoritative simulation and the
  * remote client's local prediction. The caller owns race-specific resources,
@@ -29,7 +53,8 @@ export function applyDriveModel(state, input, physics, dt, modifiers = {}) {
   const maxSpeed = Math.max(1, Number(p.maxSpeed) || 420);
   const accelerationPower = Math.max(0, Number(p.acceleration) || 0);
   const reverseAcceleration = Math.max(0, Number(p.reverseAcceleration) || 0);
-  const brakingPower = Math.max(0, Number(p.braking) || 0);
+  const brakingPower = Math.max(0, Number(p.braking) || 0)
+    * (Number.isFinite(Number(modifiers.brakingMultiplier)) ? clamp(Number(modifiers.brakingMultiplier), 0.05, 1.5) : 1);
   const steerRate = Math.max(0, Number(p.steerRate) || 0);
   const recovery = Math.max(0.01, Number(p.recovery) || 1);
   const spinResistance = Math.max(0.01, Number(p.spinResistance) || 1);
@@ -46,7 +71,9 @@ export function applyDriveModel(state, input, physics, dt, modifiers = {}) {
   const forwardSpeedBeforeAcceleration = forwardSpeed;
 
   const speedRatio = clamp(Math.abs(forwardSpeed) / maxSpeed, 0, 1.4);
-  const lowSpeedAuthority = clamp(Math.abs(forwardSpeed) / 72, 0.22, 1.04);
+  // Intentional drift retains its speed-dependent yaw response. Ordinary
+  // steering uses wheelbase and front-wheel geometry below.
+  const lowSpeedAuthority = clamp(Math.abs(forwardSpeed) / 72, 0, 1.04);
   // High-speed cornering should demand commitment. The raw steer rate still
   // defines how lively a chassis feels, but as speed climbs the available yaw
   // authority now falls off in a way that better rewards handling and control.
@@ -66,48 +93,75 @@ export function applyDriveModel(state, input, physics, dt, modifiers = {}) {
   const boostTopSpeedMultiplier = Math.max(0.01, Number(modifiers.boostTopSpeedMultiplier) || 1);
   const extraAcceleration = Number(modifiers.extraAcceleration) || 0;
 
-  let acceleration = extraAcceleration;
-  if (input.throttle > 0) {
+  const wantsReverse = Boolean(input.reverse) || input.throttle < 0;
+  // S while W is held means braking, not competing engine/reverse torque.
+  // Releasing W still lets a held S engage reverse after stopping.
+  const brakeRequested = Boolean(input.brake) || (wantsReverse && input.throttle > 0);
+  const brakingForReverse = wantsReverse && forwardSpeed > 7;
+  const applyingBrake = brakeRequested || brakingForReverse;
+  let acceleration = applyingBrake ? Math.min(0, extraAcceleration) : extraAcceleration;
+  if (input.throttle > 0 && !wantsReverse && !applyingBrake) {
     acceleration += input.throttle * accelerationPower * (1 - speedRatio * 0.38) * accelerationMultiplier;
   }
 
-  const wantsReverse = Boolean(input.reverse) || input.throttle < 0;
-  const brakingForReverse = wantsReverse && forwardSpeed > 7;
-  if (wantsReverse && !brakingForReverse) {
+  if (wantsReverse && !applyingBrake) {
     acceleration -= reverseAcceleration * clamp(1 - Math.abs(forwardSpeed) / (maxSpeed * 0.3), 0.25, 1);
   }
 
-  if (input.brake || brakingForReverse) {
+  if (applyingBrake) {
     acceleration -= Math.sign(forwardSpeed || 1) * brakingPower;
   }
 
-  if (boostAccelerationMultiplier > 0) {
+  if (boostAccelerationMultiplier > 0 && !applyingBrake && !wantsReverse) {
     acceleration += accelerationPower * boostAccelerationMultiplier;
   }
 
   forwardSpeed += acceleration * step;
+  if (applyingBrake
+    && (forwardSpeedBeforeAcceleration === 0 || forwardSpeed * forwardSpeedBeforeAcceleration < 0)) forwardSpeed = 0;
   const maxForward = maxSpeed * topSpeedMultiplier * boostTopSpeedMultiplier;
   const speedLimit = Number.isFinite(Number(modifiers.speedLimit)) ? Math.max(0, Number(modifiers.speedLimit)) : Infinity;
   const speedLimitDeceleration = Math.max(0, Number(modifiers.speedLimitDeceleration) || 0);
   const reverseSpeedMultiplier = clamp(Number(modifiers.reverseSpeedMultiplier) || 0.26, 0.05, 1);
   const limitedForward = Math.min(maxForward, speedLimit);
 
-  if (Number.isFinite(speedLimit) && forwardSpeedBeforeAcceleration > limitedForward && forwardSpeed > limitedForward) {
-    // A pit-lane limiter must bleed speed away instead of deleting it in one
-    // physics tick. Positive throttle cannot cancel this deceleration, while
-    // active braking is still allowed to slow the car more aggressively.
-    const softenedSpeed = Math.max(limitedForward, forwardSpeedBeforeAcceleration - speedLimitDeceleration * step);
+  if (forwardSpeedBeforeAcceleration > limitedForward && forwardSpeed > limitedForward) {
+    // A lower engine ceiling removes thrust, not stored momentum. Ordinary
+    // drag and terrain resistance bleed off boost/thermal overspeed naturally.
+    // The pit limiter adds its explicit deceleration; braking can still win.
+    const limiterDeceleration = speedLimit <= maxForward ? speedLimitDeceleration : 0;
+    const softenedSpeed = Math.max(limitedForward, forwardSpeedBeforeAcceleration - limiterDeceleration * step);
     forwardSpeed = Math.min(forwardSpeed, softenedSpeed);
   } else {
     forwardSpeed = Math.min(forwardSpeed, limitedForward);
   }
-  forwardSpeed = Math.max(-maxSpeed * reverseSpeedMultiplier, forwardSpeed);
+  const reverseLimit = -maxSpeed * reverseSpeedMultiplier;
+  forwardSpeed = Math.max(forwardSpeed, Math.min(reverseLimit, forwardSpeedBeforeAcceleration));
+  // Grip sharing follows the actual longitudinal drive/brake force after
+  // limiting, rather than a throttle request that no longer produces thrust.
+  acceleration = step > 0 ? (forwardSpeed - forwardSpeedBeforeAcceleration) / step : 0;
 
-  let steering = clamp(Number(input.steer) || 0, -1, 1);
+  // Steering must use motion remaining after passive resistance. Computing yaw
+  // from a pre-drag speed allowed a creeping/stalled car to rotate even when
+  // rolling resistance removed all of its displacement later in the same tick.
+  const drag = longitudinalDrag * speedRatio * speedRatio * Math.sign(forwardSpeed);
+  forwardSpeed -= drag * 55 * step;
+  if (Math.abs(forwardSpeed) > 0) {
+    const rolling = Math.min(Math.abs(forwardSpeed), rollingDrag * step);
+    forwardSpeed -= Math.sign(forwardSpeed) * rolling;
+  }
+
+  const requestedSteering = clamp(Number(input.steer) || 0, -1, 1);
+  const rackResponse = (0.045 + speedRatio * 0.035)
+    * Math.pow(clamp((Number(p.mass) || 1200) / 1200, 0.5, 2), 0.25)
+    * (modifiers.smoothSteer ? 0.85 : 1);
+  const rack = Number(state.steeringPosition) || 0;
+  let steering = rack + (requestedSteering - rack) * (1 - Math.exp(-step / rackResponse));
+  state.steeringPosition = steering;
   if (Math.abs(steering) < 0.025) steering = 0;
   const previousSteer = Number(modifiers.previousSteer ?? state.lastSteer) || 0;
-  const changedDirection = Math.sign(steering) !== Math.sign(previousSteer)
-    && Math.abs(previousSteer) > 0.42 && Math.abs(steering) > 0.42;
+  const changedDirection = Math.sign(requestedSteering) !== Math.sign(previousSteer)
+    && Math.abs(previousSteer) > 0.42 && Math.abs(requestedSteering) > 0.42;
 
   const driftEnabled = modifiers.driftEnabled !== false;
   const driftAssist = clamp(Number(modifiers.driftAssist) || 1, 0.75, 1.8);
@@ -156,9 +210,22 @@ export function applyDriveModel(state, input, physics, dt, modifiers = {}) {
   const counterSteering = driftAmount > 0.04 && steering * driftDirection < -0.10;
   const sameDirectionSteering = driftAmount > 0.04 && steering * driftDirection > 0.10;
   const driftYawMultiplier = 1 - driftAmount * 0.28 + (enteringDrift ? driftAmount * 0.06 : 0);
-  state.angularVelocity = (Number(state.angularVelocity) || 0)
-    + steering * steerRate * steerAuthority * steeringMultiplier * yawResponseMultiplier
-      * driftYawMultiplier * directionSign * step * 5.2;
+  const wheelbase = wheelbaseFor(p);
+  const wheelLock = clamp(steeringLockAngle(p) * steeringMultiplier, 0, .55);
+  const geometricYaw = forwardSpeed / wheelbase * Math.tan(steering * wheelLock);
+  const steeringActive = Math.abs(requestedSteering) > .001 || Math.abs(state.steeringPosition) > .001
+    || Math.abs(previousSteer) > .001;
+  if (driftAmount > .04) {
+    state.angularVelocity = (Number(state.angularVelocity) || 0)
+      + steering * steerRate * steerAuthority * steeringMultiplier * yawResponseMultiplier
+        * driftYawMultiplier * directionSign * step * (5.2 + 2.6 * (1 - driftAmount));
+  } else {
+    // Bicycle steering: yaw = v / wheelbase * tan(front-wheel angle). Grip
+    // limits the fast corner, wheel geometry limits the slow manoeuvre.
+    const response = clamp(7.5 * recovery * angularDampingMultiplier * yawResponseMultiplier
+      / Math.sqrt(spinResistance) / Math.pow(clamp((Number(p.mass) || 1200) / 1200, .5, 2), .25), 2, 18);
+    state.angularVelocity = geometricYaw + ((Number(state.angularVelocity) || 0) - geometricYaw) * Math.exp(-response * step);
+  }
 
   if (driftAmount > 0) {
     const throttle = clamp(Number(input.throttle) || 0, 0, 1);
@@ -173,7 +240,19 @@ export function applyDriveModel(state, input, physics, dt, modifiers = {}) {
   const baseAngularDamping = 4.7 * spinResistance * recovery * angularDampingMultiplier;
   const driftDampingScale = 1 - driftAmount * 0.48;
   const counterDamping = counterSteering ? (1.9 + driftControl * 2.25) * driftAmount : 0;
-  state.angularVelocity *= Math.exp(-(baseAngularDamping * driftDampingScale + counterDamping) * step);
+  if (driftAmount > .04) state.angularVelocity *= Math.exp(-(baseAngularDamping * driftDampingScale + counterDamping) * step);
+  // A finite tyre-force budget makes fast corners open out. Acceleration and
+  // braking consume part of that budget, so slowing before a turn matters.
+  const lateralAccelerationLimit = lateralAccelerationBudget(p, gripMultiplier, acceleration, forwardSpeed);
+  const yawLimit = lateralAccelerationLimit / Math.max(32, Math.abs(forwardSpeed)) * (1 + driftAmount * 0.65);
+  const geometryLimit = Math.abs(forwardSpeed) / wheelbase * Math.tan(wheelLock);
+  const ordinaryLimit = steeringActive ? Math.min(yawLimit, geometryLimit) : yawLimit;
+  const supportedYaw = clamp(state.angularVelocity, -(driftAmount > .04 ? yawLimit : ordinaryLimit), driftAmount > .04 ? yawLimit : ordinaryLimit);
+  // Ordinary steering respects the wheel/tyre ceiling. With a neutral rack,
+  // external angular momentum instead decays through the time-based response
+  // above; even an infinitesimal tick must not instantly truncate an impact.
+  if (driftAmount > .04) state.angularVelocity += (supportedYaw - state.angularVelocity) * (1 - Math.exp(-step * 12));
+  else if (steeringActive) state.angularVelocity = supportedYaw;
   const inertialVx = forwardX * forwardSpeed + rightX * lateralSpeed;
   const inertialVy = forwardY * forwardSpeed + rightY * lateralSpeed;
   state.angle = angleWrap((Number(state.angle) || 0) + state.angularVelocity * step);
@@ -195,15 +274,17 @@ export function applyDriveModel(state, input, physics, dt, modifiers = {}) {
     lateralSpeed += outwardDirection * Math.abs(forwardSpeed) * driftAmount * throttleSlip * step * 0.014;
   }
 
-  const brakeGripMultiplier = (input.brake || brakingForReverse)
+  const brakeGripMultiplier = applyingBrake
     ? Math.max(0.01, Number(modifiers.brakeGripMultiplier) || 1)
     : 1;
   const gripBase = lateralGrip * gripMultiplier;
   const driftGripRetention = 1 - driftAmount * (counterSteering ? 0.28 : 0.52);
-  const controlledGrip = gripBase * Math.max(0.12, driftGripRetention)
-    * (counterSteering ? 1 + (driftControl - 1) * 0.34 : 1);
+  const roadHolding = 1 + .95 * (1 - driftAmount);
+  const controlledGrip = gripBase * roadHolding * Math.max(0.12, driftGripRetention)
+    * (counterSteering ? 1.15 + (driftControl - 1) * 0.34 : 1);
   const lateralDamping = 1 - Math.exp(-controlledGrip * brakeGripMultiplier * step);
-  lateralSpeed *= 1 - lateralDamping;
+  const lateralCorrection = clamp(lateralSpeed * lateralDamping, -lateralAccelerationLimit * step, lateralAccelerationLimit * step);
+  lateralSpeed -= lateralCorrection;
 
   const transferFactor = modifiers.smoothSteer && changedDirection ? 0.68 : 1;
   const driftCornerRelief = 1 - driftAmount * 0.34;
@@ -222,13 +303,6 @@ export function applyDriveModel(state, input, physics, dt, modifiers = {}) {
     state.angularVelocity += spinDirection * spinExcess * (0.85 + speedRatio * 1.15)
       / Math.sqrt(Math.max(0.35, spinResistance)) * step;
     driftAmount = Math.max(driftAmount, 0.68 + spinExcess * 0.32);
-  }
-
-  const drag = longitudinalDrag * speedRatio * speedRatio * Math.sign(forwardSpeed);
-  forwardSpeed -= drag * 55 * step;
-  if (Math.abs(forwardSpeed) > 0) {
-    const rolling = Math.min(Math.abs(forwardSpeed), rollingDrag * step);
-    forwardSpeed -= Math.sign(forwardSpeed) * rolling;
   }
 
   state.vx = updatedForwardX * forwardSpeed + updatedRightX * lateralSpeed;

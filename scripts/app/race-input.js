@@ -198,7 +198,7 @@ export class RaceInput {
 
   #syncFocusNotice() {
     if (!this.focusNotice) return;
-    const lost = this.isRaceActive() && document.activeElement !== this.target;
+    const lost = Boolean(this.getLocalCarId()) && this.isRaceActive() && document.activeElement !== this.target;
     this.focusNotice.classList.toggle("is-visible", lost);
     this.focusNotice.setAttribute("aria-hidden", String(!lost));
     this.focusNotice.setAttribute("tabindex", lost ? "0" : "-1");

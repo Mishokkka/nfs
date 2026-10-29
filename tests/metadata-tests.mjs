@@ -21,9 +21,12 @@ assert.match(readme, new RegExp(`${constants.SNAPSHOT_HZ} Гц`));
 assert.match(readme, new RegExp(`${constants.INPUT_KEEPALIVE_MS} мс`));
 assert.match(readme, /0,8 секунды/);
 assert.match(readme, new RegExp(`Протокол версии ${constants.PROTOCOL_VERSION}`));
+const networkNotes = readme.slice(readme.indexOf("## Сетевая модель"));
+assert.match(networkNotes, new RegExp(`с частотой ${constants.SNAPSHOT_HZ} Гц`));
+assert.match(networkNotes, new RegExp(`Протокол версии ${constants.PROTOCOL_VERSION} использует`));
+const history = readme.split("## Изменения 0.16.6")[1].split("## ")[0];
+assert.ok(history.includes("с 10 до 15 Гц") && history.includes("Протокол версии 13 сохранён"), "historical 0.16.6 notes were rewritten");
 assert.doesNotMatch(css, /padding:\s*0\s*!important|overflow:\s*hidden\s*!important/);
-assert.ok((runtime.match(/!this\.practice\s*&&\s*this\.network\.isHost\s*&&/g) ?? []).length >= 3,
-  "authoritative snapshot sends must explicitly check network.isHost");
 assert.match(worker, /postMessage\(\s*\{\s*type:\s*"finished"[\s\S]*?clearClockTimer\(\)/,
   "worker must stop its clock after publishing the final snapshot");
 

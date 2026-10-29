@@ -49,12 +49,12 @@ assert.equal(constants.SNAPSHOT_HZ, 30, "authoritative network snapshots must ru
 const runtimeSource = await fs.readFile(path.join(root, "scripts/app/race-runtime.js"), "utf8");
 assert.match(
   runtimeSource,
-  /networkRenderDelay:\s*this\.isHost\s*\?\s*0\.032\s*:\s*0\.08/,
-  "remote presentation delay regressed above the 80 ms target"
+  /networkRenderDelay:\s*this\.isHost\s*\?\s*0\.032\s*:\s*0\.06/,
+  "remote presentation delay regressed above the 60 ms base target"
 );
 assert.match(
   runtimeSource,
-  /if \(!this\.practice && this\.network\.isHost\) \{[\s\S]*?this\.network\.sendSnapshot\(message\.snapshot\);[\s\S]*?\}/,
+  /if \(!this\.practice && this\.network\.isHost\) \{[\s\S]*?this\.network\.sendSnapshot\(message\.snapshot, \{ generatedAt: message\.generatedAt \}\);[\s\S]*?\}/,
   "worker snapshots are no longer forwarded directly to the network"
 );
 assert.match(
