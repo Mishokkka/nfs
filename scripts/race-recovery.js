@@ -32,10 +32,12 @@ export class RaceRecoveryStore {
       if (!text || text.length * 2 > MAX_BYTES) return null;
       const saved = JSON.parse(text);
       if (saved.version !== VERSION || saved.protocol !== PROTOCOL_VERSION || saved.userId !== game.user.id
+        || (lease?.protocol != null && lease.protocol !== PROTOCOL_VERSION)
         || !Number.isFinite(saved.savedAt) || Date.now() - saved.savedAt < -10_000
         || Date.now() - saved.savedAt > MAX_AGE_MS || !lease?.raceId
         || saved.race?.raceId !== lease.raceId || saved.race?.hostId !== game.user.id
         || saved.lobby?.id !== lease.lobbyId || saved.lobby?.hostEpoch !== lease.hostEpoch
+        || (saved.lobby?.hostInstanceId ?? null) !== (lease.hostInstanceId ?? null)
         || lease.hostId !== game.user.id || saved.race.phase !== "race") return null;
       return saved;
     } catch (_) { return null; }

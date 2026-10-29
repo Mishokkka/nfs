@@ -15,6 +15,7 @@ let snapshotFlowControl = false;
 let snapshotSequence = 0;
 let awaitingSnapshotId = null;
 let snapshotPending = false;
+let compactSnapshots = false;
 
 const fixedDt = 1 / PHYSICS_HZ;
 const tickIntervalMs = 1000 / PHYSICS_HZ;
@@ -37,8 +38,8 @@ function publishSnapshot({ force = false, flush = false } = {}) {
   if (simulation.finished && !finishedPublished) {
     finishedPublished = true;
     snapshotPending = false;
-    const snapshot = simulation.snapshot();
-    self.postMessage({ type: "finished", raceId, snapshot, generatedAt: performance.timeOrigin + performance.now() });
+    const snapshot = simulation.snapshot({ includeMetadata: !compactSnapshots });
+    self.postMessage({ type: "finished", raceId, snapshot, compact: compactSnapshots, generatedAt: performance.timeOrigin + performance.now() });
     clearClockTimer();
     return;
   }
@@ -48,11 +49,11 @@ function publishSnapshot({ force = false, flush = false } = {}) {
     snapshotPending = true;
     return;
   }
-  const snapshot = simulation.snapshot();
+  const snapshot = simulation.snapshot({ includeMetadata: !compactSnapshots });
   const stateEvent = snapshotFlowControl && awaitingSnapshotId !== null;
   const snapshotId = stateEvent ? null : ++snapshotSequence;
   if (snapshotFlowControl && !stateEvent) awaitingSnapshotId = snapshotId;
-  self.postMessage({ type: stateEvent ? "state" : "snapshot", raceId, snapshot, snapshotId,
+  self.postMessage({ type: stateEvent ? "state" : "snapshot", raceId, snapshot, snapshotId, compact: compactSnapshots,
     generatedAt: performance.timeOrigin + performance.now() });
 }
 
@@ -116,6 +117,7 @@ function stopClock() {
   snapshotSequence = 0;
   awaitingSnapshotId = null;
   snapshotPending = false;
+  compactSnapshots = false;
 }
 
 self.addEventListener("message", (event) => {
@@ -136,6 +138,8 @@ self.addEventListener("message", (event) => {
         if (message.checkpoint) simulation.restoreCheckpoint(message.checkpoint, { resetInputs: true });
         checkpoints = message.checkpoints === true;
         snapshotFlowControl = message.snapshotFlowControl === true;
+        compactSnapshots = message.compactSnapshots === true;
+        if (compactSnapshots) self.postMessage({ type: "metadata", raceId, cars: simulation.carMetadata() });
         finishedPublished = false;
         startClock();
         publishSnapshot({ force: true });

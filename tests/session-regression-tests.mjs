@@ -391,4 +391,156 @@ const setup = () => {
   nextReload.destroy(); reloaded.destroy(); player.destroy();
 }
 
-console.log("session-regression-tests: ok (F5 authority restore, packet fencing, coalescing, isolation, garage, worker authority, reordered reconnect, explicit spectator resume)");
+// A player's F5 keeps the race ID but must retire its old input namespace.
+// Late input/ready/claim packets cannot poison the new small sequence numbers.
+{
+  const {host,player}=setup(),assignments=[];
+  const simulation=new RaceSimulation({track:generateTrack(88201,2),entries:host.activeRace.entries});
+  host.on('input',m=>simulation.setInput(m.carId,m.input,m.sequence));
+  let claims=0;
+  host.on('claimControl',m=>{claims++;simulation.claimControl(m.carId);});
+  player.on('controlAssignment',m=>assignments.push(m));
+  as('player',()=>player.beginControlSession('car-player'));
+  as('player',()=>player.requestControlAssignment());
+  assert.equal(claims,1,'assignment was confirmed before establishing the host input window');
+  assert.equal(assignments.length,1);
+  as('player',()=>player.sendInput('car-player',{throttle:1,steer:1},500));advance(20);
+  const oldInput=structuredClone(sent.findLast(m=>m.type==='race-input'));
+  const oldReady=structuredClone(sent.findLast(m=>m.type==='race-ready'));
+  const car=simulation.cars.find(c=>c.id==='car-player');
+  assert.equal(car.lastInputSequence,500);
+  player.destroy();advance(300);
+  const reloaded=makeNetwork('player');
+  as('player',()=>reloaded.requestState());
+  assert.equal(claims,1,'state discovery implicitly reclaimed the car');
+  as('player',()=>reloaded.beginControlSession('car-player'));
+  as('player',()=>reloaded.requestControlAssignment());
+  assert.equal(claims,2);
+  as('player',()=>reloaded.sendInput('car-player',{throttle:1,steer:-1},1));advance(20);
+  const freshInput=sent.findLast(m=>m.type==='race-input');
+  assert.notEqual(freshInput.controlSession,oldInput.controlSession);
+  assert.equal(car.lastInputSequence,1);
+  as('player',()=>game.socket.emit('test',{...oldInput,id:'late-prior-input',sequence:501}));
+  advance(300);
+  as('player',()=>game.socket.emit('test',{...oldReady,id:'late-prior-ready'}));
+  as('player',()=>game.socket.emit('test',{...oldReady,type:'claim-control',id:'late-prior-claim'}));
+  as('player',()=>reloaded.sendInput('car-player',{throttle:.3,steer:-.5},2));advance(20);
+  assert.equal(car.lastInputSequence,2,'prior connection poisoned the new input sequence');
+  assert.equal(car.currentInput.steer,-.5);
+  assert.equal(claims,2,'retired control claim reopened the host sequence');
+  advance(300);
+  as('player',()=>reloaded.requestControlAssignment());
+  assert.equal(claims,2,'duplicate current assignment reset live control');
+  assert.equal(car.lastInputSequence,2);
+  // A delayed assignment for the old namespace cannot confirm a new runtime.
+  let confirmed=0;reloaded.on('controlAssignment',()=>confirmed++);
+  const priorAssignment=sent.find(m=>m.type==='control-assignment'&&m.controlSession===oldInput.controlSession);
+  as('host',()=>game.socket.emit('test',{...priorAssignment,id:'late-prior-assignment'}));
+  assert.equal(confirmed,0);
+  host.destroy();reloaded.destroy();
+}
+
+// A queued world-setting write must recheck its owner before issuing I/O.
+// Otherwise a GM who has already lost authority can invalidate the winner's F5.
+{
+  await new Promise(resolve=>setImmediate(resolve));
+  const {host,player}=setup();
+  const oldRace=host.raceId;
+  users.set('winner',{id:'winner',name:'Winner',isGM:true,active:true});
+  const lobby={...host.lobby,hostId:'winner',hostEpoch:1,hostClaimedAt:Date.now(),hostClaimId:'winning-claim',phase:'lobby'};
+  const winnerLease={raceId:'winner-race',lobbyId:lobby.id,hostId:'winner',hostEpoch:1};
+  as('winner',()=>game.socket.emit('test',{type:'host-claim',id:'new-authority-before-write',protocolVersion:host.activeRace.protocolVersion,
+    senderId:'winner',sentAt:Date.now(),lobby,abortRace:true,abortedRaceId:oldRace}));
+  settingsState.set('raceSession',winnerLease);
+  await host.sessionWrite;
+  assert.deepEqual(settingsState.get('raceSession'),winnerLease,'obsolete GM overwrote the current world lease');
+  host.destroy();player.destroy();users.delete('winner');
+}
+
+// Superseding queued operations must still persist a newly started race, and
+// an explicit close must clear its own lease even after lobby becomes null.
+{
+  settingsState.delete('raceSession');
+  const {host,player}=setup();
+  const entries=host.activeRace.entries;
+  as('host',()=>host.stopRace());
+  as('host',()=>host.startRace(entries));
+  await host.sessionWrite;
+  assert.equal(settingsState.get('raceSession').raceId,host.raceId);
+  as('host',()=>host.closeLobby());
+  await host.sessionWrite;
+  assert.deepEqual(settingsState.get('raceSession'),{});
+  host.destroy();player.destroy();
+}
+
+// A newer durable owner can be visible before its socket claim arrives. The
+// equal-epoch tie-break must agree with lobby election, not just compare epochs.
+for(const epoch of [0,1]) {
+  settingsState.delete('raceSession');
+  const {host,player}=setup();
+  const durable={raceId:'durable-winner',protocol:host.activeRace.protocolVersion,lobbyId:host.lobby.id,
+    hostId:'winner',hostInstanceId:'winner-instance',hostEpoch:epoch,hostClaimedAt:1,hostClaimId:'winner'};
+  settingsState.set('raceSession',durable);
+  await host.sessionWrite;
+  assert.deepEqual(settingsState.get('raceSession'),durable,'pending write defeated the durable owner');
+  host.destroy();player.destroy();
+}
+
+// A resumed race-state may precede the replacement host metadata. Existing
+// lobby knowledge must not make that reply disappear permanently.
+for(const claimFirst of [false,true]) {
+  settingsState.delete('raceSession');
+  const {host,player}=setup(),previous=player.raceId;
+  const lobby={...host.lobby,hostEpoch:1,hostInstanceId:'replacement-instance',hostClaimedAt:1,hostClaimId:'replacement'};
+  const race={...host.activeRace,raceId:'replacement-race',hostInstanceId:lobby.hostInstanceId};
+  const meta={senderId:'host',sentAt:Date.now(),protocolVersion:race.protocolVersion,hostEpoch:1,hostInstanceId:lobby.hostInstanceId};
+  as('host',()=>game.socket.emit('test',{...meta,type:'race-state',id:'resumed-state-first',targetId:'player',lobbyId:lobby.id,race,frame:null,results:null}));
+  assert.equal(player.raceId,previous,'unconfirmed ownership was accepted');
+  if(claimFirst)as('host',()=>game.socket.emit('test',{...meta,type:'host-claim',id:'resumed-claim-later',lobby,abortRace:true,abortedRaceId:previous}));
+  as('host',()=>game.socket.emit('test',{...meta,type:'lobby-state',id:'resumed-owner-later',lobby}));
+  assert.equal(player.raceId,race.raceId,'replacement state was lost before its ownership metadata');
+  assert.equal(player.pendingRaceState,null);
+  host.destroy();player.destroy();
+}
+
+// The same GM account in two tabs must have exactly one simulation owner.
+// A secondary tab spectates, including when the original owner resumes via F5.
+{
+  settingsState.delete('raceSession');
+  const previousWorker=globalThis.Worker;let liveWorkers=0;
+  globalThis.Worker=class {
+    constructor(){liveWorkers++;this.alive=true;}
+    addEventListener(){}removeEventListener(){}postMessage(){}
+    terminate(){if(this.alive){liveWorkers--;this.alive=false;}}
+  };
+  const {host,player}=setup(),duplicate=makeNetwork('host');
+  const primaryApp=as('host',()=>new BigRacesApp(host));
+  const secondaryApp=as('host',()=>new BigRacesApp(duplicate));
+  as('host',()=>duplicate.requestState());
+  assert.equal(as('host',()=>duplicate.isHost),false);
+  assert.equal(secondaryApp.runtime.localCarId,null);
+  const entries=host.activeRace.entries;
+  as('host',()=>host.stopRace());as('host',()=>host.startRace(entries));
+  assert.equal(liveWorkers,1,'a second GM tab forked the authoritative simulation');
+  assert.equal(primaryApp.runtime.isHost,true);assert.equal(secondaryApp.runtime.isHost,false);
+  assert.equal(secondaryApp.runtime.localCarId,null,'secondary GM tab claimed the primary driver');
+  await host.sessionWrite;
+  const simulation=new RaceSimulation({...host.activeRace.config,track:generateTrack(88201,2),entries});
+  as('host',()=>host.saveRecoveryCheckpoint(JSON.stringify(simulation.exportCheckpoint())));
+  as('host',()=>primaryApp.shutdown());host.destroy();
+  assert.equal(liveWorkers,0);
+  const resumed=makeNetwork('host'),resumedApp=as('host',()=>new BigRacesApp(resumed));
+  assert.equal(as('host',()=>resumed.restoreSavedRace()),true);
+  await resumed.sessionWrite;
+  assert.equal(liveWorkers,1,'F5 created competing workers in the other GM tab');
+  assert.equal(resumedApp.runtime.isHost,true);
+  assert.equal(secondaryApp.runtime.isHost,false);
+  assert.equal(secondaryApp.runtime.localCarId,null);
+  assert.notEqual(resumed.lobby.hostInstanceId,host.instanceId);
+  as('host',()=>resumed.stopRace());resumedApp.shutdown();secondaryApp.shutdown();
+  resumed.destroy();duplicate.destroy();player.destroy();
+  assert.equal(liveWorkers,0);
+  if(previousWorker===undefined)delete globalThis.Worker;else globalThis.Worker=previousWorker;
+}
+
+console.log("session-regression-tests: ok (single host instance, F5 restore, world-lease fencing, control sessions, coalescing, isolation, garage, worker authority, reordered reconnect, explicit spectator resume)");

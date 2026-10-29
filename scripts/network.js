@@ -24,6 +24,8 @@ const MESSAGE_SESSION = (() => {
   }
 })();
 let messageCounter = 0;
+let controlSessionCounter = 0;
+let networkInstanceCounter = 0;
 function messageId() {
   messageCounter = (messageCounter + 1) % Number.MAX_SAFE_INTEGER;
   return `${game.user.id}:${MESSAGE_SESSION}:${messageCounter}`;
@@ -48,18 +50,18 @@ const MESSAGE_SIZE_LIMITS = Object.freeze({
 });
 
 const MESSAGE_META_FIELDS = Object.freeze([
-  "type", "protocolVersion", "id", "senderId", "sentAt", "hostEpoch"
+  "type", "protocolVersion", "id", "senderId", "sentAt", "hostEpoch", "hostInstanceId"
 ]);
 
 const SMALL_MESSAGE_SCHEMAS = Object.freeze({
   "race-ready": {
-    required: ["lobbyId", "raceId", "userId", "carId"]
+    required: ["lobbyId", "raceId", "userId", "carId", "controlSession"]
   },
   "control-assignment": {
-    required: ["targetId", "lobbyId", "raceId", "userId", "carId"]
+    required: ["targetId", "lobbyId", "raceId", "userId", "carId", "controlSession"]
   },
   "claim-control": {
-    required: ["lobbyId", "raceId", "userId", "carId"]
+    required: ["lobbyId", "raceId", "userId", "carId", "controlSession"]
   },
   "leave-race": {
     required: ["lobbyId", "raceId", "userId", "carId"]
@@ -78,6 +80,7 @@ const STRING_FIELD_LIMITS = Object.freeze({
   raceId: 120,
   userId: 80,
   carId: 80,
+  controlSession: 80,
   word: 80,
   attemptId: 80
 });
@@ -120,7 +123,7 @@ function boundedStringArray(value, limit = 80) {
     && value.every((entry) => boundedString(entry, limit));
 }
 
-/** Validate the fixed 39-field protocol-18 row before reading positional fields. */
+/** Validate the fixed 39-field protocol-19 row before reading positional fields. */
 function compactRaceRowFitsSchema(row) {
   if (!Array.isArray(row) || row.length !== 39 || !boundedString(row[0], 80)) return false;
   for (let index = 1; index < row.length; index += 1) {
@@ -211,7 +214,7 @@ function smallMessageFitsSchema(message, schema) {
   if (!Object.keys(message).every((key) => allowed.has(key))) return false;
   if (!Number.isFinite(message.sentAt) || !Number.isInteger(message.protocolVersion)) return false;
   for (const field of [...MESSAGE_META_FIELDS, ...schema.required]) {
-    if (field === "protocolVersion" || field === "sentAt" || field === "hostEpoch") continue;
+    if (field === "protocolVersion" || field === "sentAt" || field === "hostEpoch" || field === "hostInstanceId") continue;
     const value = message[field];
     const limit = STRING_FIELD_LIMITS[field] ?? 120;
     if (typeof value !== "string" || value.length === 0 || value.length > limit) return false;
@@ -222,17 +225,19 @@ function smallMessageFitsSchema(message, schema) {
 function messageFitsLimit(message) {
   if (!message || typeof message !== "object" || Array.isArray(message)) return false;
   if (message.hostEpoch != null && (!Number.isSafeInteger(message.hostEpoch) || message.hostEpoch < 0)) return false;
+  if (message.hostInstanceId != null && !boundedString(message.hostInstanceId, 80)) return false;
   // Compact race frames have a fixed, shallow shape whose maximum encoded size
   // is bounded by the participant count and two 80-character nullable fields per
   // row. Validate that structure directly instead of JSON.stringify-ing every
   // 30 Hz snapshot again on every receiving client.
   if (message.type === "race-frame") return raceFrameMessageFitsSchema(message);
   if (message.type === "race-input") {
-    const allowed = new Set([...MESSAGE_META_FIELDS, "lobbyId", "raceId", "userId", "carId", "input", "sequence"]);
+    const allowed = new Set([...MESSAGE_META_FIELDS, "lobbyId", "raceId", "userId", "carId", "controlSession", "input", "sequence"]);
     const inputKeys = message.input && typeof message.input === "object" && !Array.isArray(message.input)
       ? Object.keys(message.input)
       : [];
     return Boolean(message.carId && inputKeys.length > 0)
+      && boundedString(message.controlSession, STRING_FIELD_LIMITS.controlSession)
       && Object.keys(message).every((key) => allowed.has(key))
       && inputKeys.length <= RACE_INPUT_FIELDS.size
       && inputKeys.every((key) => RACE_INPUT_FIELDS.has(key))
@@ -453,7 +458,7 @@ function normalizeRaceFrame(raw, race) {
 const PIT_STATE_TO_CODE = Object.freeze({ track: 0, entering: 1, service: 2, exit: 3 });
 const PIT_CODE_TO_STATE = Object.freeze(["track", "entering", "service", "exit"]);
 
-/** Pack validated state into protocol-18 rows, retaining input ACKs and all
+/** Pack validated state into protocol-19 rows, retaining input ACKs and all
  * deterministic motion state needed by prediction without duplicating metadata.
  */
 function encodeNormalizedFrame(frame) {
@@ -654,9 +659,11 @@ function normalizeResults(raw, race) {
 
 export class RaceNetwork {
   constructor() {
+    this.instanceId = `${MESSAGE_SESSION}:n${++networkInstanceCounter}`;
     this.recoveryStore = new RaceRecoveryStore();
     this.recoveryCheckpoint = null;
     this.sessionWrite = Promise.resolve();
+    this.sessionWriteGeneration = 0;
     this.sessionReadyRaceId = null;
     this.pendingRecoverySave = null;
     this.recoveryWarningShown = false;
@@ -678,6 +685,9 @@ export class RaceNetwork {
     this.lastRateLimitPruneAt = 0;
     this.pendingInputs = new Map();
     this.inputSequences = new Map();
+    this.localControlSessions = new Map();
+    this.controlSessions = new Map();
+    this.retiredControlSessions = new Set();
     this.recoveryRequired = false;
     this.discoveredRaceId = null;
     this.pendingDiscovery = null;
@@ -742,7 +752,13 @@ export class RaceNetwork {
   }
 
   get isHost() {
-    return !this.recoveryRequired && this.lobby?.hostId === game.user.id;
+    return !this.recoveryRequired && this.lobby?.hostId === game.user.id
+      && (!this.lobby.hostInstanceId || this.lobby.hostInstanceId === this.instanceId);
+  }
+
+  get isSecondaryHost() {
+    return Boolean(this.lobby?.hostId === game.user.id && this.lobby.hostInstanceId
+      && this.lobby.hostInstanceId !== this.instanceId);
   }
 
   get participant() {
@@ -754,6 +770,7 @@ export class RaceNetwork {
   }
 
   get participantCarId() {
+    if (this.isSecondaryHost) return null;
     return this.activeRace?.controlAssignments?.[String(game.user.id)] ?? null;
   }
 
@@ -762,6 +779,7 @@ export class RaceNetwork {
     const lobby = {
       id: `lobby-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
       hostId: game.user.id,
+      hostInstanceId: this.instanceId,
       hostName: game.user.name,
       phase: "lobby",
       config: normalizeConfig(config),
@@ -892,6 +910,7 @@ export class RaceNetwork {
       sessionId: raceId,
       lobbyId: this.lobby.id,
       hostId: game.user.id,
+      hostInstanceId: this.instanceId,
       phase: "race",
       config: normalizeConfig(this.lobby.config),
       entries: safeEntries,
@@ -941,14 +960,38 @@ export class RaceNetwork {
   }
 
   /** The world lease invalidates old tab saves after stop/finish/GM takeover. */
-  #writeSession() {
-    if (!game.user.isGM) return;
+  #writeSession(owner = this.lobby) {
+    if (!game.user.isGM || owner?.hostId !== game.user.id
+      || (owner.hostInstanceId && owner.hostInstanceId !== this.instanceId)) return;
+    const authority = { lobbyId: owner.id, hostId: owner.hostId, hostEpoch: Number(owner.hostEpoch) || 0,
+      hostInstanceId: owner.hostInstanceId ?? null, hostClaimId: owner.hostClaimId ?? owner.hostId,
+      hostClaimedAt: Number(owner.hostClaimedAt ?? owner.createdAt) || 0 };
+    const generation = ++this.sessionWriteGeneration;
     const value = this.activeRace?.phase === "race" ? {
-      raceId: this.raceId, lobbyId: this.lobby.id, hostId: this.lobby.hostId, hostEpoch: this.lobby.hostEpoch
+      raceId: this.raceId, protocol: PROTOCOL_VERSION, ...authority
     } : {};
     this.sessionReadyRaceId = null;
     if (!value.raceId) this.pendingRecoverySave = null;
     this.sessionWrite = this.sessionWrite.catch(() => {}).then(async () => {
+      // Settings writes are asynchronous. A queued write from an old race or a
+      // defeated GM must not overwrite the winner's durable recovery lease.
+      const stillOwner = this.lobby
+        ? this.lobby.id === authority.lobbyId && this.lobby.hostId === authority.hostId
+          && (Number(this.lobby.hostEpoch) || 0) === authority.hostEpoch
+          && (this.lobby.hostInstanceId ?? null) === authority.hostInstanceId && !this.recoveryRequired
+        : this.closedLobbyIds.has(authority.lobbyId);
+      if (generation !== this.sessionWriteGeneration || !stillOwner
+        || (value.raceId && (this.raceId !== value.raceId || !this.isHost))) return;
+      const durable = game.settings.get(MODULE_ID, "raceSession");
+      if (durable?.raceId && durable.protocol === PROTOCOL_VERSION) {
+        const sameAuthority = durable.lobbyId === authority.lobbyId && durable.hostId === authority.hostId
+          && (Number(durable.hostEpoch) || 0) === authority.hostEpoch
+          && (durable.hostInstanceId ?? null) === authority.hostInstanceId;
+        const newerClaim = durable.lobbyId === authority.lobbyId && this.#compareLobbyOwnership(authority, durable) > 0;
+        const retiredOwnLease = durable.hostId === authority.hostId
+          && (this.retiredRaceIds.has(durable.raceId) || this.closedLobbyIds.has(durable.lobbyId));
+        if (!sameAuthority && !newerClaim && !retiredOwnLease) return;
+      }
       await game.settings.set(MODULE_ID, "raceSession", value);
       if (!value.raceId || this.raceId !== value.raceId || !this.isHost) return;
       this.sessionReadyRaceId = value.raceId;
@@ -978,14 +1021,16 @@ export class RaceNetwork {
       if (simulation.finished) return false;
       const lobby = this.#normalizeLobby(saved.lobby);
       lobby.hostEpoch += 1;
+      lobby.hostInstanceId = this.instanceId;
       lobby.hostClaimedAt = Date.now();
-      lobby.hostClaimId = `${Date.now().toString(36)}:${game.user.id}`;
+      lobby.hostClaimId = `${Date.now().toString(36)}:${this.instanceId}`;
       this.#send({ type: "host-claim", lobby, abortRace: true, abortedRaceId: race.raceId });
-      if (this.lobby?.hostEpoch !== lobby.hostEpoch || this.lobby?.hostId !== game.user.id) return false;
+      if (!this.isHost || this.lobby.hostEpoch !== lobby.hostEpoch || this.lobby.hostClaimId !== lobby.hostClaimId) return false;
       // A fresh transport identity fences queued frames, inputs and pit replies.
       // Car IDs and the full sporting state remain the same.
       race.raceId = `race-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
       race.startedAt = Date.now();
+      race.hostInstanceId = this.instanceId;
       this.activeRace = race;
       this.recoveryCheckpoint = simulation.exportCheckpoint();
       this.lastSnapshot = simulation.snapshot();
@@ -1007,6 +1052,18 @@ export class RaceNetwork {
     }
   }
 
+  /** A runtime restart gets a fresh input sequence namespace, even within the
+   * same page/race. Delayed packets from its retired namespace stay fenced. */
+  beginControlSession(carId) {
+    const session = `${MESSAGE_SESSION}:${++controlSessionCounter}`;
+    this.localControlSessions.set(String(carId), session);
+    return session;
+  }
+
+  #localControlSession(carId) {
+    return this.localControlSessions.get(String(carId)) ?? this.beginControlSession(carId);
+  }
+
   requestControlAssignment() {
     const carId = this.participantCarId;
     if (!this.activeRace?.raceId || !carId || this.isHost) return false;
@@ -1015,7 +1072,8 @@ export class RaceNetwork {
       lobbyId: this.lobby?.id ?? null,
       raceId: this.activeRace.raceId,
       userId: game.user.id,
-      carId
+      carId,
+      controlSession: this.#localControlSession(carId)
     });
     return true;
   }
@@ -1028,6 +1086,7 @@ export class RaceNetwork {
       raceId: this.activeRace.raceId,
       userId: game.user.id,
       carId: String(carId).slice(0, 80),
+      controlSession: this.#localControlSession(carId),
       input: sanitizeInput(input),
       sequence: Math.max(0, Math.floor(finite(sequence, 0, 0, Number.MAX_SAFE_INTEGER)))
     }, false);
@@ -1040,7 +1099,8 @@ export class RaceNetwork {
       lobbyId: this.lobby?.id ?? null,
       raceId: this.activeRace.raceId,
       userId: game.user.id,
-      carId: String(carId).slice(0, 80)
+      carId: String(carId).slice(0, 80),
+      controlSession: this.#localControlSession(carId)
     });
   }
 
@@ -1100,21 +1160,23 @@ export class RaceNetwork {
 
   closeLobby() {
     if (!this.isHost || !this.lobby) return;
+    const leaseOwner = this.lobby;
     const lobbyId = this.lobby.id;
     const raceId = this.activeRace?.raceId ?? null;
     const hostEpoch = this.lobby.hostEpoch;
+    const hostInstanceId = this.lobby.hostInstanceId;
     this.#rememberRetired(this.closedLobbyIds, lobbyId);
     this.#rememberRetired(this.retiredRaceIds, raceId);
     this.lobby = null;
     this.activeRace = null;
     this.recoveryStore.clear();
-    this.#writeSession();
+    this.#writeSession(leaseOwner);
     this.lastSnapshot = null;
     this.lastFrame = null;
     this.lastResults = null;
     this.#clearPendingInputs();
     this.lastRequestAcceptedAt.clear();
-    this.#send({ type: "lobby-closed", lobbyId, raceId, hostEpoch });
+    this.#send({ type: "lobby-closed", lobbyId, raceId, hostEpoch, hostInstanceId });
   }
 
   /**
@@ -1130,9 +1192,10 @@ export class RaceNetwork {
     const claimedLobby = clone(this.lobby);
     claimedLobby.hostId = game.user.id;
     claimedLobby.hostName = game.user.name;
+    claimedLobby.hostInstanceId = this.instanceId;
     claimedLobby.hostEpoch = Math.max(0, Math.floor(Number(this.lobby.hostEpoch) || 0)) + 1;
     claimedLobby.hostClaimedAt = now;
-    claimedLobby.hostClaimId = `${now.toString(36)}:${game.user.id}`;
+    claimedLobby.hostClaimId = `${now.toString(36)}:${this.instanceId}`;
     if (wasRacing) claimedLobby.phase = "lobby";
     this.#send({
       type: "host-claim",
@@ -1140,6 +1203,8 @@ export class RaceNetwork {
       abortRace: wasRacing,
       abortedRaceId: wasRacing ? this.activeRace?.raceId ?? this.discoveredRaceId : null
     });
+    if (!this.isHost || this.lobby.hostEpoch !== claimedLobby.hostEpoch
+      || this.lobby.hostClaimId !== claimedLobby.hostClaimId) return false;
     this.#writeSession();
     return true;
   }
@@ -1165,6 +1230,7 @@ export class RaceNetwork {
     const message = {
       ...payload,
       hostEpoch: payload.hostEpoch ?? this.lobby?.hostEpoch ?? 0,
+      hostInstanceId: payload.hostInstanceId ?? payload.lobby?.hostInstanceId ?? this.lobby?.hostInstanceId ?? null,
       protocolVersion: PROTOCOL_VERSION,
       id: messageId(),
       senderId: game.user.id,
@@ -1190,12 +1256,24 @@ export class RaceNetwork {
   #isExpectedHost(message) {
     const expected = this.lobby?.hostId ?? this.activeRace?.hostId ?? message.hostId;
     return Boolean(expected && message.senderId === expected
-      && (Number(message.hostEpoch) || 0) === (Number(this.lobby?.hostEpoch) || 0));
+      && (Number(message.hostEpoch) || 0) === (Number(this.lobby?.hostEpoch) || 0)
+      && (!this.lobby?.hostInstanceId || message.hostInstanceId === this.lobby.hostInstanceId));
+  }
+
+  #restorePendingRaceState() {
+    const pending = this.pendingRaceState;
+    if (!pending) return;
+    if (performance.now() - pending.receivedAt >= 10000) { this.pendingRaceState = null; return; }
+    if (pending.message.lobbyId !== this.lobby?.id || !this.#isExpectedHost(pending.message)) return;
+    this.pendingRaceState = null;
+    this.seen.delete(pending.message.id);
+    this.#receive(pending.message);
   }
 
   #acceptLobby(message) {
     const incoming = message.lobby;
     if (!incoming || typeof incoming !== "object") return false;
+    if (incoming.hostInstanceId != null && !boundedString(incoming.hostInstanceId, 80)) return false;
     if (this.closedLobbyIds.has(incoming.id)) return false;
     if (message.senderId !== incoming.hostId) return false;
     if (!this.lobby) return true;
@@ -1254,6 +1332,7 @@ export class RaceNetwork {
     const raceId = String(raw.raceId ?? "").slice(0, 120);
     const lobbyId = String(raw.lobbyId ?? "").slice(0, 120);
     const hostId = String(raw.hostId ?? expectedHostId ?? "").slice(0, 80);
+    if (raw.hostInstanceId != null && !boundedString(raw.hostInstanceId, 80)) return null;
     if (!raceId || !lobbyId || !hostId || hostId !== String(expectedHostId ?? hostId)) return null;
     const entries = normalizeRaceEntries(raw.entries, raceId);
     if (!entries.length) return null;
@@ -1265,6 +1344,7 @@ export class RaceNetwork {
       sessionId: String(raw.sessionId ?? raceId).slice(0, 120),
       lobbyId,
       hostId,
+      hostInstanceId: raw.hostInstanceId ?? this.lobby?.hostInstanceId ?? null,
       phase: raw.phase === "results" ? "results" : "race",
       config: normalizeConfig(raw.config),
       entries,
@@ -1304,6 +1384,9 @@ export class RaceNetwork {
     }
     if (carId == null) {
       this.inputSequences.clear();
+      this.localControlSessions.clear();
+      this.controlSessions.clear();
+      this.retiredControlSessions.clear();
       this.pendingProbes.clear();
       this.pendingRaceState = null;
       this.timing = null;
@@ -1317,7 +1400,30 @@ export class RaceNetwork {
     if (set.size > 32) set.delete(set.values().next().value);
   }
 
+  /** Claim once per driver runtime, before confirming the assignment. Repeated
+   * ready/claim packets ACK the same namespace without reopening its counters. */
+  #claimControlSession(message) {
+    const key = `${message.carId}:${message.controlSession}`;
+    if (this.retiredControlSessions.has(key)) return false;
+    const previous = this.controlSessions.get(message.carId);
+    if (previous?.id === message.controlSession && previous.claimed) return true;
+    if (previous && previous.id !== message.controlSession) {
+      this.retiredControlSessions.add(`${message.carId}:${previous.id}`);
+      if (this.retiredControlSessions.size > 256) this.retiredControlSessions.delete(this.retiredControlSessions.values().next().value);
+    }
+    this.#clearPendingInputs(message.carId);
+    this.controlSessions.set(message.carId, { id: message.controlSession, claimed: true });
+    this.#emit("claimControl", message);
+    return true;
+  }
+
   #queueInput(message) {
+    const session = this.controlSessions.get(message.carId);
+    if (this.retiredControlSessions.has(`${message.carId}:${message.controlSession}`)
+      || (session && session.id !== message.controlSession)) return;
+    // The first input can establish the initial namespace for API callers.
+    // Replacing an existing one always requires an acknowledged control claim.
+    if (!session) this.controlSessions.set(message.carId, { id: message.controlSession, claimed: false });
     const sequence = Math.max(0, Math.floor(finite(message.sequence, 0, 0, Number.MAX_SAFE_INTEGER)));
     if (sequence <= (this.inputSequences.get(message.carId) ?? -1)) return;
     this.inputSequences.set(message.carId, sequence);
@@ -1334,7 +1440,8 @@ export class RaceNetwork {
     const record = { message: latest, timer: null };
     record.timer = setTimeout(() => {
       this.pendingInputs.delete(message.carId);
-      if (!this.isHost || this.activeRace?.raceId !== record.message.raceId) return;
+      if (!this.isHost || this.activeRace?.raceId !== record.message.raceId
+        || this.controlSessions.get(message.carId)?.id !== record.message.controlSession) return;
       this.lastRequestAcceptedAt.set(key, performance.now());
       this.#emit("input", record.message);
     }, remaining);
@@ -1429,15 +1536,7 @@ export class RaceNetwork {
         this.lobby = incoming;
         this.#markHostAlive();
         this.#emit("lobby", this.lobby);
-        const pending = this.pendingRaceState;
-        this.pendingRaceState = null;
-        if (pending && performance.now() - pending.receivedAt < 10000
-          && pending.message.lobbyId === incoming.id && pending.message.senderId === incoming.hostId) {
-          // A state reply can beat its lobby metadata during reconnect. It was
-          // retained, not accepted; validate it now against the known authority.
-          this.seen.delete(pending.message.id);
-          this.#receive(pending.message);
-        }
+        this.#restorePendingRaceState();
         break;
       }
 
@@ -1450,12 +1549,14 @@ export class RaceNetwork {
         const abortedRaceId = message.abortedRaceId == null ? null : String(message.abortedRaceId);
         this.lobby = incoming;
         if (abortRace) {
+          const pending = this.pendingRaceState;
           this.#rememberRetired(this.retiredRaceIds, abortedRaceId);
           this.activeRace = null;
           this.lastSnapshot = null;
           this.lastFrame = null;
           this.lastResults = null;
           this.#clearPendingInputs();
+          if (pending && pending.message.race?.raceId !== abortedRaceId) this.pendingRaceState = pending;
           this.lastRequestAcceptedAt.clear();
         } else if (this.activeRace) {
           this.activeRace.hostId = incoming.hostId;
@@ -1463,6 +1564,7 @@ export class RaceNetwork {
         this.#markHostAlive();
         this.#emit("lobby", this.lobby);
         if (abortRace) this.#emit("stop", { ...message, raceId: abortedRaceId, recovered: true });
+        this.#restorePendingRaceState();
         break;
       }
 
@@ -1511,6 +1613,7 @@ export class RaceNetwork {
         }, message.senderId, message.sentAt);
         if (!race || race.lobbyId !== this.lobby.id) break;
         this.lastStartedRaceId = race.raceId;
+        this.#clearPendingInputs();
         this.lobby.phase = "race";
         this.activeRace = race;
         this.lastReceivedSnapshotSequence = -1;
@@ -1520,14 +1623,19 @@ export class RaceNetwork {
         this.lastResults = null;
         this.#markHostAlive();
         this.#emit("start", clone(this.activeRace));
-        if (!this.isHost && this.participantCarId) this.requestControlAssignment();
         break;
       }
 
       case "race-state": {
         if (message.targetId && message.targetId !== game.user.id) break;
-        if (!this.lobby && message.targetId === game.user.id
+        const waitingForOwner = !this.lobby || (message.lobbyId === this.lobby.id
+          && (Number(message.hostEpoch) || 0) >= (Number(this.lobby.hostEpoch) || 0)
+          && !this.#isExpectedHost(message));
+        if (waitingForOwner
           && message.senderId === message.race?.hostId && game.users?.get(message.senderId)?.active) {
+          // A replacement host's state can overtake its ownership metadata,
+          // even on a client that already knows the previous lobby owner.
+          // Retain one untrusted reply; accept it only after the lobby check.
           this.pendingRaceState = { message, receivedAt: performance.now() };
           break;
         }
@@ -1559,7 +1667,6 @@ export class RaceNetwork {
           snapshot: this.lastSnapshot,
           results: this.lastResults ? clone(this.lastResults) : null
         });
-        if (!this.isHost && this.participantCarId) this.requestControlAssignment();
         break;
       }
 
@@ -1569,13 +1676,15 @@ export class RaceNetwork {
         const assignedCarId = this.activeRace.controlAssignments?.[String(message.senderId)] ?? null;
         if (!assignedCarId || assignedCarId !== String(message.carId)) break;
         if (!this.#acceptRate(`ready:${message.senderId}`, 250)) break;
+        if (!this.#claimControlSession(message)) break;
         this.#send({
           type: "control-assignment",
           targetId: message.senderId,
           lobbyId: this.lobby.id,
           raceId: this.activeRace.raceId,
           userId: message.senderId,
-          carId: assignedCarId
+          carId: assignedCarId,
+          controlSession: message.controlSession
         });
         break;
       }
@@ -1585,6 +1694,7 @@ export class RaceNetwork {
         if (message.lobbyId !== this.lobby?.id || message.raceId !== this.activeRace.raceId) break;
         const expectedCarId = this.activeRace.controlAssignments?.[String(game.user.id)] ?? null;
         if (!expectedCarId || expectedCarId !== String(message.carId) || message.userId !== game.user.id) break;
+        if (message.controlSession !== this.localControlSessions.get(expectedCarId)) break;
         this.#markHostAlive();
         this.#emit("controlAssignment", { carId: expectedCarId, raceId: this.activeRace.raceId });
         break;
@@ -1605,8 +1715,7 @@ export class RaceNetwork {
         const entry = this.activeRace.entries.find((candidate) => candidate.id === message.carId);
         if (!entry || entry.userId !== message.senderId || entry.isBot) break;
         if (!this.#acceptRate(`claim:${message.senderId}:${message.carId}`, 250)) break;
-        this.#clearPendingInputs(message.carId);
-        this.#emit("claimControl", message);
+        this.#claimControlSession(message);
         break;
       }
 

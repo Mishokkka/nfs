@@ -1,7 +1,7 @@
 export const MODULE_ID = "fbl-need-for-speed";
 export const SOCKET = `module.${MODULE_ID}`;
 export const VERSION = "0.17.0";
-export const PROTOCOL_VERSION = 18;
+export const PROTOCOL_VERSION = 19;
 export const SURFACE_TYPES = Object.freeze(["road", "grass", "gravel", "sand", "paving"]);
 
 export const PHYSICS_HZ = 60;

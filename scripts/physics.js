@@ -27,6 +27,21 @@ const checkpointRoute = route => route == null ? null : Object.fromEntries(["mai
     signedDistance: route[key].signedDistance, point: { ...route[key].point } }]));
 const CHECKPOINT_POINT_KEYS = "x y tx ty nx ny cumulative roadWidth grassWidth grassWidthLeft grassWidthRight surfaceLeft surfaceRight wallLeftAlpha wallRightAlpha wallLeftX wallLeftY wallRightX wallRightY mainProgressUnwrapped".split(" ");
 
+/** Attach immutable per-race presentation/prediction data only where needed.
+ * Worker frames reuse a single metadata message instead of cloning it at 30 Hz. */
+function copyCarMetadata(row, car) {
+  row.prediction = car.prediction;
+  row.appearance = car.appearance;
+  row.maxHealth = car.physics.maxHealth;
+  row.maxCharge = car.physics.maxCharge;
+  row.color = car.color;
+  row.name = car.name;
+  row.driverName = car.driverName;
+  row.heatWarning = Boolean(car.resolved.traits.heatWarning);
+  row.pitStopsRequired = car.pitStopsRequired;
+  return row;
+}
+
 function validCheckpointRoute(route, track) {
   if (route === null) return true;
   if (!route?.mainNearest) return false;
@@ -1548,7 +1563,11 @@ export class RaceSimulation {
     return this;
   }
 
-  snapshot() {
+  carMetadata() {
+    return this.cars.map(car => copyCarMetadata({ id: car.id }, car));
+  }
+
+  snapshot({ includeMetadata = true } = {}) {
     return {
       tick: this.tick,
       simulationTime: this.simulationTime,
@@ -1559,7 +1578,8 @@ export class RaceSimulation {
       laps: this.laps,
       requiredPitStops: this.requiredPitStops,
       finishOrder: [...this.finishOrder],
-      cars: this.cars.map((car) => ({
+      cars: this.cars.map((car) => {
+        const row = {
         id: car.id,
         x: car.x,
         y: car.y,
@@ -1575,12 +1595,8 @@ export class RaceSimulation {
         criticalGrace: car.criticalGrace,
         startBoostTimer: car.startBoostTimer,
         burstTimer: car.burstTimer,
-        prediction: car.prediction,
-        appearance: car.appearance,
         health: car.health,
-        maxHealth: car.physics.maxHealth,
         charge: car.charge,
-        maxCharge: car.physics.maxCharge,
         heat: car.heat,
         overheated: car.overheated,
         lap: car.lap,
@@ -1595,19 +1611,14 @@ export class RaceSimulation {
         finishTime: car.finishTime,
         finishBlocked: car.finishBlocked,
         disabled: car.disabled,
-        color: car.color,
-        name: car.name,
-        driverName: car.driverName,
         isBot: car.isBot,
         temporaryAutopilot: car.temporaryAutopilot,
         abandoned: car.abandoned,
-        heatWarning: Boolean(car.resolved.traits.heatWarning),
         ram: Boolean(car.currentInput?.ram),
         boost: Boolean(car.boostActive),
         pitState: car.pitState,
         pitProgress: car.pitProgress,
         pitInServiceZone: car.pitState !== "track" && this.#isInsidePitServiceZone(car),
-        pitStopsRequired: car.pitStopsRequired,
         pitStopsCompleted: car.pitStopsCompleted,
         pitWord: car.pitState === "service" ? car.pitWord : null,
         pitAttemptId: car.pitState === "service" ? car.pitAttemptId : null,
@@ -1616,7 +1627,9 @@ export class RaceSimulation {
         driftAmount: car.driftAmount,
         slipAngle: car.slipAngle,
         wallContactTimer: car.wallContactTimer
-      }))
+        };
+        return includeMetadata ? copyCarMetadata(row, car) : row;
+      })
     };
   }
 }

@@ -75,10 +75,14 @@ assert.ok(posted.some(message => message.raceId === "worker-restored" && message
 // A single ACK releases a fresh snapshot, while state events stay independent.
 for(const stallMs of [250,500,1000]) {
   const raceId='worker-pressure-'+stallMs;
-  handler({data:{type:'init',raceId,snapshotFlowControl:true,checkpoints:true,
+  handler({data:{type:'init',raceId,snapshotFlowControl:true,compactSnapshots:true,checkpoints:true,
     track:generateTrack('worker-pressure',2),entries:[{id:'car',userId:'user',build:cloneDefaultBuild()}],
     config:{laps:1,requiredPitStops:0}}});
   const initial=posted.findLast(message=>message.raceId===raceId&&message.type==='snapshot');
+  const metadata=posted.findLast(message=>message.raceId===raceId&&message.type==='metadata');
+  assert.ok(metadata.cars[0].prediction&&metadata.cars[0].appearance);
+  assert.ok(!Object.hasOwn(initial.snapshot.cars[0],'prediction')&&!Object.hasOwn(initial.snapshot.cars[0],'appearance'));
+  assert.equal(initial.compact,true);
   for(let elapsed=0;elapsed<stallMs;elapsed+=1000/60) {
     clock+=1000/60;const current=pump;pump=null;current?.();
   }
@@ -94,12 +98,14 @@ for(const stallMs of [250,500,1000]) {
   assert.equal(posted.filter(message=>message.raceId===raceId&&message.type==='snapshot').length,2,'ACK burst a queue of stale frames');
   handler({data:{type:'snapshot-consumed',raceId,snapshotId:initial.snapshotId}});
   assert.equal(posted.filter(message=>message.raceId===raceId&&message.type==='snapshot').length,2,'duplicate ACK changed the outstanding frame');
+  assert.equal(posted.filter(message=>message.raceId===raceId&&message.type==='metadata').length,1,'worker repeated static metadata');
 }
 
 handler({ data: {
   type: "init",
   raceId: "worker-finish",
   snapshotFlowControl: true,
+  compactSnapshots: true,
   track: generateTrack("worker-finish", 1),
   entries: [{
     id: "bot", userId: null, name: "Bot", build: cloneDefaultBuild(), color: "#fff",
@@ -138,6 +144,7 @@ handler({ data: { type: "stop" } });
   runtime.start({config:{seed:1,trackComplexity:1},entries:[{id:'car',userId:'user',build:cloneDefaultBuild()}],host:true,raceId:'runtime-pressure'});
   const worker=runtime.simulationWorker;
   assert.equal(worker.sent[0].snapshotFlowControl,true,'runtime did not enable snapshot credits');
+  assert.equal(worker.sent[0].compactSnapshots,true,'runtime did not request thin worker frames');
   runtime.audio.update=()=>order.push('audio');
   runtime.renderer={pushSnapshot:()=>order.push('renderer'),destroy:()=>{}};
   const receive=worker.listeners.get('message');
@@ -149,7 +156,16 @@ handler({ data: { type: "stop" } });
   assert.deepEqual(order,['audio','renderer','network']);
   receive({data:{type:'checkpoint',raceId:'runtime-pressure',checkpoint:'{}'}});
   assert.equal(order.at(-1),'checkpoint');
+  const metadata={id:'car',name:'Static name',prediction:{maxSpeed:500},appearance:{frame:'arrow'}};
+  receive({data:{type:'metadata',raceId:'runtime-pressure',cars:[metadata]}});
+  receive({data:{type:'snapshot',raceId:'runtime-pressure',snapshotId:2,compact:true,
+    snapshot:{tick:4,cars:[{id:'car',x:20,isBot:true,temporaryAutopilot:true}]}}});
+  assert.equal(runtime.currentSimulationSnapshot.cars[0].prediction,metadata.prediction,'runtime copied or lost static prediction data');
+  assert.equal(runtime.currentSimulationSnapshot.cars[0].appearance,metadata.appearance);
+  assert.equal(runtime.currentSimulationSnapshot.cars[0].name,'Static name');
+  assert.equal(runtime.currentSimulationSnapshot.cars[0].temporaryAutopilot,true,'hydration lost dynamic automation state');
   runtime.stop();
+  assert.equal(runtime.workerMetadata.size,0,'runtime retained worker metadata after teardown');
 }
 
 console.log("worker-tests: ok");

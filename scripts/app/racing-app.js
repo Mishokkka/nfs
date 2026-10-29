@@ -300,7 +300,8 @@ export class BigRacesApp extends HandlebarsApplicationMixin(ApplicationV2) {
     this.runtime.start({
       config: race.config,
       entries: race.entries,
-      host: race.hostId === game.user.id,
+      host: this.network.isHost,
+      allowLocalControl: !this.network.isSecondaryHost,
       practice: false,
       raceId: race.raceId,
       assignedCarId: race.controlAssignments?.[String(game.user.id)] ?? null
@@ -327,11 +328,12 @@ export class BigRacesApp extends HandlebarsApplicationMixin(ApplicationV2) {
     this.runtime.start({
       config: race.config,
       entries: race.entries,
-      host: race.hostId === game.user.id,
+      host: this.network.isHost,
+      allowLocalControl: !this.network.isSecondaryHost,
       practice: false,
       raceId: race.raceId,
       initialSnapshot: snapshot,
-      checkpoint: race.hostId === game.user.id ? this.network.takeRecoveryCheckpoint(race.raceId) : null,
+      checkpoint: this.network.isHost ? this.network.takeRecoveryCheckpoint(race.raceId) : null,
       assignedCarId: race.controlAssignments?.[String(game.user.id)] ?? null
     });
     this.results = null;

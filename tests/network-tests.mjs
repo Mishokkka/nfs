@@ -75,6 +75,7 @@ const message = (payload) => ({
   protocolVersion: PROTOCOL_VERSION,
   id: `test-${++counter}`,
   sentAt: Date.now(),
+  ...(["race-input", "race-ready", "claim-control", "control-assignment"].includes(payload.type) ? { controlSession: "test-control" } : {}),
   ...payload
 });
 
@@ -386,7 +387,8 @@ const message = (payload) => ({
     lobbyId: network.lobby.id,
     raceId: network.activeRace.raceId,
     userId: "player",
-    carId: "car-player"
+    carId: "car-player",
+    controlSession: "reclaimed-control"
   };
   socketHandler(message({ ...claim, senderId: "attacker" }));
   socketHandler(message({ ...claim, senderId: "player", carId: "car-host" }));

@@ -26,6 +26,7 @@ export class RaceRuntime {
     this.simulation = null;
     this.simulationWorker = null;
     this.workerReady = false;
+    this.workerMetadata = new Map();
     this.workerInitEntries = null;
     this.workerStartupTimer = null;
     this.initialCheckpoint = null;
@@ -86,7 +87,7 @@ export class RaceRuntime {
     };
   }
 
-  start({ config, entries, host, practice = false, raceId = null, initialSnapshot = null, assignedCarId = null, checkpoint = null }) {
+  start({ config, entries, host, practice = false, raceId = null, initialSnapshot = null, assignedCarId = null, checkpoint = null, allowLocalControl = true }) {
     this.stop();
     this.practice = Boolean(practice);
     this.isHost = Boolean(host);
@@ -107,7 +108,9 @@ export class RaceRuntime {
     this.localCarId = expectedCarId && assignedCarAvailable && ownedEntries.some((entry) => String(entry.id) === expectedCarId)
       ? expectedCarId
       : (!expectedCarId && ownedEntries.length === 1 ? String(ownedEntries[0].id) : null);
+    if (!allowLocalControl) this.localCarId = null;
     this.controlConfirmed = Boolean(this.practice || host);
+    if (!this.controlConfirmed && this.localCarId) this.network.beginControlSession?.(this.localCarId);
     this.pendingInitialSnapshot = initialSnapshot;
     this.resultsSent = false;
     this.lastInputSequence.clear();
@@ -204,7 +207,8 @@ export class RaceRuntime {
     if (this.controlConfirmed) return;
     this.controlConfirmed = true;
     this.renderer?.setLocalCarId(carId);
-    this.network.claimControl(carId);
+    // The host applied the session claim before sending this confirmation.
+    // A second claim here could reset a live sequence window after new input.
     this.input.dispatch(undefined, { force: true });
   }
 
@@ -356,6 +360,7 @@ export class RaceRuntime {
     this.simulationWorker = null;
     this.workerReady = false;
     if (this.workerStartupTimer) window.clearTimeout(this.workerStartupTimer);
+    this.workerMetadata.clear();
     this.workerStartupTimer = null;
     this.workerInitEntries = null;
     this.previousSimulationSnapshot = null;
@@ -437,7 +442,7 @@ export class RaceRuntime {
       this.simulationWorker.addEventListener("error", this.#onWorkerError);
       this.simulationWorker.postMessage({
         type: "init", raceId: this.currentRaceId, track: this.track, entries, config: this.config,
-        checkpoint: this.initialCheckpoint, checkpoints: !this.practice, snapshotFlowControl: true
+        checkpoint: this.initialCheckpoint, checkpoints: !this.practice, snapshotFlowControl: true, compactSnapshots: true
       });
       this.workerStartupTimer = window.setTimeout(() => {
         if (!this.workerReady && this.simulationWorker) this.#fallbackWorker(new Error("Фоновая симуляция не ответила при запуске"));
@@ -459,6 +464,7 @@ export class RaceRuntime {
     this.simulationWorker = null;
     this.workerReady = false;
     this.#startMainThreadSimulation(this.workerInitEntries ?? []);
+    this.workerMetadata.clear();
     this.renderer?.setSmoothAuthoritativePresentation(false);
     this.renderer?.setSimulationFrame(this.currentSimulationSnapshot, this.currentSimulationSnapshot, 0);
     ui.notifications.warn("Большие Гонки: Web Worker недоступен, симуляция продолжена в основном потоке.");
@@ -467,6 +473,10 @@ export class RaceRuntime {
   #onWorkerMessage = (event) => {
     const message = event.data ?? {};
     if (String(message.raceId ?? "") !== String(this.currentRaceId ?? "")) return;
+    if (message.type === "metadata") {
+      this.workerMetadata = new Map((message.cars ?? []).map(car => [car.id, car]));
+      return;
+    }
     if (message.type === "checkpoint") {
       if (!this.practice && this.network.isHost) this.network.saveRecoveryCheckpoint(message.checkpoint);
       return;
@@ -490,6 +500,11 @@ export class RaceRuntime {
     if (!["snapshot", "state", "finished"].includes(message.type) || !message.snapshot) return;
     const sourceWorker = this.simulationWorker;
     try {
+      if (message.compact) message.snapshot = { ...message.snapshot, cars: message.snapshot.cars.map(car => {
+        const metadata = this.workerMetadata.get(car.id);
+        if (!metadata) throw new Error("Worker snapshot arrived without car metadata");
+        return { ...metadata, ...car };
+      }) };
       const priorSnapshot = this.currentSimulationSnapshot;
       this.previousSimulationSnapshot = priorSnapshot ?? message.snapshot;
       this.currentSimulationSnapshot = message.snapshot;
