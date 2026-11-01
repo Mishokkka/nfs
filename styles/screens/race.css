@@ -52,9 +52,9 @@
   background: var(--nfs-surface-2);
 }
 .nfs-camera-switch__button.is-active {
-  color: #e2d2f1;
-  border-color: #70607d;
-  background: #3c3249;
+  color: #f0e7ff;
+  border-color: #9474c1;
+  background: #392a51;
 }
 .nfs-camera-switch__button kbd {
   color: var(--nfs-muted);
@@ -89,7 +89,7 @@
   border: 1px solid var(--nfs-line);
   border-radius: 4px;
   color: var(--nfs-text);
-  background: #171d1af2;
+  background: #101521f2;
   font-size: 11px;
 }
 .nfs-controls-help > summary {
@@ -144,15 +144,15 @@
   padding: 7px 10px;
   border: 1px solid #9b8155;
   border-radius: 4px;
-  color: #e4c991;
-  background: #26261af5;
+  color: #f1d7ad;
+  background: #181319f5;
   font-size: 11px;
   line-height: 1.4;
   text-align: center;
   transform: translateX(-50%);
 }
 .nfs-network-status {
-  top: 148px;
+  top: 178px;
   pointer-events: none;
 }
 .nfs-network-status[hidden] {
@@ -294,9 +294,9 @@
   width: min(400px,100%);
   padding: 20px;
   border: 1px solid #957cab;
-  border-radius: 6px;
+  border-radius: 2px;
   color: var(--nfs-text);
-  background: #202620;
+  background: #101521;
   box-shadow: 0 16px 40px #0008;
   text-align: center;
 }
@@ -309,7 +309,7 @@
 .nfs-pit-card h2 {
   margin: 7px 0;
   color: var(--nfs-text);
-  font: 700 25px/1.2 Georgia,serif;
+  font: italic 800 25px/1.2 Arial,sans-serif;
 }
 .nfs-pit-card p {
   margin: 0 auto 14px;

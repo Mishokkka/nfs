@@ -125,6 +125,17 @@
   gap: 6px;
 }
 .nfs-shell--race {
+  --nfs-bg-0: #0b1019;
+  --nfs-bg-1: #101521;
+  --nfs-surface: #171e2c;
+  --nfs-surface-2: #242c40;
+  --nfs-line: #515a70;
+  --nfs-line-soft: #343c50;
+  --nfs-text: #f5f5fa;
+  --nfs-muted: #aeb5c5;
+  --nfs-crystal: #c39aff;
+  --nfs-amber: #c39aff;
+  --nfs-amber-strong: #efe4ff;
   grid-template-rows: auto minmax(0,1fr);
 }
 .nfs-shell--race .nfs-topbar {
@@ -139,7 +150,10 @@
   font-size: 13px;
 }
 .nfs-shell--race .nfs-brand__copy strong {
-  font-size: 18px;
+  color: #f5f5fa;
+  font: italic 800 18px/1 Arial,sans-serif;
+  text-transform: uppercase;
+  letter-spacing: -.03em;
 }
 .nfs-shell--race .nfs-brand__copy span {
   display: none;

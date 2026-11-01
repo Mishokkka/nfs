@@ -640,4 +640,75 @@ for (const localCarId of ["target", null]) {
   window.devicePixelRatio = previousDpr;
 }
 
+// In a narrow chase view, fixed look-ahead places the driver near the bottom.
+// Its body and priority name must stay clear of the new bottom-corner panels.
+{
+  const {buildRaceCarMeta}=await import('../scripts/physics.js');
+  const {cloneDefaultBuild}=await import('../scripts/catalog.js');
+  const previousDpr=window.devicePixelRatio;window.devicePixelRatio=1;
+  const canvas=makeCanvas(),context=makeContext(),draws=[];
+  canvas.getBoundingClientRect=()=>({width:360,height:526});
+  context.drawImage=(image,...position)=>draws.push({image,position});canvas.getContext=()=>context;
+  const renderer=new RaceRenderer(canvas,track,{localCarId:'driver',cameraMode:'chase'});
+  const angle=Math.atan2(track.start.ty,track.start.tx);
+  const meta=buildRaceCarMeta({id:'driver',name:'Аметист №7',build:cloneDefaultBuild()});
+  const car={...meta,x:track.start.x,y:track.start.y,vx:Math.cos(angle)*600,vy:Math.sin(angle)*600,angle,place:1,lap:0,progress:0,
+    health:meta.maxHealth,charge:meta.maxCharge,heat:0,pitState:'track'};
+  const snapshot={cars:[car],tick:1,simulationTime:3,time:3,countdown:0,started:true,laps:3};
+  renderer.camera.speed=600;renderer.setSimulationFrame(snapshot,snapshot,0);renderer.render(performance.now()+100);
+  const label=[...renderer.labelCache.values()][0],draw=draws.find(d=>d.image===label.canvas);
+  const [x,y]=draw.position,regions=renderer.instruments.layout;
+  for(const r of [regions.dial,regions.map])assert.equal(x<r.x+r.width&&x+label.canvas.width>r.x&&y<r.y+r.height&&y+label.canvas.height>r.y,false,
+    'priority name was hidden under a corner instrument');
+  assert.ok(180+meta.appearance.halfWidth*renderer.camera.zoom<regions.dial.x,'dial covers the controlled chassis');
+  renderer.destroy();window.devicePixelRatio=previousDpr;
+}
+
+// HUD telemetry stays truthful, bounded and allocation-free after resize. A
+// moving/boosting/overheated car must not rebuild dial ticks every frame.
+{
+  const { RaceInstruments, raceHudLayout } = await import('../scripts/rendering/race-instruments.js');
+  const intersects = (a,b) => a.x < b.x+b.width && a.x+a.width > b.x && a.y < b.y+b.height && a.y+a.height > b.y;
+  for (const [width,height] of [[1040,646],[760,526],[480,526],[360,526],[360,300],[1040,300]]) {
+    const layout = raceHudLayout(width,height);
+    for (const region of [layout.dial,layout.map,layout.timing,layout.standing,layout.status]) {
+      assert.ok(region.x>=0 && region.y>=0 && region.x+region.width<=width && region.y+region.height<=height,
+        `HUD region escaped ${width}x${height}`);
+    }
+    for (const [a,b] of [[layout.timing,layout.standing],[layout.dial,layout.map],[layout.dial,layout.status],
+      [layout.map,layout.status],[layout.timing,layout.dial],[layout.standing,layout.dial]]) {
+      assert.equal(intersects(a,b),false,`HUD regions overlap at ${width}x${height}`);
+    }
+    assert.ok(layout.map.y+layout.map.height<=height-42,'minimap covers help control');
+  }
+  const hud = new RaceInstruments(), context = makeContext(), texts=[];
+  context.fillText = (...args) => texts.push(args);
+  const car = {id:'hud-car',vx:600,vy:0,angle:0,place:2,lap:1,currentLapTime:59.999,bestLapTime:null,lastLapTime:62.5,
+    charge:70,maxCharge:100,health:22,maxHealth:100,heat:130,overheated:true,pitStopsCompleted:0,pitStopsRequired:1};
+  const race = {time:62,cars:[car,car,car],laps:3};
+  hud.resize(1040,646,1.5);
+  const plate=hud.backplate, canvases=createdCanvasCount, before=structuredClone(car);
+  hud.draw(context,car,race,'Критические повреждения · заезжайте в пит');
+  const values=texts.map(t=>t[0]);
+  assert.ok(values.includes('124'),'speed does not reflect motion in km/h');
+  assert.ok(values.includes('1:00.00'),'lap time carry was lost in the new instruments');
+  assert.ok(values.includes('1:02.50'),'last lap time disappeared');
+  assert.ok(values.includes('—'),'unknown best lap became a fabricated zero');
+  assert.ok(values.includes('70%') && values.includes('22%') && values.includes('100%'),'resource ratios must clamp to percentages');
+  assert.ok(values.includes('КРУГ 2 / 3') && values.includes('ПИТ 0 / 1'));
+  assert.deepEqual(car,before,'painting modified authority telemetry');
+  for(let i=0;i<120;i++)hud.draw(context,{...car,vx:i*8,heat:i,charge:i,boost:!!(i%2)},race,'');
+  assert.equal(hud.staticBuilds,1); assert.equal(hud.backplate,plate); assert.equal(createdCanvasCount,canvases);
+  assert.ok(plate.width*plate.height*4<500_000,'dial exceeded its fixed backing-store budget');
+  texts.length=0;
+  hud.draw(context,{...car,vx:-50,overheated:false},race,'',true);
+  assert.ok(texts.some(t=>t[0]==='НАЗАД')); assert.ok(texts.some(t=>t[0]==='НАБЛЮДЕНИЕ · ВРЕМЯ'));
+  hud.resize(360,300,1); assert.equal(hud.layout.short,true);
+  texts.length=0;
+  hud.draw(context,{...car,vx:50,boost:true,overheated:false},race,'');
+  assert.ok(texts.some(t=>t[0]==='КМ/Ч · ФОРСАЖ'),'short-window HUD hid active boost');
+  hud.resize(360,300,1); assert.equal(hud.staticBuilds,2);
+  hud.destroy(); hud.destroy(); assert.equal(plate.width*plate.height,1);
+}
+
 console.log("renderer-tests: ok");

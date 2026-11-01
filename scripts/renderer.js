@@ -13,19 +13,12 @@ import {
 import { LocalPrediction } from "./netcode/local-prediction.js";
 import { VehicleSprites, REAR_CORE_X } from "./rendering/vehicle-sprites.js";
 import { TrackArt } from "./rendering/track-art.js";
+import { RaceInstruments } from "./rendering/race-instruments.js";
 import { GripFeedback } from "./rendering/grip-feedback.js";
 import { paintBuilding } from "./rendering/building-art.js";
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 const angleDelta = (target, current) => Math.atan2(Math.sin(target - current), Math.cos(target - current));
 const smoothingFactor = (dt, timeConstant) => 1 - Math.exp(-Math.max(0, dt) / Math.max(0.001, timeConstant));
-/** Format nonnegative centiseconds; missing lap times stay visibly unknown. */
-const formatRaceTime = (seconds) => {
-  if (!Number.isFinite(seconds)) return "—";
-  const totalCentiseconds = Math.max(0, Math.round(seconds * 100));
-  const minutes = Math.floor(totalCentiseconds / 6000);
-  const remaining = totalCentiseconds % 6000;
-  return `${minutes}:${String(Math.floor(remaining / 100)).padStart(2, "0")}.${String(remaining % 100).padStart(2, "0")}`;
-};
 const maximumRunoffWidth = (points) => (points ?? []).reduce((maximum, point) => Math.max(
   maximum,
   grassWidthForSide(point, 1),
@@ -76,6 +69,7 @@ export class RaceRenderer {
     this.localCarId = localCarId;
     this.onHud = onHud;
     this.gripFeedback = new GripFeedback();
+    this.instruments = new RaceInstruments();
     this.cameraMode = CAMERA_MODES.has(cameraMode) ? cameraMode : "overview";
     this.minimapEnabled = Boolean(minimapEnabled);
     this.previousSnapshot = null;
@@ -336,6 +330,8 @@ export class RaceRenderer {
       vehicleSpritesGenerated: this.vehicleSprites.generated,
       labelCacheSize: this.labelCache.size,
       visibleLabels: this.visibleLabelCount,
+      hudStaticBuilds: this.instruments.staticBuilds,
+      hudBackingPixels: this.instruments.backplate.width * this.instruments.backplate.height,
       labelCacheHits: this.labelCacheHits,
       labelCacheMisses: this.labelCacheMisses,
       labelCacheHitRate: labelRequests ? this.labelCacheHits / labelRequests : 1,
@@ -702,6 +698,7 @@ export class RaceRenderer {
     this.#clearLabelCache();
     this.vehicleSprites.destroy();
     this.art.destroy();
+    this.instruments.destroy();
     this.presentationCars.clear();
     this.activePresentationIds.clear();
     this.blendedCars.length = 0;
@@ -793,6 +790,7 @@ export class RaceRenderer {
       this.context.imageSmoothingEnabled = true;
       this.context.imageSmoothingQuality = "high";
       this.#clearLabelCache();
+      this.instruments.resize(width / this.outputScale, height / this.outputScale, this.outputScale);
       this.#rebuildBackground(width, height);
       this.#rebuildMinimapLayer();
     }
@@ -1023,7 +1021,7 @@ export class RaceRenderer {
     if (!ctx) return;
     const s = this.outputScale;
     const cssWidth = this.canvas.width / s;
-    const mapWidth = cssWidth < 540 ? 128 : cssWidth < 920 ? 172 : 218;
+    const mapWidth = this.instruments.layout.map.width;
     const boxWidth = Math.round(mapWidth * s);
     const boxHeight = Math.round(mapWidth * .68 * s);
     const padding = Math.round((cssWidth < 540 ? 10 : 13) * s);
@@ -1031,9 +1029,9 @@ export class RaceRenderer {
     this.minimapLayer.height = boxHeight;
 
     this.#roundedRect(ctx, 0, 0, boxWidth, boxHeight, Math.round(4 * s));
-    ctx.fillStyle = "rgba(23, 29, 26, 0.92)";
+    ctx.fillStyle = "rgba(10, 14, 23, 0.86)";
     ctx.fill();
-    ctx.strokeStyle = "rgba(173, 151, 103, 0.62)";
+    ctx.strokeStyle = "rgba(183, 191, 210, 0.56)";
     ctx.lineWidth = Math.max(1, s);
     ctx.stroke();
 
@@ -1056,7 +1054,7 @@ export class RaceRenderer {
     ctx.strokeStyle = "rgba(32, 42, 47, 0.98)";
     ctx.lineWidth = 5 / mapScale;
     ctx.stroke(this.trackPath);
-    ctx.strokeStyle = "rgba(184, 164, 119, 0.88)";
+    ctx.strokeStyle = "rgba(238, 241, 248, 0.95)";
     ctx.lineWidth = 2 / mapScale;
     ctx.stroke(this.trackPath);
     if (this.track.pit?.samples?.length) {
@@ -1678,7 +1676,7 @@ export class RaceRenderer {
 
     if (!snapshot) {
       ctx.fillStyle = "#d7c7a1";
-      ctx.font = `${Math.round(height * 0.035)}px serif`;
+      ctx.font = `${Math.round(height * 0.035)}px Arial, sans-serif`;
       ctx.textAlign = "center";
       ctx.fillText("Ожидание данных гонки…", width / 2, height / 2);
       return;
@@ -2002,8 +2000,21 @@ export class RaceRenderer {
       // The glyphs are already rasterized in a cached sprite. Snapping the whole
       // sprite to integer pixels made its motion visibly step at low chase zoom.
       // Fractional placement keeps the label attached to the interpolated car.
-      const x = clamp(screenX - sprite.canvas.width * 0.5, 4 * this.outputScale, width - sprite.canvas.width - 4 * this.outputScale);
-      const y = screenY - verticalOffset - sprite.canvas.height;
+      let x = clamp(screenX - sprite.canvas.width * 0.5, 4 * this.outputScale, width - sprite.canvas.width - 4 * this.outputScale);
+      let y = screenY - verticalOffset - sprite.canvas.height;
+      if (priority) {
+        // Chase look-ahead puts the driver near the bottom of a small window.
+        // Keep its name clear of the instruments without moving the car/camera.
+        const { dial, map } = this.instruments.layout, s = this.outputScale, pad = 4 * s;
+        if (x < (dial.x + dial.width) * s && x + sprite.canvas.width > dial.x * s
+          && y < (dial.y + dial.height) * s && y + sprite.canvas.height > dial.y * s) {
+          x = Math.max(pad, dial.x * s - sprite.canvas.width - pad);
+        }
+        if (this.minimapEnabled && x < (map.x + map.width) * s && x + sprite.canvas.width > map.x * s
+          && y + sprite.canvas.height > map.y * s && y < (map.y + map.height) * s) {
+          y = map.y * s - sprite.canvas.height - pad;
+        }
+      }
       const right = x + sprite.canvas.width, bottom = y + sprite.canvas.height;
       const gap = 3 * this.outputScale;
       let overlaps = false;
@@ -2108,9 +2119,9 @@ export class RaceRenderer {
     const projection = this.minimapProjection;
     if (!projection) return;
     const s = this.outputScale;
-    const margin = Math.round(10 * s);
-    const x = width - projection.boxWidth - margin;
-    const y = height - projection.boxHeight - margin;
+    const map = this.instruments.layout.map;
+    const x = Math.round(map.x * s);
+    const y = Math.round(map.y * s);
     ctx.drawImage(this.minimapLayer, x, y);
 
     for (const car of cars) {
@@ -2141,125 +2152,15 @@ export class RaceRenderer {
       : "Пит-лейн · ограничение 60 км/ч · остановитесь в голубой зоне";
     if (car.pitState === "exit") return "Пит-лейн · ограничение 60 км/ч";
     if (car.temporaryAutopilot) return "Временный автопилот";
-    if (car.overheated) return "Ядро перегрето";
+    if (car.disabled) return "Болид выведен из строя";
+    if (car.overheated) return "Ядро перегрето · форсаж заблокирован";
+    if (car.finished) return "Финиш · ожидаем остальных участников";
+    if (car.health < car.maxHealth * .25) return "Критические повреждения · заезжайте в пит";
     return this.gripFeedback.update(car, performance.now());
   }
 
-  #drawHudPanel(ctx, x, y, width, height, label, value, { valueColor = "#ece8db", valueSize = 15 } = {}) {
-    const s = this.outputScale;
-    this.#roundedRect(ctx, x, y, width, height, 4 * s);
-    ctx.fillStyle = "rgba(23, 29, 26, 0.94)";
-    ctx.fill();
-    ctx.strokeStyle = "rgba(173, 151, 103, 0.62)";
-    ctx.lineWidth = Math.max(1, s);
-    ctx.stroke();
-    ctx.textAlign = "left";
-    ctx.textBaseline = "top";
-    ctx.fillStyle = "#afb5a5";
-    ctx.font = `600 ${Math.max(9, Math.round(9 * s))}px system-ui, sans-serif`;
-    ctx.fillText(label, x + 8 * s, y + 5 * s, width - 16 * s);
-    ctx.fillStyle = valueColor;
-    ctx.font = `650 ${Math.max(11, Math.round(valueSize * s))}px system-ui, sans-serif`;
-    ctx.fillText(String(value), x + 8 * s, y + 18 * s, width - 16 * s);
-  }
-
-  #drawHudMeter(ctx, x, y, width, height, label, ratio, { kind = "charge", warning = false, critical = false, empty = false } = {}) {
-    const s = this.outputScale;
-    const amount = clamp(Number(ratio) || 0, 0, 1);
-    this.#roundedRect(ctx, x, y, width, height, 3 * s);
-    ctx.fillStyle = empty ? "#382823" : "rgba(23, 29, 26, 0.94)";
-    ctx.fill();
-    ctx.strokeStyle = critical ? "#d8806b" : warning ? "#d6a35c" : "rgba(173, 151, 103, 0.5)";
-    ctx.lineWidth = Math.max(1, s);
-    ctx.stroke();
-    ctx.textAlign = "left";
-    ctx.textBaseline = "top";
-    ctx.fillStyle = critical || empty ? "#efb3a7" : "#bfc3b5";
-    ctx.font = `600 ${Math.max(9, Math.round(9 * s))}px system-ui, sans-serif`;
-    ctx.fillText(label, x + 7 * s, y + 4 * s, width - 42 * s);
-    ctx.textAlign = "right";
-    ctx.fillText(`${Math.round(amount * 100)}%`, x + width - 7 * s, y + 4 * s);
-    ctx.fillStyle = kind === "health" ? "#c47761" : kind === "heat" || critical || warning ? "#d6a35c" : "#bda1df";
-    ctx.fillRect(x + s, y + height - 3 * s, (width - 2 * s) * amount, 2 * s);
-  }
-
   #drawRaceHud(ctx, car, snapshot, width, height) {
-    const s = this.outputScale;
-    const narrow = width / s < 540;
-    const compact = width / s < 920;
-    const margin = 10 * s;
-    const gap = 4 * s;
-    const panelHeight = 40 * s;
-    const panelWidth = (narrow ? 70 : compact ? 76 : 84) * s;
-    ctx.save();
-    const raceValues = [
-      ["Место", `${car.place} / ${snapshot.cars.length}`],
-      ["Круг", `${Math.min(Number(car.lap || 0) + 1, Number(snapshot.laps) || 1)} / ${snapshot.laps}`],
-      ["Пит-стопы", `${car.pitStopsCompleted ?? 0} / ${car.pitStopsRequired ?? snapshot.requiredPitStops ?? 0}`],
-      ["Заезд", formatRaceTime(Number(snapshot.time))]
-    ];
-    for (let index = 0; index < raceValues.length; index += 1) {
-      const column = narrow ? index % 2 : index;
-      const row = narrow ? Math.floor(index / 2) : 0;
-      const [label, value] = raceValues[index];
-      this.#drawHudPanel(ctx, margin + column * (panelWidth + gap), margin + row * (panelHeight + gap),
-        panelWidth, panelHeight, label, value, { valueSize: compact ? 13 : 15 });
-    }
-    const timingY = margin + (narrow ? 2 : 1) * (panelHeight + gap);
-    const timingValues = narrow ? [
-      ["Текущий", formatRaceTime(Number(car.currentLapTime))],
-      ["Лучший", formatRaceTime(car.bestLapTime)]
-    ] : [
-      ["Текущий круг", formatRaceTime(Number(car.currentLapTime))],
-      ["Последний", formatRaceTime(car.lastLapTime)],
-      ["Лучший", formatRaceTime(car.bestLapTime)]
-    ];
-    const timingWidth = narrow ? panelWidth : (compact ? 96 : 105) * s;
-    for (let index = 0; index < timingValues.length; index += 1) {
-      const [label, value] = timingValues[index];
-      this.#drawHudPanel(ctx, margin + index * (timingWidth + gap), timingY, timingWidth, 35 * s,
-        label, value, { valueSize: 11 });
-    }
-
-    const vehicleWidth = (narrow ? 128 : 160) * s;
-    const vehicleX = width - margin - vehicleWidth;
-    const speedKmh = Math.round(Math.hypot(Number(car.vx) || 0, Number(car.vy) || 0) * (0.62 / 3));
-    this.#drawHudPanel(ctx, vehicleX, margin, vehicleWidth, 46 * s, "Скорость", `${speedKmh} км/ч`, {
-      valueColor: "#e4c991", valueSize: 21
-    });
-    const meterHeight = 21 * s;
-    let meterY = margin + 46 * s + gap;
-    this.#drawHudMeter(ctx, vehicleX, meterY, vehicleWidth, meterHeight, "Прочность",
-      Number(car.health) / Math.max(1, Number(car.maxHealth) || 1), { kind: "health" });
-    meterY += meterHeight + gap;
-    const chargeEmpty = Number(car.charge) <= 0.01;
-    this.#drawHudMeter(ctx, vehicleX, meterY, vehicleWidth, meterHeight, chargeEmpty ? "Нет заряда" : "Кристалл",
-      Number(car.charge) / Math.max(1, Number(car.maxCharge) || 1), { kind: "charge", empty: chargeEmpty });
-    meterY += meterHeight + gap;
-    const warningAt = car.heatWarning ? 68 : 78;
-    this.#drawHudMeter(ctx, vehicleX, meterY, vehicleWidth, meterHeight,
-      car.overheated ? "Перегрев" : Number(car.heat) >= warningAt ? "Опасный нагрев" : "Нагрев", Number(car.heat) / 100,
-      { kind: "heat", warning: Number(car.heat) >= warningAt, critical: Boolean(car.overheated) || Number(car.heat) >= 100 });
-
-    const status = this.#raceHudStatus(car);
-    if (status) {
-      ctx.font = `600 ${Math.max(10, Math.round(11 * s))}px system-ui, sans-serif`;
-      const statusWidth = Math.min(width - 24 * s, ctx.measureText(status).width + 24 * s);
-      const statusHeight = 30 * s;
-      const statusX = (width - statusWidth) * 0.5;
-      const statusY = 142 * s;
-      this.#roundedRect(ctx, statusX, statusY, statusWidth, statusHeight, 4 * s);
-      ctx.fillStyle = "#26261af5";
-      ctx.fill();
-      ctx.strokeStyle = "#9b8155";
-      ctx.lineWidth = Math.max(1, s);
-      ctx.stroke();
-      ctx.fillStyle = "#e4c991";
-      ctx.textAlign = "center";
-      ctx.textBaseline = "middle";
-      ctx.fillText(status, width * 0.5, statusY + statusHeight * 0.5, statusWidth - 16 * s);
-    }
-    ctx.restore();
+    this.instruments.draw(ctx, car, snapshot, this.#raceHudStatus(car), car.id !== this.localCarId);
   }
 
   #drawCountdown(ctx, snapshot, width, height) {
@@ -2269,18 +2170,18 @@ export class RaceRenderer {
       ctx.fillRect(0, 0, width, height);
       ctx.textAlign = "center";
       ctx.textBaseline = "middle";
-      ctx.font = `900 ${Math.floor(Math.min(width, height) * 0.22)}px serif`;
-      ctx.fillStyle = "#f2d77f";
-      ctx.strokeStyle = "#301b0d";
+      ctx.font = `italic 900 ${Math.floor(Math.min(width, height) * 0.22)}px Arial, sans-serif`;
+      ctx.fillStyle = "#f5f5fa";
+      ctx.strokeStyle = "#392b52";
       ctx.lineWidth = 10;
       ctx.strokeText(String(value), width / 2, height / 2);
       ctx.fillText(String(value), width / 2, height / 2);
     } else if (snapshot.started && snapshot.time < 1.1) {
       ctx.textAlign = "center";
       ctx.textBaseline = "alphabetic";
-      ctx.font = `900 ${Math.floor(Math.min(width, height) * 0.13)}px serif`;
-      ctx.fillStyle = "#f2d77f";
-      ctx.strokeStyle = "#301b0d";
+      ctx.font = `italic 900 ${Math.floor(Math.min(width, height) * 0.13)}px Arial, sans-serif`;
+      ctx.fillStyle = "#f5f5fa";
+      ctx.strokeStyle = "#392b52";
       ctx.lineWidth = 8;
       ctx.strokeText("ВПЕРЁД", width / 2, height * 0.42);
       ctx.fillText("ВПЕРЁД", width / 2, height * 0.42);
