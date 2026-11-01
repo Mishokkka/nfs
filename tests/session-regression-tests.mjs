@@ -543,4 +543,140 @@ for(const claimFirst of [false,true]) {
   if(previousWorker===undefined)delete globalThis.Worker;else globalThis.Worker=previousWorker;
 }
 
-console.log("session-regression-tests: ok (single host instance, F5 restore, world-lease fencing, control sessions, coalescing, isolation, garage, worker authority, reordered reconnect, explicit spectator resume)");
+// The object saved during a setting round-trip must remain the comparison and
+// lobby baseline even when the current draft is edited before it completes.
+{
+  const { GarageController } = await import("../scripts/app/garage-controller.js");
+  const originalSet = game.settings.set;
+  let release, submitted;
+  const gate = new Promise(resolve => { release = resolve; });
+  game.settings.set = async (_module, key, value) => {
+    submitted = value;
+    await gate;
+    settingsState.set(key, structuredClone(value));
+  };
+  const updates = [];
+  const garage = new GarageController({ network: { participant: {}, updateBuild: b => updates.push(structuredClone(b)) } });
+  garage.readFromForm = () => garage.build;
+  garage.refreshPreview = () => {};
+  const expected = structuredClone(garage.build);
+  const save = garage.saveFromForm(null, false);
+  garage.build.name = "Unsaved draft";
+  garage.build.driver.name = "Unsaved driver";
+  release();
+  const saved = await save;
+  assert.deepEqual(submitted, expected);
+  assert.deepEqual(saved, expected);
+  assert.deepEqual(garage.comparisonBuild, expected);
+  assert.deepEqual(updates, [expected]);
+  assert.equal(garage.build.name, "Unsaved draft", "completion discarded the newer form draft");
+  assert.equal(garage.build.driver.name, "Unsaved driver");
+  game.settings.set = originalSet;
+}
+
+// A delayed Leave/Stop answer belongs to the exact runtime that opened it.
+for (const role of ["player", "host"]) for (const changed of ["currentRaceId", "localCarId"]) {
+  const { host, player } = setup();
+  const beforeUser = game.user;
+  game.user = users.get(role);
+  const network = role === "host" ? host : player;
+  const app = new BigRacesApp(network);
+  for (const fn of network.handlers.start) fn(network.activeRace);
+  const events = new Map();
+  app.element = { querySelector: () => null, addEventListener: (type, fn) => events.set(type, fn), contains: () => true };
+  await app._onRender({}, {});
+  let answer;
+  foundry.applications.api.DialogV2.confirm = () => new Promise(resolve => { answer = resolve; });
+  const actions = sent.length;
+  events.get("click")({ target: { closest: () => ({ dataset: { action: "abandon-race" } }) }, preventDefault() {} });
+  app.runtime[changed] = "replacement-" + changed;
+  answer(true);
+  await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+  assert.equal(app.screen, "race", "stale confirmation closed the replacement runtime");
+  assert.equal(sent.slice(actions).some(m => ["leave-race", "stop-race"].includes(m.type)), false);
+  app.shutdown(); host.destroy(); player.destroy(); game.user = beforeUser;
+  foundry.applications.api.DialogV2.confirm = async () => true;
+}
+
+// An unrelated expired lease is recoverable, but a live owner keeps it even
+// when all of its ordinary lobby broadcasts are rejected by the racing lobby.
+{
+  const { host, player } = setup();
+  const orphan = { raceId: "orphan-race", lobbyId: "orphan-lobby", hostId: "orphan",
+    hostInstanceId: "orphan-instance", hostEpoch: 0, protocol: host.activeRace.protocolVersion, expiresAt: Date.now() - 1 };
+  settingsState.set("raceSession", orphan);
+  let savedCheckpoint = null;
+  host.recoveryStore.save = data => { savedCheckpoint = data.checkpoint; return true; };
+  assert.equal(host.saveRecoveryCheckpoint("latest-checkpoint"), false);
+  await host.sessionWrite;
+  assert.deepEqual(settingsState.get("raceSession"), orphan);
+  for (let i = 0; i < 50; i++) {
+    game.socket.emit("test", { type: "host-heartbeat", id: "orphan-heartbeat-" + i,
+      senderId: "orphan", protocolVersion: orphan.protocol, hostInstanceId: orphan.hostInstanceId,
+      hostEpoch: 0, lobbyId: orphan.lobbyId, raceId: orphan.raceId });
+    advance(2000); await host.sessionWrite;
+  }
+  assert.deepEqual(settingsState.get("raceSession"), orphan, "live cross-lobby owner was overwritten");
+  for (let i = 0; i < 46; i++) { advance(2000); await host.sessionWrite; }
+  assert.equal(settingsState.get("raceSession").raceId, host.raceId, "quiet expired cross-lobby lease blocked recovery forever");
+  assert.equal(host.sessionReadyRaceId, host.raceId);
+  assert.equal(savedCheckpoint, "latest-checkpoint");
+  assert.ok(settingsState.get("raceSession").expiresAt > Date.now());
+  host.destroy(); player.destroy();
+}
+
+// Periodic renewals never enqueue a growing promise/socket backlog when the
+// transport is offline or a world-setting acknowledgement is slow.
+{
+  const originalInterval = window.setInterval, originalSet = game.settings.set;
+  const previousConnected = game.socket.connected;
+  const heartbeats = [];
+  window.setInterval = fn => { heartbeats.push({ owner: game.user.id, fn }); return heartbeats.length; };
+  settingsState.delete("raceSession");
+  const { host, player } = setup();
+  await host.sessionWrite;
+  let release, writes = 0;
+  const pending = new Promise(resolve => { release = resolve; });
+  game.settings.set = async (...args) => { writes++; await pending; return originalSet(...args); };
+  const heartbeat = () => as("host", heartbeats.find(h => h.owner === "host").fn);
+  game.socket.connected = false;
+  advance(31_000); heartbeat();
+  assert.equal(writes, 0, "offline heartbeat queued a lease RPC");
+  game.socket.connected = true;
+  heartbeat(); await Promise.resolve(); await Promise.resolve();
+  assert.equal(writes, 1);
+  for (let i = 0; i < 4; i++) { advance(31_000); heartbeat(); await Promise.resolve(); }
+  assert.equal(writes, 1, "slow setting ACK queued repeated lease renewals");
+  release(); await host.sessionWrite;
+  assert.equal(host.sessionWritePending, false);
+  game.settings.set = originalSet;
+  window.setInterval = originalInterval;
+  if (previousConnected === undefined) delete game.socket.connected;
+  else game.socket.connected = previousConnected;
+  host.destroy(); player.destroy();
+}
+
+// A suspension, disconnect, or renewed durable lease restarts the observation
+// period. Wall-clock jumps alone never authorize replacing an active owner.
+{
+  const { RecoveryLeaseGuard, RECOVERY_LEASE_MS } = await import("../scripts/netcode/recovery-lease.js");
+  const lease = { raceId: "a", lobbyId: "a", hostId: "old", expiresAt: 1 };
+  const guard = new RecoveryLeaseGuard();
+  let now = 0;
+  const check = (connected = true) => guard.canReplace(lease, { now, wallNow: 1e15, connected });
+  assert.equal(check(), false);
+  now = 100_000;
+  assert.equal(check(), false, "tab suspension counted as a quiet observation");
+  for (let i = 0; i < 44; i++) { now += 2000; assert.equal(check(), false); }
+  now += 2000;
+  assert.equal(check(), true);
+  assert.equal(check(false), false);
+  now += 2000;
+  assert.equal(check(), false, "disconnect did not reset quiet observation");
+  for (let i = 0; i < RECOVERY_LEASE_MS / 2000; i++) { now += 2000; check(); }
+  assert.equal(check(), true);
+  lease.expiresAt = 2;
+  assert.equal(check(), false, "a renewal did not reset the observed durable identity");
+}
+
+console.log("session-regression-tests: ok (single host instance, F5 restore, lease expiry/renewal, control sessions, coalescing, garage save races, stale confirmations, reordered reconnect)");

@@ -72,9 +72,10 @@ assert.match(foundation, /header-control\[data-action="close"\]::after/,
   "ApplicationV2 close control lacks a font-independent cross");
 assert.match(foundation, /rotate\(-45deg\)/);
 const responsive = fs.readFileSync(path.join(root, "styles/responsive.css"), "utf8");
-assert.match(responsive, /@media \(max-width:\s*480px\)/);
+assert.match(responsive, /@container nfs \(max-width:\s*480px\)/);
 assert.doesNotMatch(responsive, /min-width:\s*(?:480|560)px/);
-assert.equal((responsive.match(/@media \(max-width:\s*720px\)/g) ?? []).length, 1, "720px breakpoint is duplicated");
+assert.equal((responsive.match(/@container nfs \(max-width:\s*720px\)/g) ?? []).length, 1, "720px application breakpoint is duplicated");
+assert.doesNotMatch(responsive, /@media\s*\(max-width/, "resizable app layout must follow its container, not the monitor");
 assert.doesNotMatch(allCss, /nfs-heat-pulse|nfs-talent__copy small|nfs-attribute__copy small/);
 assert.match(allCss, /\.nfs-talent:focus-within/);
 

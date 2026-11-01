@@ -602,4 +602,42 @@ for(const fps of [60,144]) {
   renderer.destroy();Object.defineProperty(globalThis,'performance',originalPerformance);
 }
 
+// A crowded grid must keep the driver's label (or the spectator's leader),
+// rather than painting twelve unreadable names on top of one another. Inspect
+// the actual canvas draw calls, including a long name at the minimum UI width.
+for (const localCarId of ["target", null]) {
+  const previousDpr = window.devicePixelRatio;
+  window.devicePixelRatio = 1;
+  let cssWidth = 360;
+  const canvas = makeCanvas();
+  canvas.getBoundingClientRect = () => ({ width: cssWidth, height: 600 });
+  const context = makeContext(), draws = [];
+  context.drawImage = (image, ...position) => draws.push({ image, position });
+  canvas.getContext = () => context;
+  const renderer = new RaceRenderer(canvas, track, { localCarId });
+  const cars = Array.from({ length: 12 }, (_, i) => ({
+    id: i === 11 ? "target" : "rival-" + i, name: i === 11 ? "Очень длинное имя кристаллического болида 🚗" : "Соперник " + i,
+    place: i === 11 ? 1 : i + 2, x: track.start.x, y: track.start.y,
+    vx: 0, vy: 0, angle: 0, health: 100, maxHealth: 100, charge: 100, maxCharge: 100,
+    heat: 0, lap: 0, progress: 0, color: "#fff", pitState: "track", surfaceSeverity: 0
+  }));
+  const snapshot = { cars, tick: 1, time: 1, simulationTime: 1, started: true, countdown: 0, laps: 3 };
+  renderer.setSimulationFrame(snapshot, snapshot, 0);
+  renderer.render(performance.now() + 100);
+  const labels = new Set([...renderer.labelCache.values()].map(sprite => sprite.canvas));
+  const labelDraws = draws.filter(draw => labels.has(draw.image));
+  const target = [...renderer.labelCache].find(([key]) => key.includes(":target:"))?.[1];
+  assert.equal(labelDraws.length, 1, "overlapping rival names were painted");
+  assert.equal(labelDraws[0].image, target.canvas, "crowding hid the priority car's label");
+  assert.ok(target.canvas.width < canvas.width / 2, "long name covered most of the narrow race view");
+  assert.equal(renderer.getPerformanceStats().visibleLabels, 1);
+  assert.equal(renderer.minimapLayer.width, 128);
+  cssWidth = 760; renderer.resize();
+  assert.equal(renderer.minimapLayer.width, 172);
+  cssWidth = 1040; renderer.resize();
+  assert.equal(renderer.minimapLayer.width, 218);
+  renderer.destroy();
+  window.devicePixelRatio = previousDpr;
+}
+
 console.log("renderer-tests: ok");

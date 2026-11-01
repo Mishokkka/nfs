@@ -25,6 +25,7 @@ export class PitUi {
     };
     this.abortController = new AbortController();
     this.elements.input?.addEventListener("input", this.#onInput, { signal: this.abortController.signal });
+    root?.addEventListener?.("keydown", this.#onTab, { signal: this.abortController.signal, capture: true });
   }
 
   destroy() {
@@ -83,6 +84,15 @@ export class PitUi {
     }
   }
 
+  #onTab = (event) => {
+    const pit = this.elements;
+    if (!pit?.overlay || pit.overlay.hidden || event.key !== "Tab"
+      || event.ctrlKey || event.metaKey || event.altKey) return;
+    event.preventDefault();
+    event.stopPropagation();
+    (pit.input?.disabled ? pit.overlay : pit.input)?.focus({ preventScroll: true });
+  };
+
   #onInput = (event) => {
     const input = event.currentTarget;
     if (!(input instanceof HTMLInputElement)) return;
@@ -106,6 +116,7 @@ export class PitUi {
     if (this.errorTimer != null) window.clearTimeout(this.errorTimer);
     this.errorTimer = null;
     input.disabled = true;
+    this.elements?.overlay?.focus({ preventScroll: true });
     this.elements?.overlay?.classList.remove("is-error");
     this.elements?.overlay?.classList.add("is-complete");
     this.elements?.overlay?.setAttribute("aria-busy", "true");

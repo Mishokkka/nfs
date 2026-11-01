@@ -74,7 +74,8 @@ const { PitUi } = await load("scripts/app/pit-ui.js");
     ["[data-pit-errors]", errors],
     ["[data-pit-count]", count]
   ]);
-  const rootElement = { querySelector: (selector) => bySelector.get(selector) ?? null };
+  const rootElement = new FakeElement();
+  rootElement.querySelector = (selector) => bySelector.get(selector) ?? null;
   const completed = [];
   let restored = 0;
   const pit = new PitUi({
@@ -93,6 +94,11 @@ const { PitUi } = await load("scripts/app/pit-ui.js");
   assert.equal(input.disabled, true);
   assert.equal(errors.textContent, "Подтверждение обслуживания…");
   assert.equal(overlay.getAttribute("aria-busy"), "true");
+  assert.equal(overlay.focusCount, 1, "waiting for the authority must keep focus in the pit dialog");
+  let trapped = 0;
+  rootElement.listeners.get("keydown")({ key: "Tab", preventDefault() { trapped++; }, stopPropagation() {} });
+  assert.equal(trapped, 1);
+  assert.equal(overlay.focusCount, 2, "Tab escaped the busy pit dialog");
 
   pit.update({ pitState: "exit", pitWord: "", pitAttemptId: null, pitStopsCompleted: 1, pitStopsRequired: 1 });
   assert.equal(restored, 1);
@@ -111,6 +117,13 @@ const { PitUi } = await load("scripts/app/pit-ui.js");
   assert.equal(overlay.classList.contains("is-complete"), false);
   assert.equal(input.focusCount, 2);
   assert.equal(restored, 1, "retry must keep focus in the pit dialog");
+  rootElement.listeners.get("keydown")({ key: "Tab", shiftKey: true, preventDefault() { trapped++; }, stopPropagation() {} });
+  assert.equal(input.focusCount, 3, "Shift+Tab escaped the active pit input");
+  rootElement.listeners.get("keydown")({ key: "Tab", ctrlKey: true, preventDefault() { trapped++; }, stopPropagation() {} });
+  assert.equal(trapped, 2, "browser Ctrl+Tab shortcut was trapped");
+  pit.update({ pitState: "track" });
+  rootElement.listeners.get("keydown")({ key: "Tab", preventDefault() { trapped++; }, stopPropagation() {} });
+  assert.equal(trapped, 2, "hidden pit dialog intercepted normal keyboard navigation");
   pit.destroy();
 }
 

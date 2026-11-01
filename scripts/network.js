@@ -8,6 +8,7 @@ import {
   TRACK_ENVIRONMENT_THEMES
 } from "./constants.js";
 import { RaceRecoveryStore } from "./race-recovery.js";
+import { RecoveryLeaseGuard, RECOVERY_LEASE_MS, RECOVERY_LEASE_RENEW_MS } from "./netcode/recovery-lease.js";
 import { generateTrack } from "./track.js";
 import { normalizeBuild } from "./catalog.js";
 import { buildRaceCarMeta, sanitizeInput, RaceSimulation } from "./physics.js";
@@ -664,6 +665,11 @@ export class RaceNetwork {
     this.recoveryCheckpoint = null;
     this.sessionWrite = Promise.resolve();
     this.sessionWriteGeneration = 0;
+    this.sessionWritePending = false;
+    this.recoveryLeaseGuard = new RecoveryLeaseGuard();
+    this.sessionRetry = null;
+    this.nextSessionRenewAt = 0;
+    this.lastLeaseProbeAt = -Infinity;
     this.sessionReadyRaceId = null;
     this.pendingRecoverySave = null;
     this.recoveryWarningShown = false;
@@ -719,6 +725,7 @@ export class RaceNetwork {
 
   initialize() {
     if (this.initialized) return;
+    this.nextSessionRenewAt = 0;
     try {
       this.socketHandler ??= (message) => this.#receive(message);
       game.socket.on(SOCKET, this.socketHandler);
@@ -735,6 +742,11 @@ export class RaceNetwork {
   }
 
   destroy() {
+    this.sessionWriteGeneration += 1;
+    this.sessionWritePending = false;
+    if (this.sessionRetry != null) clearTimeout(this.sessionRetry);
+    this.sessionRetry = null;
+    this.recoveryLeaseGuard.reset();
     if (this.heartbeatTimer) window.clearInterval(this.heartbeatTimer);
     this.heartbeatTimer = null;
     if (this.socketHandler && typeof game.socket.off === "function") game.socket.off(SOCKET, this.socketHandler);
@@ -946,10 +958,10 @@ export class RaceNetwork {
     return saved;
   }
 
-  #warnRecoveryUnavailable() {
+  #warnRecoveryUnavailable(message = "Сохранение гонки для F5 недоступно. Перезагрузка ведущего может потребовать сброса заезда.") {
     if (this.recoveryWarningShown) return;
     this.recoveryWarningShown = true;
-    globalThis.ui?.notifications?.warn?.("Сохранение гонки для F5 недоступно. Перезагрузка ведущего может потребовать сброса заезда.");
+    globalThis.ui?.notifications?.warn?.(message);
   }
 
   takeRecoveryCheckpoint(raceId) {
@@ -967,6 +979,10 @@ export class RaceNetwork {
       hostInstanceId: owner.hostInstanceId ?? null, hostClaimId: owner.hostClaimId ?? owner.hostId,
       hostClaimedAt: Number(owner.hostClaimedAt ?? owner.createdAt) || 0 };
     const generation = ++this.sessionWriteGeneration;
+    this.sessionWritePending = true;
+    if (this.sessionRetry != null) clearTimeout(this.sessionRetry);
+    this.sessionRetry = null;
+    this.nextSessionRenewAt = performance.now() + RECOVERY_LEASE_RENEW_MS;
     const value = this.activeRace?.phase === "race" ? {
       raceId: this.raceId, protocol: PROTOCOL_VERSION, ...authority
     } : {};
@@ -990,9 +1006,34 @@ export class RaceNetwork {
         const newerClaim = durable.lobbyId === authority.lobbyId && this.#compareLobbyOwnership(authority, durable) > 0;
         const retiredOwnLease = durable.hostId === authority.hostId
           && (this.retiredRaceIds.has(durable.raceId) || this.closedLobbyIds.has(durable.lobbyId));
-        if (!sameAuthority && !newerClaim && !retiredOwnLease) return;
+        if (!sameAuthority && !newerClaim && !retiredOwnLease) {
+          // A different local lobby is not proof that the durable owner died.
+          // Renewals and even rejected broadcasts from that owner postpone this
+          // recovery. Probe it while observing, and retry without losing the
+          // latest pending checkpoint or touching the competing live race.
+          if (durable.lobbyId === authority.lobbyId
+            || !this.recoveryLeaseGuard.canReplace(durable, { connected: game.socket.connected !== false })) {
+            if (durable.lobbyId !== authority.lobbyId) {
+              if (value.raceId && this.pendingRecoverySave) this.#warnRecoveryUnavailable(
+                "Сохранение для F5 ожидает завершения прежней сессии. Пока перезагрузка ведущего может сбросить текущий заезд.");
+              this.sessionRetry = setTimeout(() => {
+                this.sessionRetry = null;
+                if (generation === this.sessionWriteGeneration) this.#writeSession(owner);
+              }, 2000);
+              this.sessionRetry?.unref?.();
+              if (game.socket.connected !== false && performance.now() - this.lastLeaseProbeAt >= 10_000) {
+                this.lastLeaseProbeAt = performance.now();
+                this.requestState();
+              }
+            }
+            return;
+          }
+        }
       }
+      if (value.raceId) value.expiresAt = Date.now() + RECOVERY_LEASE_MS;
       await game.settings.set(MODULE_ID, "raceSession", value);
+      if (generation !== this.sessionWriteGeneration) return;
+      this.recoveryLeaseGuard.reset();
       if (!value.raceId || this.raceId !== value.raceId || !this.isHost) return;
       this.sessionReadyRaceId = value.raceId;
       const pending = this.pendingRecoverySave;
@@ -1002,6 +1043,8 @@ export class RaceNetwork {
       .catch(error => {
         console.warn("FBL Need for Speed | не удалось сохранить состояние сессии", error);
         this.#warnRecoveryUnavailable();
+      }).finally(() => {
+        if (generation === this.sessionWriteGeneration) this.sessionWritePending = false;
       });
   }
 
@@ -1462,6 +1505,7 @@ export class RaceNetwork {
     try {
     if (!message?.id || this.seen.has(message.id)) return;
     if (message.protocolVersion !== PROTOCOL_VERSION || !messageFitsLimit(message)) return;
+    this.recoveryLeaseGuard.observe(message);
     this.seen.add(message.id);
     if (this.seen.size > 5000) {
       const iterator = this.seen.values();
@@ -1824,6 +1868,8 @@ export class RaceNetwork {
     if (!this.lobby || this.recoveryRequired) return;
     this.#probeTiming();
     if (this.isHost) {
+      if (game.user.isGM && game.socket.connected !== false && !this.sessionWritePending
+        && this.activeRace?.phase === "race" && performance.now() >= this.nextSessionRenewAt) this.#writeSession();
       this.lastHostHeartbeat = Date.now();
       this.#send({
         type: "host-heartbeat",

@@ -149,6 +149,8 @@ export class RaceRenderer {
     this.measuredFps = 0;
     this.outputScale = 1;
     this.labelCache = new Map();
+    this.labelBounds = new Float32Array(MAX_LABEL_CACHE * 4);
+    this.visibleLabelCount = 0;
     this.labelCacheHits = 0;
     this.labelCacheMisses = 0;
     this.presentationCars = new Map();
@@ -333,6 +335,7 @@ export class RaceRenderer {
       vehicleSpriteHits: this.vehicleSprites.hits,
       vehicleSpritesGenerated: this.vehicleSprites.generated,
       labelCacheSize: this.labelCache.size,
+      visibleLabels: this.visibleLabelCount,
       labelCacheHits: this.labelCacheHits,
       labelCacheMisses: this.labelCacheMisses,
       labelCacheHitRate: labelRequests ? this.labelCacheHits / labelRequests : 1,
@@ -1019,16 +1022,18 @@ export class RaceRenderer {
     const ctx = this.minimapLayerContext;
     if (!ctx) return;
     const s = this.outputScale;
-    const boxWidth = Math.round(218 * s);
-    const boxHeight = Math.round(148 * s);
-    const padding = Math.round(13 * s);
+    const cssWidth = this.canvas.width / s;
+    const mapWidth = cssWidth < 540 ? 128 : cssWidth < 920 ? 172 : 218;
+    const boxWidth = Math.round(mapWidth * s);
+    const boxHeight = Math.round(mapWidth * .68 * s);
+    const padding = Math.round((cssWidth < 540 ? 10 : 13) * s);
     this.minimapLayer.width = boxWidth;
     this.minimapLayer.height = boxHeight;
 
-    this.#roundedRect(ctx, 0, 0, boxWidth, boxHeight, Math.round(9 * s));
-    ctx.fillStyle = "rgba(10, 15, 18, 0.84)";
+    this.#roundedRect(ctx, 0, 0, boxWidth, boxHeight, Math.round(4 * s));
+    ctx.fillStyle = "rgba(23, 29, 26, 0.92)";
     ctx.fill();
-    ctx.strokeStyle = "rgba(113, 145, 157, 0.48)";
+    ctx.strokeStyle = "rgba(173, 151, 103, 0.62)";
     ctx.lineWidth = Math.max(1, s);
     ctx.stroke();
 
@@ -1042,7 +1047,7 @@ export class RaceRenderer {
     const originY = (boxHeight - contentHeight) * 0.5 - bounds.minY * mapScale;
 
     ctx.save();
-    this.#roundedRect(ctx, 2, 2, boxWidth - 4, boxHeight - 4, Math.round(8 * s));
+    this.#roundedRect(ctx, 2, 2, boxWidth - 4, boxHeight - 4, Math.round(3 * s));
     ctx.clip();
     ctx.translate(originX, originY);
     ctx.scale(mapScale, mapScale);
@@ -1697,7 +1702,7 @@ export class RaceRenderer {
     // All text/UI is drawn in screen space. It is never rotated or scaled by the
     // world matrix, so glyph rasterization remains stable while the camera turns.
     ctx.setTransform(1, 0, 0, 1, 0, 0);
-    this.#drawCarLabels(ctx, snapshot.cars, width, height, worldScale);
+    this.#drawCarLabels(ctx, snapshot.cars, width, height, worldScale, focus?.id);
     if (this.minimapEnabled) this.#drawMinimap(ctx, snapshot.cars, width, height);
     if (focus) this.#drawRaceHud(ctx, focus, snapshot, width, height);
     this.#drawCountdown(ctx, snapshot, width, height);
@@ -1972,22 +1977,43 @@ export class RaceRenderer {
     ctx.restore();
   }
 
-  #drawCarLabels(ctx, cars, width, height, worldScale) {
+  #drawCarLabels(ctx, cars, width, height, worldScale, priorityCarId) {
     const verticalOffset = 31 * this.outputScale;
     const cos = Math.cos(this.camera.rotation);
     const sin = Math.sin(this.camera.rotation);
-    for (const car of cars) {
+    const narrow = width / this.outputScale < 540;
+    const maximumWidth = Math.min(220 * this.outputScale, width * .42);
+    const maximumLabels = narrow ? 4 : 8;
+    const bounds = this.labelBounds;
+    this.visibleLabelCount = 0;
+    // Draw the owning label first, then admit non-overlapping rival labels in
+    // stable entry order. The list and raster cache are both strictly bounded.
+    for (let pass = 0; pass < 2; pass++) for (const car of cars) {
+      const local = car.id === this.localCarId;
+      const priority = car.id === priorityCarId;
+      if (priority !== (pass === 0) || this.visibleLabelCount >= maximumLabels) continue;
       const dx = car.x - this.camera.x;
       const dy = car.y - this.camera.y;
       const screenX = width * 0.5 + (dx * cos - dy * sin) * worldScale;
       const screenY = height * 0.5 + (dx * sin + dy * cos) * worldScale;
       if (screenX < -180 || screenX > width + 180 || screenY < -80 || screenY > height + 80) continue;
-      const sprite = this.#getLabelSprite(car.id, car.name, car.id === this.localCarId);
+      if (!priority && (screenX < 0 || screenX > width || screenY < 0 || screenY > height)) continue;
+      const sprite = this.#getLabelSprite(car.id, car.name, local, maximumWidth);
       // The glyphs are already rasterized in a cached sprite. Snapping the whole
       // sprite to integer pixels made its motion visibly step at low chase zoom.
       // Fractional placement keeps the label attached to the interpolated car.
-      const x = screenX - sprite.canvas.width * 0.5;
+      const x = clamp(screenX - sprite.canvas.width * 0.5, 4 * this.outputScale, width - sprite.canvas.width - 4 * this.outputScale);
       const y = screenY - verticalOffset - sprite.canvas.height;
+      const right = x + sprite.canvas.width, bottom = y + sprite.canvas.height;
+      const gap = 3 * this.outputScale;
+      let overlaps = false;
+      for (let i = 0; i < this.visibleLabelCount * 4; i += 4) {
+        if (x < bounds[i + 2] + gap && right > bounds[i] - gap
+          && y < bounds[i + 3] + gap && bottom > bounds[i + 1] - gap) { overlaps = true; break; }
+      }
+      if (overlaps) continue;
+      const index = this.visibleLabelCount++ * 4;
+      bounds[index] = x; bounds[index + 1] = y; bounds[index + 2] = right; bounds[index + 3] = bottom;
       ctx.drawImage(sprite.canvas, x, y);
       ctx.font = sprite.font;
       ctx.textAlign = "center";
@@ -1997,9 +2023,9 @@ export class RaceRenderer {
     }
   }
 
-  #getLabelSprite(carId, name, local) {
-    const safeName = String(name || "Болид");
-    const key = `${this.outputScale.toFixed(3)}:${local ? 1 : 0}:${String(carId)}:${safeName}`;
+  #getLabelSprite(carId, name, local, maximumWidth) {
+    let safeName = String(name || "Болид").normalize("NFC");
+    const key = `${this.outputScale.toFixed(3)}:${Math.round(maximumWidth)}:${local ? 1 : 0}:${String(carId)}:${safeName}`;
     const cached = this.labelCache.get(key);
     if (cached) {
       // Map insertion order is used as an actual LRU queue.
@@ -2018,8 +2044,19 @@ export class RaceRenderer {
     const measure = scratch.getContext("2d");
     const font = `700 ${fontSize}px system-ui, sans-serif`;
     measure.font = font;
-    const nameWidth = Math.ceil(measure.measureText(safeName).width);
     const placeWidth = Math.ceil(measure.measureText("12.").width) + Math.round(4 * scale);
+    const available = Math.max(24 * scale, maximumWidth - placeWidth - paddingX * 2);
+    if (measure.measureText(safeName).width > available) {
+      const characters = Array.from(safeName);
+      let low = 0, high = characters.length;
+      while (low < high) {
+        const middle = Math.ceil((low + high) / 2);
+        if (measure.measureText(characters.slice(0, middle).join("") + "…").width <= available) low = middle;
+        else high = middle - 1;
+      }
+      safeName = characters.slice(0, low).join("") + "…";
+    }
+    const nameWidth = Math.ceil(measure.measureText(safeName).width);
     scratch.width = nameWidth + placeWidth + paddingX * 2;
     scratch.height = fontSize + paddingY * 2 + Math.round(2 * scale);
 
@@ -2028,9 +2065,9 @@ export class RaceRenderer {
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
     this.#roundedRect(ctx, 0.5, 0.5, scratch.width - 1, scratch.height - 1, Math.round(6 * scale));
-    ctx.fillStyle = local ? "rgba(21, 39, 44, 0.92)" : "rgba(13, 17, 19, 0.86)";
+    ctx.fillStyle = local ? "rgba(48, 39, 58, 0.94)" : "rgba(23, 29, 26, 0.90)";
     ctx.fill();
-    ctx.strokeStyle = local ? "rgba(99, 198, 220, 0.90)" : "rgba(133, 145, 149, 0.62)";
+    ctx.strokeStyle = local ? "#bda1df" : "rgba(173, 151, 103, 0.65)";
     ctx.lineWidth = Math.max(1, Math.round(scale));
     ctx.stroke();
     const textColor = local ? "#effcff" : "#eee7d7";
@@ -2071,7 +2108,7 @@ export class RaceRenderer {
     const projection = this.minimapProjection;
     if (!projection) return;
     const s = this.outputScale;
-    const margin = Math.round(14 * s);
+    const margin = Math.round(10 * s);
     const x = width - projection.boxWidth - margin;
     const y = height - projection.boxHeight - margin;
     ctx.drawImage(this.minimapLayer, x, y);
@@ -2108,125 +2145,119 @@ export class RaceRenderer {
     return this.gripFeedback.update(car, performance.now());
   }
 
-  #drawHudPanel(ctx, x, y, width, height, label, value, { valueColor = "#f2f6f7", valueSize = 16 } = {}) {
+  #drawHudPanel(ctx, x, y, width, height, label, value, { valueColor = "#ece8db", valueSize = 15 } = {}) {
     const s = this.outputScale;
-    this.#roundedRect(ctx, x, y, width, height, 8 * s);
-    ctx.fillStyle = "rgba(12, 18, 21, 0.86)";
+    this.#roundedRect(ctx, x, y, width, height, 4 * s);
+    ctx.fillStyle = "rgba(23, 29, 26, 0.94)";
     ctx.fill();
-    ctx.strokeStyle = "rgba(113, 145, 157, 0.45)";
+    ctx.strokeStyle = "rgba(173, 151, 103, 0.62)";
     ctx.lineWidth = Math.max(1, s);
     ctx.stroke();
     ctx.textAlign = "left";
     ctx.textBaseline = "top";
-    ctx.fillStyle = "#94a7ae";
-    ctx.font = `800 ${Math.max(9, Math.round(9 * s))}px system-ui, sans-serif`;
-    ctx.fillText(label.toUpperCase(), x + 10 * s, y + 7 * s);
+    ctx.fillStyle = "#afb5a5";
+    ctx.font = `600 ${Math.max(9, Math.round(9 * s))}px system-ui, sans-serif`;
+    ctx.fillText(label, x + 8 * s, y + 5 * s, width - 16 * s);
     ctx.fillStyle = valueColor;
-    ctx.font = `700 ${Math.max(12, Math.round(valueSize * s))}px system-ui, sans-serif`;
-    ctx.fillText(String(value), x + 10 * s, y + 21 * s);
+    ctx.font = `650 ${Math.max(11, Math.round(valueSize * s))}px system-ui, sans-serif`;
+    ctx.fillText(String(value), x + 8 * s, y + 18 * s, width - 16 * s);
   }
 
   #drawHudMeter(ctx, x, y, width, height, label, ratio, { kind = "charge", warning = false, critical = false, empty = false } = {}) {
     const s = this.outputScale;
-    this.#roundedRect(ctx, x, y, width, height, 8 * s);
-    ctx.fillStyle = empty ? "rgba(58, 24, 20, 0.90)" : "rgba(12, 18, 21, 0.86)";
+    const amount = clamp(Number(ratio) || 0, 0, 1);
+    this.#roundedRect(ctx, x, y, width, height, 3 * s);
+    ctx.fillStyle = empty ? "#382823" : "rgba(23, 29, 26, 0.94)";
     ctx.fill();
-    ctx.strokeStyle = critical ? "rgba(239, 91, 62, 0.90)" : warning ? "rgba(236, 171, 72, 0.78)" : "rgba(113, 145, 157, 0.45)";
+    ctx.strokeStyle = critical ? "#d8806b" : warning ? "#d6a35c" : "rgba(173, 151, 103, 0.5)";
     ctx.lineWidth = Math.max(1, s);
     ctx.stroke();
     ctx.textAlign = "left";
     ctx.textBaseline = "top";
-    ctx.fillStyle = empty ? "#f1a69c" : "#94a7ae";
-    ctx.font = `800 ${Math.max(9, Math.round(9 * s))}px system-ui, sans-serif`;
-    ctx.fillText(label.toUpperCase(), x + 9 * s, y + 6 * s);
-    const barX = x;
-    const barY = y + height - 5 * s;
-    const barWidth = width * clamp(Number(ratio) || 0, 0, 1);
-    if (barWidth <= 0) return;
-    ctx.fillStyle = kind === "health"
-      ? "#c55e52"
-      : kind === "heat" || critical || warning
-        ? "#dc7440"
-        : "#55bfd4";
-    ctx.fillRect(barX, barY, barWidth, 5 * s);
+    ctx.fillStyle = critical || empty ? "#efb3a7" : "#bfc3b5";
+    ctx.font = `600 ${Math.max(9, Math.round(9 * s))}px system-ui, sans-serif`;
+    ctx.fillText(label, x + 7 * s, y + 4 * s, width - 42 * s);
+    ctx.textAlign = "right";
+    ctx.fillText(`${Math.round(amount * 100)}%`, x + width - 7 * s, y + 4 * s);
+    ctx.fillStyle = kind === "health" ? "#c47761" : kind === "heat" || critical || warning ? "#d6a35c" : "#bda1df";
+    ctx.fillRect(x + s, y + height - 3 * s, (width - 2 * s) * amount, 2 * s);
   }
 
   #drawRaceHud(ctx, car, snapshot, width, height) {
     const s = this.outputScale;
-    const margin = 14 * s;
+    const narrow = width / s < 540;
     const compact = width / s < 920;
-    const panelHeight = (compact ? 47 : 50) * s;
-    const gap = 7 * s;
-    const panelWidth = (compact ? 76 : 86) * s;
-    const timingWidth = (compact ? 88 : 102) * s;
-
+    const margin = 10 * s;
+    const gap = 4 * s;
+    const panelHeight = 40 * s;
+    const panelWidth = (narrow ? 70 : compact ? 76 : 84) * s;
     ctx.save();
     const raceValues = [
       ["Место", `${car.place} / ${snapshot.cars.length}`],
       ["Круг", `${Math.min(Number(car.lap || 0) + 1, Number(snapshot.laps) || 1)} / ${snapshot.laps}`],
       ["Пит-стопы", `${car.pitStopsCompleted ?? 0} / ${car.pitStopsRequired ?? snapshot.requiredPitStops ?? 0}`],
-      ["Время", formatRaceTime(Number(snapshot.time))]
+      ["Заезд", formatRaceTime(Number(snapshot.time))]
     ];
     for (let index = 0; index < raceValues.length; index += 1) {
+      const column = narrow ? index % 2 : index;
+      const row = narrow ? Math.floor(index / 2) : 0;
       const [label, value] = raceValues[index];
-      this.#drawHudPanel(ctx, margin + index * (panelWidth + gap), margin, panelWidth, panelHeight, label, value, {
-        valueSize: compact ? 13 : 15
-      });
+      this.#drawHudPanel(ctx, margin + column * (panelWidth + gap), margin + row * (panelHeight + gap),
+        panelWidth, panelHeight, label, value, { valueSize: compact ? 13 : 15 });
     }
-
-    const timingY = margin + panelHeight + gap;
-    const timingValues = [
+    const timingY = margin + (narrow ? 2 : 1) * (panelHeight + gap);
+    const timingValues = narrow ? [
+      ["Текущий", formatRaceTime(Number(car.currentLapTime))],
+      ["Лучший", formatRaceTime(car.bestLapTime)]
+    ] : [
       ["Текущий круг", formatRaceTime(Number(car.currentLapTime))],
       ["Последний", formatRaceTime(car.lastLapTime)],
       ["Лучший", formatRaceTime(car.bestLapTime)]
     ];
+    const timingWidth = narrow ? panelWidth : (compact ? 96 : 105) * s;
     for (let index = 0; index < timingValues.length; index += 1) {
       const [label, value] = timingValues[index];
-      this.#drawHudPanel(ctx, margin + index * (timingWidth + gap), timingY, timingWidth, panelHeight, label, value, {
-        valueSize: compact ? 11 : 13
-      });
+      this.#drawHudPanel(ctx, margin + index * (timingWidth + gap), timingY, timingWidth, 35 * s,
+        label, value, { valueSize: 11 });
     }
 
-    const vehicleWidth = (compact ? 184 : 210) * s;
+    const vehicleWidth = (narrow ? 128 : 160) * s;
     const vehicleX = width - margin - vehicleWidth;
     const speedKmh = Math.round(Math.hypot(Number(car.vx) || 0, Number(car.vy) || 0) * (0.62 / 3));
-    this.#drawHudPanel(ctx, vehicleX, margin, vehicleWidth, 55 * s, "Скорость", `${speedKmh} км/ч`, {
-      valueColor: "#f5d985",
-      valueSize: compact ? 17 : 20
+    this.#drawHudPanel(ctx, vehicleX, margin, vehicleWidth, 46 * s, "Скорость", `${speedKmh} км/ч`, {
+      valueColor: "#e4c991", valueSize: 21
     });
-    const meterHeight = 31 * s;
-    const meterGap = 7 * s;
-    let meterY = margin + 55 * s + meterGap;
-    this.#drawHudMeter(ctx, vehicleX, meterY, vehicleWidth, meterHeight, "Прочность", Number(car.health) / Math.max(1, Number(car.maxHealth) || 1), { kind: "health" });
-    meterY += meterHeight + meterGap;
+    const meterHeight = 21 * s;
+    let meterY = margin + 46 * s + gap;
+    this.#drawHudMeter(ctx, vehicleX, meterY, vehicleWidth, meterHeight, "Прочность",
+      Number(car.health) / Math.max(1, Number(car.maxHealth) || 1), { kind: "health" });
+    meterY += meterHeight + gap;
     const chargeEmpty = Number(car.charge) <= 0.01;
-    this.#drawHudMeter(ctx, vehicleX, meterY, vehicleWidth, meterHeight, chargeEmpty ? "Заряд исчерпан" : "Заряд", Number(car.charge) / Math.max(1, Number(car.maxCharge) || 1), { kind: "charge", empty: chargeEmpty });
-    meterY += meterHeight + meterGap;
+    this.#drawHudMeter(ctx, vehicleX, meterY, vehicleWidth, meterHeight, chargeEmpty ? "Нет заряда" : "Кристалл",
+      Number(car.charge) / Math.max(1, Number(car.maxCharge) || 1), { kind: "charge", empty: chargeEmpty });
+    meterY += meterHeight + gap;
     const warningAt = car.heatWarning ? 68 : 78;
-    this.#drawHudMeter(ctx, vehicleX, meterY, vehicleWidth, meterHeight, car.overheated ? "Перегрев · блокировка" : Number(car.heat) >= warningAt ? "Опасный нагрев" : "Нагрев", Number(car.heat) / 100, {
-      kind: "heat",
-      warning: Number(car.heat) >= warningAt,
-      critical: Boolean(car.overheated) || Number(car.heat) >= 100
-    });
+    this.#drawHudMeter(ctx, vehicleX, meterY, vehicleWidth, meterHeight,
+      car.overheated ? "Перегрев" : Number(car.heat) >= warningAt ? "Опасный нагрев" : "Нагрев", Number(car.heat) / 100,
+      { kind: "heat", warning: Number(car.heat) >= warningAt, critical: Boolean(car.overheated) || Number(car.heat) >= 100 });
 
     const status = this.#raceHudStatus(car);
     if (status) {
-      ctx.font = `750 ${Math.max(10, Math.round(11 * s))}px system-ui, sans-serif`;
-      const paddingX = 13 * s;
-      const statusWidth = Math.min(width - 32 * s, ctx.measureText(status).width + paddingX * 2);
-      const statusHeight = 34 * s;
+      ctx.font = `600 ${Math.max(10, Math.round(11 * s))}px system-ui, sans-serif`;
+      const statusWidth = Math.min(width - 24 * s, ctx.measureText(status).width + 24 * s);
+      const statusHeight = 30 * s;
       const statusX = (width - statusWidth) * 0.5;
-      const statusY = 116 * s;
-      this.#roundedRect(ctx, statusX, statusY, statusWidth, statusHeight, 8 * s);
-      ctx.fillStyle = "rgba(48, 31, 15, 0.93)";
+      const statusY = 142 * s;
+      this.#roundedRect(ctx, statusX, statusY, statusWidth, statusHeight, 4 * s);
+      ctx.fillStyle = "#26261af5";
       ctx.fill();
-      ctx.strokeStyle = "rgba(218, 154, 72, 0.62)";
+      ctx.strokeStyle = "#9b8155";
       ctx.lineWidth = Math.max(1, s);
       ctx.stroke();
-      ctx.fillStyle = "#ffe3a4";
+      ctx.fillStyle = "#e4c991";
       ctx.textAlign = "center";
       ctx.textBaseline = "middle";
-      ctx.fillText(status, width * 0.5, statusY + statusHeight * 0.5);
+      ctx.fillText(status, width * 0.5, statusY + statusHeight * 0.5, statusWidth - 16 * s);
     }
     ctx.restore();
   }

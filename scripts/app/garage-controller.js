@@ -89,7 +89,8 @@ export class GarageController {
         ...talent,
         tooltip: `${talent.name}. ${talent.description}`,
         checked: driver.talents.includes(talent.id)
-      }))
+      })),
+      selectedTalentNames: DRIVER_TALENTS.filter(t => driver.talents.includes(t.id)).map(t => t.name).join(" · ") || "Выберите два таланта"
     };
   }
 
@@ -191,6 +192,8 @@ export class GarageController {
     for (const checkbox of root.querySelectorAll("input[name='talents']")) {
       checkbox.closest(".nfs-talent")?.classList.toggle("is-selected", checkbox.checked);
     }
+    const talents = root.querySelector("[data-selected-talents]");
+    if (talents) talents.textContent = DRIVER_TALENTS.filter(t => this.build.driver.talents.includes(t.id)).map(t => t.name).join(" · ") || "Выберите два таланта";
 
     const catalogs = {
       frame: PARTS.frame,
@@ -302,12 +305,16 @@ export class GarageController {
       return false;
     }
     this.build = normalizeBuild(this.build, { repairPoints: true });
-    await game.settings.set(MODULE_ID, "build", this.build);
-    this.comparisonBuild = foundry.utils.deepClone(this.build);
+    // Form edits can replace or mutate the draft during the setting round-trip.
+    // Keep the submitted build independent of that live draft all the way to
+    // the comparison baseline and the lobby update.
+    const submitted = foundry.utils.deepClone(this.build);
+    await game.settings.set(MODULE_ID, "build", submitted);
+    this.comparisonBuild = foundry.utils.deepClone(submitted);
     this.refreshPreview(root);
-    if (this.network.participant) this.network.updateBuild(this.build);
+    if (this.network.participant) this.network.updateBuild(submitted);
     if (showNotification) ui.notifications.info("Сборка сохранена.");
-    return true;
+    return submitted;
   }
 
   #driverTotal(driver) {

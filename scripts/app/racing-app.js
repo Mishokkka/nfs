@@ -6,6 +6,7 @@ import { LobbyController } from "./lobby-controller.js";
 import { RaceRuntime } from "./race-runtime.js";
 import { ScreenStateMachine, formatTime } from "./app-helpers.js";
 import { TooltipController } from "./tooltip-controller.js";
+import { ViewState } from "./view-state.js";
 import { playUiClick } from "./sound-manager.js";
 
 const { ApplicationV2, HandlebarsApplicationMixin } = foundry.applications.api;
@@ -21,7 +22,7 @@ export class BigRacesApp extends HandlebarsApplicationMixin(ApplicationV2) {
       resizable: true,
       minimizable: true
     },
-    position: { width: 1180, height: 760 }
+    position: { width: 1040, height: 720 }
   };
 
   static PARTS = {
@@ -35,6 +36,7 @@ export class BigRacesApp extends HandlebarsApplicationMixin(ApplicationV2) {
     this.garage = new GarageController({ network });
     this.lobby = new LobbyController({ network });
     this.results = null;
+    this.viewState = new ViewState();
     this.hostOffline = false;
     this.closing = false;
     this.closeConfirmed = false;
@@ -55,6 +57,11 @@ export class BigRacesApp extends HandlebarsApplicationMixin(ApplicationV2) {
 
   get screen() {
     return this.screenStateMachine.current;
+  }
+
+  render(options = {}) {
+    this.viewState?.capture(this.element);
+    return super.render(options);
   }
 
   #setScreen(screen, options = {}) {
@@ -118,6 +125,7 @@ export class BigRacesApp extends HandlebarsApplicationMixin(ApplicationV2) {
 
   async _prepareContext(options) {
     return {
+      screenName: this.screen,
       isGarage: this.screenStateMachine.is("garage"),
       isLobby: this.screenStateMachine.is("lobby"),
       isRace: this.screenStateMachine.is("race"),
@@ -147,6 +155,7 @@ export class BigRacesApp extends HandlebarsApplicationMixin(ApplicationV2) {
     this.garage.bind(root, signal);
     this.lobby.bind(root, signal);
     if (this.screenStateMachine.is("race")) this.runtime.mount(root);
+    this.viewState.restore(root);
   }
 
   async close(options = {}) {
@@ -211,24 +220,30 @@ export class BigRacesApp extends HandlebarsApplicationMixin(ApplicationV2) {
       case "save-build":
         await this.garage.saveFromForm(this.element);
         break;
-      case "practice":
-        if (await this.garage.saveFromForm(this.element, false)) this.#startPractice();
+      case "practice": {
+        const saved = await this.garage.saveFromForm(this.element, false);
+        if (saved) this.#startPractice(saved);
         break;
-      case "create-lobby":
-        if (!(await this.garage.saveFromForm(this.element, false))) return;
-        if (!this.network.createLobby({ build: this.garage.build, config: this.lobby.config })) {
+      }
+      case "create-lobby": {
+        const saved = await this.garage.saveFromForm(this.element, false);
+        if (!saved) return;
+        if (!this.network.createLobby({ build: saved, config: this.lobby.config })) {
           ui.notifications.warn("В мире уже существует активное лобби.");
           this.#setScreen("lobby");
           this.network.requestState();
         } else this.#setScreen("lobby");
         this.render({ force: true });
         break;
-      case "join-lobby":
-        if (await this.garage.saveFromForm(this.element, false)) {
+      }
+      case "join-lobby": {
+        const saved = await this.garage.saveFromForm(this.element, false);
+        if (saved) {
           this.joinPending = true;
-          this.network.join(this.garage.build);
+          this.network.join(saved);
         }
         break;
+      }
       case "leave-lobby":
         this.network.leave();
         break;
@@ -263,6 +278,12 @@ export class BigRacesApp extends HandlebarsApplicationMixin(ApplicationV2) {
       case "copy-performance-report":
         await this.runtime.copyPerformanceReport();
         break;
+      case "resume-driving": {
+        const help = this.element?.querySelector(".nfs-controls-help");
+        if (help) help.open = false;
+        this.runtime.input.restoreFocus();
+        break;
+      }
       case "abandon-race":
         await this.#abandonRace();
         break;
@@ -277,10 +298,10 @@ export class BigRacesApp extends HandlebarsApplicationMixin(ApplicationV2) {
     }
   }
 
-  #startPractice() {
+  #startPractice(build = this.garage.build) {
     this.viewingNetworkRace = false;
     this.resumeRequested = false;
-    const { config, entries } = this.lobby.createPractice(this.garage.build);
+    const { config, entries } = this.lobby.createPractice(build);
     this.runtime.start({
       config,
       entries,
@@ -359,16 +380,20 @@ export class BigRacesApp extends HandlebarsApplicationMixin(ApplicationV2) {
       if (await this.#confirmStopRace()) this.network.stopRace();
       return;
     }
-    const wasDriver = Boolean(this.runtime.localCarId);
+    const raceId = this.runtime.currentRaceId;
+    const carId = this.runtime.localCarId;
+    const wasDriver = Boolean(carId);
     if (wasDriver && !(await foundry.applications.api.DialogV2.confirm({
       window: { title: "Передать болид автоматону?" },
       content: "<p>Вернуть ручное управление в этом заезде уже не получится. Чтобы временно скрыть окно, используйте сворачивание.</p>",
       yes: { label: "Передать болид" }, no: { label: "Остаться" }, rejectClose: false, modal: true
     }))) return;
+    if (this.runtime.practice || this.runtime.currentRaceId !== raceId
+      || this.runtime.localCarId !== carId || this.network.isHost) return;
     this.viewingNetworkRace = false;
     this.dismissedRaceId = this.network.activeRace?.sessionId ?? this.runtime.currentRaceId;
     this.runtime.sendNeutralInput();
-    if (wasDriver) this.network.leaveRace(this.runtime.localCarId);
+    if (wasDriver) this.network.leaveRace(carId);
     this.runtime.stop();
     this.#setScreen(this.network.lobby ? "lobby" : "garage");
     this.render({ force: true });
@@ -376,9 +401,12 @@ export class BigRacesApp extends HandlebarsApplicationMixin(ApplicationV2) {
   }
 
   async #confirmStopRace() {
+    const raceId = this.runtime.currentRaceId;
+    const carId = this.runtime.localCarId;
     const DialogV2 = foundry.applications.api.DialogV2;
+    let confirmed;
     if (DialogV2?.confirm) {
-      return DialogV2.confirm({
+      confirmed = await DialogV2.confirm({
         window: { title: "Завершить общий заезд?" },
         content: "<p>Гонка завершится для всех участников. Результаты текущего заезда не будут сохранены.</p>",
         yes: { label: "Завершить", icon: "fas fa-flag" },
@@ -386,7 +414,8 @@ export class BigRacesApp extends HandlebarsApplicationMixin(ApplicationV2) {
         rejectClose: false,
         modal: true
       });
-    }
-    return window.confirm("Завершить общий заезд для всех участников?");
+    } else confirmed = window.confirm("Завершить общий заезд для всех участников?");
+    return Boolean(confirmed && !this.runtime.practice && this.network.isHost
+      && this.runtime.currentRaceId === raceId && this.runtime.localCarId === carId);
   }
 }
