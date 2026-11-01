@@ -3,7 +3,7 @@
 export const APP_SCREENS = Object.freeze(["garage", "lobby", "race", "results"]);
 
 const TRANSITIONS = Object.freeze({
-  garage: new Set(["garage", "lobby", "race"]),
+  garage: new Set(["garage", "lobby", "race", "results"]),
   lobby: new Set(["garage", "lobby", "race", "results"]),
   race: new Set(["garage", "lobby", "race", "results"]),
   results: new Set(["garage", "lobby", "race", "results"])

@@ -2,6 +2,7 @@
 .nfs-shell {
   position: relative;
   display: grid;
+  grid-template-columns: minmax(0,1fr);
   grid-template-rows: auto minmax(0,1fr) auto;
   width: 100%;
   height: 100%;
@@ -49,6 +50,8 @@
   font: 700 21px/1 Georgia,serif;
   letter-spacing: .02em;
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .nfs-brand__copy span {
   margin-top: 4px;

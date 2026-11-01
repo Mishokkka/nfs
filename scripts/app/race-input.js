@@ -118,6 +118,8 @@ export class RaceInput {
   focus() {
     const target = this.target;
     if (!target?.isConnected) return;
+    const local = this.getSnapshot()?.cars?.find(car => car.id === this.getLocalCarId());
+    if (local?.pitState === "service") return;
     target.focus({ preventScroll: true });
     this.#syncFocusNotice();
   }
@@ -173,13 +175,14 @@ export class RaceInput {
 
   #onWindowBlur = () => {
     if (!this.isRaceActive()) return;
+    this.#cancelPendingRestore();
     this.neutralize();
     this.#syncFocusNotice();
   };
 
   #onDocumentVisibility = () => {
     if (!this.isRaceActive()) return;
-    if (document.hidden) this.neutralize();
+    if (document.hidden) { this.#cancelPendingRestore(); this.neutralize(); }
     this.onVisibilityChange(Boolean(document.hidden));
     this.#syncFocusNotice();
   };
@@ -192,6 +195,7 @@ export class RaceInput {
 
   #onFocus = () => this.#syncFocusNotice();
   #onBlur = () => {
+    this.#cancelPendingRestore();
     if (this.isRaceActive()) this.neutralize();
     this.#syncFocusNotice();
   };

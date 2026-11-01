@@ -47,6 +47,7 @@ export class RaceRuntime {
     this.lastInputSequence = new Map();
     this.networkStatus = null;
     this.lastConnectionCheckAt = -Infinity;
+    this.viewSettingWarningShown = false;
     try {
       this.cameraMode = game.settings.get(MODULE_ID, "cameraMode") || "overview";
       this.minimapEnabled = game.settings.get(MODULE_ID, "minimapEnabled") !== false;
@@ -89,6 +90,7 @@ export class RaceRuntime {
 
   start({ config, entries, host, practice = false, raceId = null, initialSnapshot = null, assignedCarId = null, checkpoint = null, allowLocalControl = true }) {
     this.stop();
+    this.viewSettingWarningShown = false;
     this.practice = Boolean(practice);
     this.isHost = Boolean(host);
     this.config = normalizeConfig(config);
@@ -141,7 +143,9 @@ export class RaceRuntime {
       this.networkStatus = root.querySelector("[data-network-status]");
       this.renderer = new RaceRenderer(canvas, this.track, {
         localCarId: this.localCarId,
-        onHud: (car, snapshot) => this.hud.update(car, snapshot),
+        // Spectators follow the leader for instruments, but must never receive
+        // that driver's interactive service dialog.
+        onHud: (car, snapshot) => this.hud.update(car.id === this.localCarId ? car : null, snapshot),
         cameraMode: this.cameraMode,
         minimapEnabled: this.minimapEnabled,
         enableLocalPrediction: !this.simulation,
@@ -246,7 +250,6 @@ export class RaceRuntime {
   async setCameraMode(mode) {
     if (!["overview", "chase"].includes(mode)) return;
     this.cameraMode = mode;
-    await game.settings.set(MODULE_ID, "cameraMode", mode);
     this.renderer?.setCameraMode(mode);
     const root = this.renderer?.canvas?.closest?.(".fbl-need-for-speed") ?? document;
     for (const button of root.querySelectorAll?.("[data-camera-mode]") ?? []) {
@@ -255,6 +258,7 @@ export class RaceRuntime {
       button.setAttribute("aria-pressed", String(active));
     }
     this.input.focus();
+    await this.#saveViewSetting("cameraMode", mode);
   }
 
   toggleCameraMode() {
@@ -263,7 +267,6 @@ export class RaceRuntime {
 
   async toggleMinimap() {
     this.minimapEnabled = !this.minimapEnabled;
-    await game.settings.set(MODULE_ID, "minimapEnabled", this.minimapEnabled);
     this.renderer?.setMinimapEnabled(this.minimapEnabled);
     const button = this.renderer?.canvas?.closest?.(".fbl-need-for-speed")?.querySelector?.("[data-action='toggle-minimap']");
     if (button) {
@@ -271,6 +274,18 @@ export class RaceRuntime {
       button.setAttribute("aria-pressed", String(this.minimapEnabled));
     }
     this.input.focus();
+    await this.#saveViewSetting("minimapEnabled", this.minimapEnabled);
+  }
+
+  async #saveViewSetting(key, value) {
+    try { await game.settings.set(MODULE_ID, key, value); }
+    catch (error) {
+      console.warn("FBL Need for Speed | настройка вида не сохранена", error);
+      if (!this.viewSettingWarningShown) {
+        this.viewSettingWarningShown = true;
+        ui.notifications.warn("Выбор вида применён, но не сохранён для следующих запусков.");
+      }
+    }
   }
 
   async copyPerformanceReport() {

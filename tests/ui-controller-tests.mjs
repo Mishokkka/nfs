@@ -176,6 +176,26 @@ const { RaceInput } = await load("scripts/app/race-input.js");
 }
 
 const { RaceHud } = await load("scripts/app/race-hud.js");
+// The delayed focus retries must respect a later user blur, and must never
+// refocus driving underneath an interactive service dialog.
+{
+  const priorDocument=globalThis.document,priorAdd=window.addEventListener;
+  const canvas=new FakeElement();let service=false;
+  globalThis.document={activeElement:canvas,hidden:false,addEventListener(){}};
+  window.addEventListener=()=>{};
+  const input=new RaceInput({getLocalCarId:()=> 'driver',getSnapshot:()=>({cars:[{id:'driver',pitState:service?'service':'track'}]}),
+    isRaceActive:()=>true,onInput(){},onCameraMode(){},onToggleCamera(){},onToggleMinimap(){},onVisibilityChange(){}});
+  input.mount(canvas,{querySelector:()=>null});input.restoreFocus();
+  const frame=frameCallbacks.get(input.restoreFrame),timer=window.timers.get(input.restoreTimer)?.callback;
+  document.activeElement=new FakeInput();canvas.emit('blur');const count=canvas.focusCount;
+  frame?.(0);timer?.();await Promise.resolve();
+  assert.equal(canvas.focusCount,count,'old focus retries overrode a newer user focus');
+  service=true;input.restoreFocus();await Promise.resolve();
+  assert.equal(canvas.focusCount,count,'focus jumped from pit input to driving');
+  input.destroyListeners();globalThis.document=priorDocument;
+  if(priorAdd===undefined)delete window.addEventListener;else window.addEventListener=priorAdd;
+}
+
 {
   const hud = new RaceHud({ pitUi: { update() {} } });
   hud.updateCount = 9;
@@ -188,6 +208,52 @@ const { RaceHud } = await load("scripts/app/race-hud.js");
     domWrites: 0
   });
   hud.destroy();
+}
+
+// Losing local ownership must close an existing service dialog once, without
+// copying the followed leader's interactive pit state to a spectator.
+{
+  const updates=[];
+  const hud=new RaceHud({pitUi:{update:car=>updates.push(car)}});
+  const service={id:'own',pitState:'service',pitAttemptId:'a',pitWord:'ядро'};
+  hud.update(service,{cars:[service]});
+  hud.update(null,{cars:[service]});
+  hud.update(null,{cars:[service]});
+  assert.equal(updates.length,2);
+  assert.equal(updates[0].pitState,'service');
+  assert.notEqual(updates[1].pitState,'service','spectator retained an interactive pit dialog');
+}
+
+// A lobby update may arrive before blur/change commits a typed value. Preserve
+// that draft and its caret, but never carry it into another lobby or a disabled
+// control after the host role changes.
+{
+  const {ViewState}=await load('scripts/app/view-state.js');
+  const state=new ViewState(),field=new FakeInput();
+  field.name='seed';field.type='number';field.value='777888';field.selectionStart=null;field.selectionEnd=null;
+  field.matches=()=>true;field.closest=()=>({dataset:{form:'lobby-config'}});
+  const disclosure={dataset:{nfsDisclosure:'track-code'},open:true};
+  const scroll={scrollTop:231};
+  const shell={dataset:{nfsScreen:'lobby',nfsScope:'lobby-a'}};
+  const rootElement={contains:el=>el===field,querySelector:s=>s==='[data-nfs-screen]'?shell:s==='.nfs-view'?scroll:null,
+    querySelectorAll:s=>s==='[data-nfs-disclosure]'?[disclosure]:[field]};
+  const priorDocument=globalThis.document;globalThis.document={activeElement:field};
+  state.capture(rootElement);
+  field.value='88201';disclosure.open=false;scroll.scrollTop=0;
+  state.restore(rootElement);
+  assert.equal(field.value,'777888');assert.equal(field.focusCount,1);assert.equal(disclosure.open,true);assert.equal(scroll.scrollTop,231);
+  shell.dataset.nfsScope='lobby-b';field.value='123';state.restore(rootElement);assert.equal(field.value,'123');
+  shell.dataset.nfsScope='lobby-a';field.disabled=true;state.restore(rootElement);assert.equal(field.value,'123');
+  field.disabled=false;field.type='text';field.selectionStart=2;field.selectionEnd=4;field.value='late edit';
+  let selection;field.setSelectionRange=(...range)=>selection=range;
+  state.capture(rootElement);field.value='stale template';state.restore(rootElement);
+  assert.equal(field.value,'late edit');assert.deepEqual(selection,[2,4]);
+  field.setAttribute('aria-invalid','true');field.validity={customError:true};field.validationMessage='Введите целое число';
+  let restoredValidity;field.setCustomValidity=message=>restoredValidity=message;
+  state.capture(rootElement);field.setAttribute('aria-invalid','false');state.restore(rootElement);
+  assert.equal(field.getAttribute('aria-invalid'),'true');assert.equal(restoredValidity,'Введите целое число');
+  state.capture(null);assert.equal(state.saved,null);
+  globalThis.document=priorDocument;
 }
 
 

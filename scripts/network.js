@@ -907,6 +907,7 @@ export class RaceNetwork {
     const carMeta = normalizeCarMeta(null, safeEntries);
     const controlAssignments = buildControlAssignments(safeEntries);
     if (!controlAssignments) return null;
+    this.recoveryWarningShown = false;
     this.lobby.phase = "race";
     this.snapshotSequence = 0;
     this.lastReceivedSnapshotSequence = -1;
@@ -947,6 +948,10 @@ export class RaceNetwork {
 
   saveRecoveryCheckpoint(checkpoint) {
     if (!this.isHost || this.activeRace?.phase !== "race") return false;
+    if (!game.user.isGM) {
+      this.#warnRecoveryUnavailable("После перезагрузки ведущего-игрока заезд придётся начать заново. Для восстановления после F5 ведущим должен быть ГМ.");
+      return false;
+    }
     // Keep the previous tab checkpoint until the new world lease is durable.
     // Otherwise a second F5 during the setting round-trip loses both versions.
     if (game.user.isGM && this.sessionReadyRaceId !== this.raceId) {
@@ -954,7 +959,7 @@ export class RaceNetwork {
       return false;
     }
     const saved = this.recoveryStore.save({ lobby: this.lobby, race: this.activeRace, checkpoint });
-    if (!saved && this.recoveryStore.warned) this.#warnRecoveryUnavailable();
+    if (!saved) this.#warnRecoveryUnavailable();
     return saved;
   }
 

@@ -679,4 +679,129 @@ for (const role of ["player", "host"]) for (const changed of ["currentRaceId", "
   assert.equal(check(), false, "a renewal did not reset the observed durable identity");
 }
 
-console.log("session-regression-tests: ok (single host instance, F5 restore, lease expiry/renewal, control sessions, coalescing, garage save races, stale confirmations, reordered reconnect)");
+// Foundry serializes a render queued by stopRace behind close(). The close
+// lifecycle must fence synchronous stop/lobby handlers before either can queue
+// a forced reopen. A player's close also suppresses unsolicited state replies.
+for(const role of ['host','player']) {
+  const {host,player}=setup(),beforeUser=game.user;game.user=users.get(role);
+  const network=role==='host'?host:player,app=new BigRacesApp(network);
+  for(const fn of network.handlers.start)fn(network.activeRace);
+  app.rendered=true;const count=app.renderCalls;
+  await app._preClose({});
+  assert.equal(app.renderCalls,count,'closing queued a forced render of the lobby');
+  assert.equal(app.closing,true);
+  await app._onClose({});app.rendered=false;
+  if(role==='player') {
+    const before=app.renderCalls;
+    for(const fn of network.handlers.raceState)fn({race:network.activeRace,snapshot:null});
+    assert.equal(app.renderCalls,before,'closed player view reopened on unsolicited state');
+    assert.equal(sent.some(m=>m.type==='leave-race'),false,'closing permanently abandoned the car');
+  }
+  app.shutdown();host.destroy();player.destroy();game.user=beforeUser;
+}
+
+// Delayed saves may persist, but cannot launch an obsolete test drive after
+// navigation/close or supersede the user's newer launch intent.
+for(const outcome of ['navigate','close','latest']) {
+  listeners.length=0;const network=makeNetwork('host'),app=new BigRacesApp(network);
+  const events=new Map();app.element={querySelector:()=>null,querySelectorAll:()=>[],addEventListener:(type,fn)=>events.set(type,fn),contains:()=>true};
+  app.rendered=true;await app._onRender({},{});
+  const starts=[];app.runtime.start=options=>starts.push(options);
+  const originalSet=game.settings.set;let release;
+  const gate=new Promise(resolve=>release=resolve);
+  game.settings.set=async()=>{await gate;};
+  const click=action=>events.get('click')({target:{closest:()=>({dataset:{action}})},preventDefault(){}});
+  click('practice');
+  if(outcome==='navigate')click('show-lobby');
+  if(outcome==='close'){await app._preClose({});await app._onClose({});app.rendered=false;}
+  if(outcome==='latest')click('practice');
+  release();for(let i=0;i<8;i++)await Promise.resolve();
+  assert.equal(starts.length,outcome==='latest'?1:0,`obsolete launch survived ${outcome}`);
+  game.settings.set=originalSet;app.shutdown();network.destroy();
+}
+
+// Leaving results is an explicit presentation choice too. State discovery must
+// not pull a player back into the finished race when browsing Garage/Lobby.
+for(const action of ['results-lobby','show-garage','show-lobby']) {
+  const {host,player}=setup(),beforeUser=game.user;game.user=users.get('player');
+  const app=new BigRacesApp(player);
+  for(const fn of player.handlers.start)fn(player.activeRace);
+  as('host',()=>host.sendResults({cars:host.activeRace.entries.map((e,i)=>({id:e.id,finished:true,finishTime:100+i}))}));
+  assert.equal(app.screen,'results');
+  const events=new Map();app.element={querySelector:()=>null,querySelectorAll:()=>[],addEventListener:(type,fn)=>events.set(type,fn),contains:()=>true};
+  await app._onRender({},{});
+  events.get('click')({target:{closest:()=>({dataset:{action}})},preventDefault(){}});
+  advance(1100);player.requestState();
+  assert.equal(app.screen,action==='show-garage'?'garage':'lobby',`state reply undid ${action}`);
+  app.shutdown();host.destroy();player.destroy();game.user=beforeUser;
+}
+
+// A player can host, but cannot maintain the world lease required for F5. Do
+// not report such a checkpoint as saved, or repeatedly write an unusable save.
+{
+  listeners.length=0;const beforeUser=game.user;game.user=users.get('player');
+  const network=makeNetwork('player'),originalWarn=ui.notifications.warn,warnings=[];
+  ui.notifications.warn=message=>warnings.push(message);
+  network.createLobby({build:cloneDefaultBuild(),config:{seed:88201,bots:0}});
+  const entries=[{id:'player-car',userId:'player',build:cloneDefaultBuild()}];
+  network.startRace(entries);
+  let writes=0;network.recoveryStore.save=()=>{writes++;return true;};
+  assert.equal(network.saveRecoveryCheckpoint('not-recoverable'),false);
+  assert.equal(network.saveRecoveryCheckpoint('still-not-recoverable'),false);
+  assert.equal(writes,0);assert.equal(warnings.length,1);
+  network.stopRace();network.startRace(entries);network.saveRecoveryCheckpoint('new-race');
+  assert.equal(warnings.length,2,'a new race suppressed its recovery warning');
+  ui.notifications.warn=originalWarn;network.destroy();game.user=beforeUser;
+}
+
+// A failed build write stays on the current form with its draft intact and
+// produces a handled error, rather than an unhandled event-handler rejection.
+{
+  listeners.length=0;const network=makeNetwork('host'),app=new BigRacesApp(network),events=new Map();
+  app.element={querySelector:()=>null,querySelectorAll:()=>[],addEventListener:(type,fn)=>events.set(type,fn),contains:()=>true};
+  app.rendered=true;await app._onRender({},{});app.garage.build.name='Unsaved draft';
+  const originalSet=game.settings.set,originalError=ui.notifications.error,originalConsole=console.error,errors=[];
+  game.settings.set=async()=>{throw new Error('client storage unavailable');};
+  ui.notifications.error=message=>errors.push(message);console.error=()=>{};
+  events.get('click')({target:{closest:()=>({dataset:{action:'save-build'}})},preventDefault(){}});
+  for(let i=0;i<8;i++)await Promise.resolve();
+  assert.equal(errors.length,1);assert.equal(app.screen,'garage');assert.equal(app.garage.build.name,'Unsaved draft');
+  assert.notEqual(app.garage.comparisonBuild.name,'Unsaved draft');
+  game.settings.set=originalSet;ui.notifications.error=originalError;console.error=originalConsole;
+  app.shutdown();network.destroy();
+}
+
+// A reconnect can discover a finished race while the newly opened app is still
+// on Garage; this is a valid transition to Results, not a rejected UI state.
+{
+  const {host,player}=setup(),beforeUser=game.user;game.user=users.get('player');
+  as('host',()=>host.sendResults({cars:host.activeRace.entries.map((e,i)=>({id:e.id,finished:true,finishTime:100+i}))}));
+  const app=new BigRacesApp(player);player.requestState();
+  assert.equal(app.screen,'results','cold reconnect could not present finished results from Garage');
+  app.shutdown();host.destroy();player.destroy();game.user=beforeUser;
+}
+
+// Preferences are optional persistence: camera/map must apply immediately,
+// and an older acknowledgement must not rewind the latest choice.
+{
+  const originalSet=game.settings.set,originalWarn=ui.notifications.warn,originalConsoleWarn=console.warn;
+  const runtime=new RaceRuntime({network:{},isRaceActive:()=>true,onFinished(){}}),cameras=[],maps=[],pending=[],warnings=[];
+  runtime.renderer={setCameraMode:mode=>cameras.push(mode),setMinimapEnabled:enabled=>maps.push(enabled)};
+  runtime.input.focus=()=>{};document.querySelectorAll=()=>[];
+  game.settings.set=()=>new Promise(resolve=>pending.push(resolve));
+  const first=runtime.setCameraMode('chase'),second=runtime.setCameraMode('overview');
+  assert.deepEqual(cameras,['chase','overview'],'camera waited for preference persistence');
+  pending[1]();await second;pending[0]();await first;
+  assert.equal(cameras.at(-1),'overview','older camera ACK undid the latest choice');
+  const off=runtime.toggleMinimap(),on=runtime.toggleMinimap();
+  assert.deepEqual(maps,[false,true],'map waited for preference persistence');
+  pending[3]();await on;pending[2]();await off;assert.equal(maps.at(-1),true);
+  ui.notifications.warn=message=>warnings.push(message);console.warn=()=>{};
+  game.settings.set=async()=>{throw new Error('client storage unavailable');};
+  await runtime.setCameraMode('chase');await runtime.toggleMinimap();
+  assert.equal(runtime.cameraMode,'chase');assert.equal(warnings.length,1,'preference errors were silent or spammed');
+  runtime.renderer=null;runtime.destroy();
+  game.settings.set=originalSet;ui.notifications.warn=originalWarn;console.warn=originalConsoleWarn;delete document.querySelectorAll;
+}
+
+console.log("session-regression-tests: ok (single host instance, F5 restore, leases, view lifecycle, obsolete launches, results dismissal, preferences, control sessions)");

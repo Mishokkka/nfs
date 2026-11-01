@@ -37,6 +37,8 @@ export class BigRacesApp extends HandlebarsApplicationMixin(ApplicationV2) {
     this.lobby = new LobbyController({ network });
     this.results = null;
     this.viewState = new ViewState();
+    this.viewGeneration = 0;
+    this.launchRequest = 0;
     this.hostOffline = false;
     this.closing = false;
     this.closeConfirmed = false;
@@ -59,13 +61,18 @@ export class BigRacesApp extends HandlebarsApplicationMixin(ApplicationV2) {
     return this.screenStateMachine.current;
   }
 
-  render(options = {}) {
+  _replaceHTML(result, content, options) {
+    // Capture at replacement, after async template work, so typing and scroll
+    // changes made while a render was queued are not overwritten by old state.
     this.viewState?.capture(this.element);
-    return super.render(options);
+    return super._replaceHTML(result, content, options);
   }
 
   #setScreen(screen, options = {}) {
-    return this.screenStateMachine.transition(screen, options);
+    const previous = this.screen;
+    const changed = this.screenStateMachine.transition(screen, options);
+    if (changed && previous !== this.screen) this.viewGeneration++;
+    return changed;
   }
 
   #bindNetwork() {
@@ -93,7 +100,7 @@ export class BigRacesApp extends HandlebarsApplicationMixin(ApplicationV2) {
       this.network.on("hostStatus", ({ offline }) => {
         this.hostOffline = offline;
         if (this.#ownsNetworkRuntime() || this.screenStateMachine.is("lobby")) {
-          if (offline) ui.notifications.warn("Связь с ведущим потеряна. После F5 ГМа гонка продолжится из сохранения вкладки ведущего; без сохранения доступен сброс в лобби.");
+          if (offline) ui.notifications.warn("Связь с ведущим потеряна. Дождитесь его возвращения; если заезд не восстановится, ГМ может сбросить его в лобби.");
           else ui.notifications.info("Связь с ведущим Больших Гонок восстановлена.");
         }
         if (this.screenStateMachine.is("lobby") && this.rendered) this.render({ force: true });
@@ -123,9 +130,17 @@ export class BigRacesApp extends HandlebarsApplicationMixin(ApplicationV2) {
       || Boolean(race?.controlAssignments?.[game.user.id] && this.network.participant);
   }
 
+  #dismissRaceView() {
+    if (this.viewingNetworkRace) this.dismissedRaceId = this.network.activeRace?.sessionId ?? this.network.raceId ?? this.runtime.currentRaceId;
+    this.viewingNetworkRace = false;
+    this.resumeRequested = false;
+  }
+
   async _prepareContext(options) {
     return {
       screenName: this.screen,
+      viewScope: this.screen === "lobby" ? this.network.lobby?.id ?? "empty"
+        : this.screen === "race" ? this.runtime.currentRaceId ?? "empty" : this.screen,
       isGarage: this.screenStateMachine.is("garage"),
       isLobby: this.screenStateMachine.is("lobby"),
       isRace: this.screenStateMachine.is("race"),
@@ -168,11 +183,15 @@ export class BigRacesApp extends HandlebarsApplicationMixin(ApplicationV2) {
   }
 
   async _preClose(options) {
+    // stopRace synchronously broadcasts stop/lobby events. Mark closing before
+    // them, or those handlers queue a forced render behind Foundry's close.
+    this.closing = true;
+    this.viewGeneration++;
+    if (!this.runtime.practice) this.#dismissRaceView();
     if (this.screenStateMachine.is("race") && !this.runtime.practice) {
       if (this.network.isHost) this.network.stopRace();
       else if (this.runtime.localCarId) this.runtime.sendNeutralInput();
     }
-    this.closing = true;
     this.renderAbortController?.abort();
     this.renderAbortController = null;
     this.tooltips.destroy();
@@ -189,6 +208,7 @@ export class BigRacesApp extends HandlebarsApplicationMixin(ApplicationV2) {
   }
 
   shutdown() {
+    this.viewGeneration++;
     this.renderAbortController?.abort();
     this.tooltips.destroy({ removeElement: true });
     this.runtime.destroy();
@@ -200,18 +220,33 @@ export class BigRacesApp extends HandlebarsApplicationMixin(ApplicationV2) {
     if (!button || !this.element?.contains(button)) return;
     event.preventDefault();
     playUiClick();
-    void this.#onAction(button.dataset.action);
+    void this.#onAction(button.dataset.action).catch(error => {
+      console.error("FBL Need for Speed | действие интерфейса не выполнено", error);
+      ui.notifications.error("Не удалось выполнить действие. Подробности записаны в консоль Foundry.");
+    });
   };
+
+  async #saveForLaunch() {
+    const request = ++this.launchRequest, view = this.viewGeneration;
+    const lobbyId = this.network.lobby?.id, phase = this.network.lobby?.phase, raceId = this.network.raceId;
+    const saved = await this.garage.saveFromForm(this.element, false);
+    // Saving may finish after navigation, close, another launch, or a host's
+    // race transition. Keep the saved build, discard only the obsolete launch.
+    return saved && this.rendered && !this.closing && view === this.viewGeneration && request === this.launchRequest
+      && lobbyId === this.network.lobby?.id && phase === this.network.lobby?.phase && raceId === this.network.raceId ? saved : false;
+  }
 
   async #onAction(action) {
     switch (action) {
       case "show-garage":
         if (this.screenStateMachine.is("race")) return;
+        this.#dismissRaceView();
         this.#setScreen("garage");
         this.render({ force: true });
         break;
       case "show-lobby":
         if (this.screenStateMachine.is("race")) return;
+        this.#dismissRaceView();
         this.garage.readFromForm(this.element);
         this.#setScreen("lobby");
         this.network.requestState();
@@ -221,12 +256,12 @@ export class BigRacesApp extends HandlebarsApplicationMixin(ApplicationV2) {
         await this.garage.saveFromForm(this.element);
         break;
       case "practice": {
-        const saved = await this.garage.saveFromForm(this.element, false);
+        const saved = await this.#saveForLaunch();
         if (saved) this.#startPractice(saved);
         break;
       }
       case "create-lobby": {
-        const saved = await this.garage.saveFromForm(this.element, false);
+        const saved = await this.#saveForLaunch();
         if (!saved) return;
         if (!this.network.createLobby({ build: saved, config: this.lobby.config })) {
           ui.notifications.warn("В мире уже существует активное лобби.");
@@ -237,7 +272,7 @@ export class BigRacesApp extends HandlebarsApplicationMixin(ApplicationV2) {
         break;
       }
       case "join-lobby": {
-        const saved = await this.garage.saveFromForm(this.element, false);
+        const saved = await this.#saveForLaunch();
         if (saved) {
           this.joinPending = true;
           this.network.join(saved);
@@ -288,6 +323,7 @@ export class BigRacesApp extends HandlebarsApplicationMixin(ApplicationV2) {
         await this.#abandonRace();
         break;
       case "results-lobby":
+        this.#dismissRaceView();
         this.results = null;
         this.#setScreen(this.network.lobby ? "lobby" : "garage");
         if (this.network.isHost && this.network.lobby) this.network.stopRace();
