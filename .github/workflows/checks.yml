@@ -57,7 +57,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-        run: gh release create "$GITHUB_REF_NAME" dist/*.zip dist/SHA256SUMS.txt dist/module.json --draft --verify-tag --title "$GITHUB_REF_NAME" --generate-notes
+        run: node scripts/publish-manifest.mjs --prepare
       - name: Publish complete release and advance eligible update channels
         env:
           GH_TOKEN: ${{ github.token }}

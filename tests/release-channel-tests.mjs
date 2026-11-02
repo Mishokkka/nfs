@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import { publishRelease } from "../scripts/publish-manifest.mjs";
+import { publishRelease, prepareRelease, createReleaseApi } from "../scripts/publish-manifest.mjs";
 
 const source = JSON.parse(fs.readFileSync(new URL("../module-source.json", import.meta.url)));
 const manifest = version => `${JSON.stringify({ ...source, version,
@@ -120,9 +120,81 @@ for (const invalid of ["missing-zip", "uploading", "prerelease", "tag", "bad-lat
   assert.deepEqual(f.versions(), { latest: "0.18.0", legacy: "0.16.10" });
 }
 
+// Exercise the real CLI adapter: draft lookup must paginate the draft-capable
+// list, preserve the REST id and never call the published-only tag endpoint.
+{
+  const draft = { id: 123, tag_name: "v0.17.0", draft: true, prerelease: false }, calls = [];
+  const api = createReleaseApi((...args) => {
+    calls.push(args);
+    if (args[0] === "api" && args.at(-1).endsWith("/releases?per_page=100")) return JSON.stringify([[{ id: 1, tag_name: "v0.16.10" }], [draft]]);
+    if (args[0] === "release" && args[1] === "upload") return "";
+    if (args[0] === "api" && args.includes("--method")) {
+      const payload = JSON.parse(fs.readFileSync(args[args.indexOf("--input") + 1]));
+      assert.equal(payload.make_latest, "false");
+      assert.ok(args.includes("repos/Mishokkka/nfs/releases/123"));
+      return "{}";
+    }
+    throw new Error(`Unexpected command: ${args.join(" ")}`);
+  });
+  assert.deepEqual(api.release("v0.17.0"), draft);
+  assert.ok(calls[0].includes("--paginate") && calls[0].includes("--slurp"));
+  assert.equal(await prepareRelease(api, "v0.17.0"), "uploaded-draft");
+  const upload = calls.find(args => args[1] === "upload");
+  assert.ok(upload.includes("--clobber") && upload.includes("dist/fbl-need-for-speed-0.17.0.zip"));
+  api.publishWithoutLatest(draft);
+  assert.throws(() => createReleaseApi(() => JSON.stringify([[draft], [draft]])).release("v0.17.0"), /Ambiguous/);
+  assert.throws(() => createReleaseApi(() => "[[]]").release("v0.17.0"), /missing/);
+  const creates = [], empty = createReleaseApi((...args) => {
+    if (args[0] === "api") return "[[]]";
+    creates.push(args); return "";
+  });
+  assert.equal(await prepareRelease(empty, "v0.17.0"), "created");
+  assert.ok(creates[0].includes("--draft") && creates[0].includes("--verify-tag"));
+  let reads = 0;
+  const changed = createReleaseApi((...args) => {
+    assert.equal(args[0], "api", "uploaded after the draft became public");
+    return JSON.stringify([[++reads === 1 ? draft : { ...draft, draft: false, published_at: "now" }]]);
+  });
+  await assert.rejects(prepareRelease(changed, "v0.17.0"), /Refusing/);
+}
+
+// Whole-job retry: an existing partial draft is completed; a failure AFTER
+// publication reuses public assets without clobber and reaches the publisher.
+for (const failedStage of ["upload", "legacy"]) {
+  const f = fixture(), actions = [];
+  let failUpload = failedStage === "upload";
+  Object.assign(f.api, {
+    findRelease: async tag => structuredClone(f.releases.get(tag)?.release ?? null),
+    createDraft: async tag => { actions.push("create"); f.add(tag.slice(1)); },
+    uploadDraft: async release => {
+      assert.equal(release.draft, true); actions.push("upload-draft");
+      if (failUpload) { failUpload = false; throw new Error("interrupted upload"); }
+    }
+  });
+  if (failedStage === "upload") {
+    f.add("0.17.0");
+    await assert.rejects(prepareRelease(f.api, "v0.17.0"), /interrupted/);
+  } else {
+    await prepareRelease(f.api, "v0.17.0"); f.denyLegacy(true);
+    await assert.rejects(publishRelease(f.api, "v0.17.0"), /denied/); f.denyLegacy(false);
+  }
+  const assetsBeforeRetry = structuredClone(f.releases.get("v0.17.0").release.assets);
+  await prepareRelease(f.api, "v0.17.0"); await publishRelease(f.api, "v0.17.0");
+  assert.deepEqual(f.versions(), { latest: "0.17.0", legacy: "0.17.0" });
+  assert.deepEqual(f.releases.get("v0.17.0").release.assets, assetsBeforeRetry);
+  assert.deepEqual(actions, failedStage === "upload" ? ["upload-draft", "upload-draft"] : ["create"]);
+}
+{
+  let writes = 0;
+  await assert.rejects(prepareRelease({ findRelease: async () => { throw new Error("API unavailable"); }, createDraft: () => writes++ }, "v0.17.0"), /unavailable/);
+  await assert.rejects(prepareRelease({ findRelease: async () => ({ tag_name: "v0.17.0", draft: true, prerelease: true }), uploadDraft: () => writes++ }, "v0.17.0"));
+  assert.equal(writes, 0, "lookup errors were interpreted as an absent release");
+}
+
 // All stable tags must share the same non-cancelling queue, rather than one
 // lock per tag. The workflow must delegate promotion to the tested sequence.
 const workflow = fs.readFileSync(new URL("../.github/workflows/checks.yml", import.meta.url), "utf8");
 assert.match(workflow, /concurrency:\s+group: nfs-stable-release\s+cancel-in-progress: false\s+queue: max/);
 assert.doesNotMatch(workflow, /gh release edit[^\n]*--latest/);
+assert.match(workflow, /run: node scripts\/publish-manifest\.mjs --prepare/);
 console.log("release-channel-tests: ok (ordered/out-of-order tags, both channels at every mutation, retries, failures and publication guards)");

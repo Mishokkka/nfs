@@ -103,7 +103,7 @@ export function verifyPublicManifest(localText, releasedText, release) {
 
 function gh(...args) {
   if (process.env.GH_REPO !== REPOSITORY) throw new Error("Unexpected release repository");
-  return execFileSync("gh", args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 60_000 });
+  return execFileSync("gh", args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 60_000, maxBuffer: 16 * 1024 * 1024 });
 }
 
 function checkPublicManifest() {
@@ -118,34 +118,64 @@ function checkPublicManifest() {
   verifyPublicManifest(manifestText, releasedText, release);
 }
 
-function optionalResource(endpoint) {
-  try { return JSON.parse(gh("api", endpoint)); }
+function optionalResource(endpoint, run = gh) {
+  try { return JSON.parse(run("api", endpoint)); }
   catch (error) { if (!String(error.stderr ?? "").includes("HTTP 404")) throw error; return null; }
 }
 
-function writeResource(method, endpoint, payload) {
+function writeResource(method, endpoint, payload, run = gh) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "nfs-release-manifest-"));
   const payloadPath = path.join(directory, "manifest-update.json");
   try {
     fs.writeFileSync(payloadPath, JSON.stringify(payload));
-    gh("api", "--method", method, endpoint, "--input", payloadPath);
+    run("api", "--method", method, endpoint, "--input", payloadPath);
   } finally { fs.rmSync(payloadPath, { force: true }); fs.rmdirSync(directory); }
 }
 
-function publishManifest() {
+/** Whole-job retries must reach the publisher without replacing public assets. */
+export async function prepareRelease(api, tag) {
+  if (!/^v\d+\.\d+\.\d+$/.test(tag ?? "")) throw new Error("Only stable tags may prepare release assets");
+  const release = await api.findRelease(tag);
+  if (!release) { await api.createDraft(tag); return "created"; }
+  if (release.tag_name !== tag || release.prerelease !== false) throw new Error("Unexpected existing release");
+  if (release.draft === true) { await api.uploadDraft(release); return "uploaded-draft"; }
+  if (release.draft === false && release.published_at) return "reuse-published";
+  throw new Error("Invalid release state");
+}
+
+export function createReleaseApi(run = gh) {
   const endpoint = `repos/${REPOSITORY}`;
-  return publishRelease({
-    release: tag => JSON.parse(gh("api", `${endpoint}/releases/tags/${tag}`)),
-    manifest: tag => gh("release", "download", tag, "--repo", REPOSITORY, "--pattern", "module.json", "--output", "-"),
-    latest: () => optionalResource(`${endpoint}/releases/latest`),
-    legacy: () => optionalResource(`${endpoint}/contents/module.json?ref=main`),
-    publishWithoutLatest: release => writeResource("PATCH", `${endpoint}/releases/${release.id}`, { draft: false, make_latest: "false" }),
-    updateLegacy: payload => writeResource("PUT", `${endpoint}/contents/module.json`, payload),
-    promote: release => writeResource("PATCH", `${endpoint}/releases/${release.id}`, { make_latest: "true" })
-  }, process.env.GITHUB_REF_NAME);
+  const find = tag => {
+    // The list explicitly includes drafts for a writer token. Do not depend on
+    // the published-release-by-tag endpoint for the initial draft lookup.
+    const pages = JSON.parse(run("api", "--paginate", "--slurp", `${endpoint}/releases?per_page=100`));
+    if (!Array.isArray(pages) || !pages.every(Array.isArray)) throw new Error("Invalid releases list response");
+    const matches = pages.flat().filter(item => item.tag_name === tag);
+    if (matches.length > 1) throw new Error(`Ambiguous releases for ${tag}`);
+    return matches[0] ?? null;
+  };
+  const required = tag => { const release = find(tag); if (!release) throw new Error(`Release missing for ${tag}`); return release; };
+  const assets = tag => [`dist/${MODULE_ID}-${tag.slice(1)}.zip`, "dist/SHA256SUMS.txt", "dist/module.json"];
+  return {
+    findRelease: find,
+    release: required,
+    createDraft: tag => run("release", "create", tag, ...assets(tag), "--repo", REPOSITORY, "--draft", "--verify-tag", "--title", tag, "--generate-notes"),
+    uploadDraft: release => {
+      const current = required(release.tag_name);
+      if (current.id !== release.id || current.draft !== true || current.prerelease !== false) throw new Error("Refusing to replace assets outside the original draft");
+      return run("release", "upload", current.tag_name, ...assets(current.tag_name), "--repo", REPOSITORY, "--clobber");
+    },
+    manifest: tag => run("release", "download", tag, "--repo", REPOSITORY, "--pattern", "module.json", "--output", "-"),
+    latest: () => optionalResource(`${endpoint}/releases/latest`, run),
+    legacy: () => optionalResource(`${endpoint}/contents/module.json?ref=main`, run),
+    publishWithoutLatest: release => writeResource("PATCH", `${endpoint}/releases/${release.id}`, { draft: false, make_latest: "false" }, run),
+    updateLegacy: payload => writeResource("PUT", `${endpoint}/contents/module.json`, payload, run),
+    promote: release => writeResource("PATCH", `${endpoint}/releases/${release.id}`, { make_latest: "true" }, run)
+  };
 }
 
 if (process.argv[1] && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url) {
   if (process.argv[2] === "--check") checkPublicManifest();
-  else await publishManifest();
+  else if (process.argv[2] === "--prepare") await prepareRelease(createReleaseApi(), process.env.GITHUB_REF_NAME);
+  else await publishRelease(createReleaseApi(), process.env.GITHUB_REF_NAME);
 }
