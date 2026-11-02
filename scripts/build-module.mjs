@@ -5,7 +5,8 @@ import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const manifest = JSON.parse(fs.readFileSync(path.join(root, "module.json"), "utf8"));
+const manifestBytes = fs.readFileSync(path.join(root, "module-source.json"));
+const manifest = JSON.parse(manifestBytes.toString("utf8"));
 const pkg = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
 if (manifest.version !== pkg.version) throw new Error("Run npm run sync-version before building");
 const files = ["module.json", "README.md", "CHANGELOG.md"];
@@ -32,7 +33,9 @@ const chunks = [], central = [];
 let offset = 0;
 for (const file of files.sort()) {
   const name = Buffer.from(`${manifest.id}/${file.replaceAll("\\", "/")}`);
-  const data = fs.readFileSync(path.join(root, file));
+  // The repository's public module.json belongs to the last published release.
+  // Development builds always package the source manifest at the Foundry path.
+  const data = file === "module.json" ? manifestBytes : fs.readFileSync(path.join(root, file));
   const compressed = deflateRawSync(data, { level: 9 });
   const crc = crc32(data);
   const local = Buffer.alloc(30);
@@ -66,5 +69,6 @@ const dist = path.join(root, "dist");
 fs.mkdirSync(dist, { recursive: true });
 const name = `${manifest.id}-${pkg.version}.zip`;
 fs.writeFileSync(path.join(dist, name), archive);
-fs.writeFileSync(path.join(dist, "SHA256SUMS.txt"), `${createHash("sha256").update(archive).digest("hex")}  ${name}\n`);
+fs.writeFileSync(path.join(dist, "module.json"), manifestBytes);
+fs.writeFileSync(path.join(dist, "SHA256SUMS.txt"), `${createHash("sha256").update(archive).digest("hex")}  ${name}\n${createHash("sha256").update(manifestBytes).digest("hex")}  module.json\n`);
 console.log(path.join(dist, name));

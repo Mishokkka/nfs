@@ -57,6 +57,7 @@ function validCheckpointValue(key, value, initial) {
   if (key === "currentInput") return value && typeof value === "object"
     && JSON.stringify(sanitizeInput(value)) === JSON.stringify(value);
   if (CHECKPOINT_NULLABLE_STRINGS.has(key)) return value === null || (typeof value === "string" && value.length <= 80);
+  if (key === "lastInputSequence") return Number.isSafeInteger(value) && value >= -1;
   if (initial === null) return value === null || (Number.isFinite(value) && Math.abs(value) <= 1e9);
   if (typeof initial === "number") return Number.isFinite(value) && Math.abs(value) <= 1e9;
   return typeof value === typeof initial && (typeof value !== "string" || value.length <= 80);

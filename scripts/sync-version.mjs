@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const packagePath = path.join(root, "package.json");
-const modulePath = path.join(root, "module.json");
+const modulePath = path.join(root, "module-source.json");
 const constantsPath = path.join(root, "scripts/constants.js");
 const readmePath = path.join(root, "README.md");
 
@@ -16,7 +16,7 @@ if (!/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(version)) {
 
 const manifest = JSON.parse(fs.readFileSync(modulePath, "utf8"));
 manifest.version = version;
-manifest.manifest = "https://raw.githubusercontent.com/Mishokkka/nfs/main/module.json";
+manifest.manifest = "https://github.com/Mishokkka/nfs/releases/latest/download/module.json";
 manifest.download = `https://github.com/Mishokkka/nfs/releases/download/v${version}/fbl-need-for-speed-${version}.zip`;
 
 const constants = fs.readFileSync(constantsPath, "utf8");

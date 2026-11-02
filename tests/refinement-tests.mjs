@@ -77,6 +77,38 @@ for (const seed of [88201, 424242]) {
   assert.equal(restored.cars[0].pitStopsCompleted, 1);
 }
 
+// Leaving sends a terminal input sequence before handing the human car to a
+// bot. That sequence must survive F5; resetInputs intentionally skips this car.
+{
+  const setup = { track: generateTrack(9, 2),
+    entries: [{ id: "leaver", userId: "pilot", build }] };
+  const original = new RaceSimulation(setup);
+  original.setInput("leaver", neutralInput(), Number.MAX_SAFE_INTEGER);
+  assert.equal(original.handToBot("leaver"), true);
+  const checkpoint = JSON.parse(JSON.stringify(original.exportCheckpoint()));
+  for (const resetInputs of [false, true]) {
+    const restored = new RaceSimulation(setup).restoreCheckpoint(checkpoint, { resetInputs });
+    assert.equal(restored.cars[0].lastInputSequence, Number.MAX_SAFE_INTEGER);
+    assert.equal(restored.cars[0].abandoned, true);
+    assert.equal(restored.cars[0].isBot, true);
+    const expected = new RaceSimulation(setup).restoreCheckpoint(checkpoint);
+    for (let tick = 0; tick < 300; tick++) { expected.step(); restored.step(); }
+    assert.deepEqual(restored.exportCheckpoint(), expected.exportCheckpoint(), "abandoned car diverged after restore");
+  }
+  for (const sequence of [-1, 0, 1e9 + 1, Number.MAX_SAFE_INTEGER]) {
+    const saved = structuredClone(checkpoint);
+    saved.cars[0].state.lastInputSequence = sequence;
+    assert.equal(new RaceSimulation(setup).restoreCheckpoint(saved).cars[0].lastInputSequence, sequence);
+  }
+  for (const sequence of [-2, .5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+    const saved = structuredClone(checkpoint), clean = new RaceSimulation(setup);
+    const before = clean.exportCheckpoint();
+    saved.cars[0].state.lastInputSequence = sequence;
+    assert.throws(() => clean.restoreCheckpoint(saved), `accepted invalid input sequence ${sequence}`);
+    assert.deepEqual(clean.exportCheckpoint(), before, "invalid input sequence partially mutated authority");
+  }
+}
+
 {
   const feedback = new GripFeedback(), car = { id: "a", angle: 0, vx: 400, vy: 140, driftAmount: 0 };
   assert.equal(feedback.update(car, 100), "", "one contact impulse caused a warning");

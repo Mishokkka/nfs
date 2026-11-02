@@ -804,4 +804,86 @@ for(const action of ['results-lobby','show-garage','show-lobby']) {
   game.settings.set=originalSet;ui.notifications.warn=originalWarn;console.warn=originalConsoleWarn;delete document.querySelectorAll;
 }
 
+// A GM who recovers another host's lobby need not be a driver. Starting and
+// restoring the race must still create exactly one authoritative Worker.
+{
+  settingsState.delete("raceSession");
+  const { host, player } = setup(), previousWorker = globalThis.Worker, previousUser = game.user;
+  const rescuerId = "rescue-gm";
+  users.set(rescuerId, { id: rescuerId, name: "Rescue GM", isGM: true, active: true });
+  game.user = users.get(rescuerId);
+  let liveWorkers = 0;
+  globalThis.Worker = class {
+    constructor() { liveWorkers++; this.alive = true; }
+    addEventListener() {} removeEventListener() {} postMessage() {}
+    terminate() { if (this.alive) { liveWorkers--; this.alive = false; } }
+  };
+  host.destroy();
+  player.hostOffline = true; // the remaining participant has timed out the former host
+  const rescuer = makeNetwork(rescuerId), app = as(rescuerId, () => new BigRacesApp(rescuer));
+  as(rescuerId, () => rescuer.requestState());
+  assert.equal(as(rescuerId, () => rescuer.recoverOrphanedSession()), true);
+  assert.equal(as(rescuerId, () => rescuer.participant), null);
+  const entries = [{ id: "car-player", userId: "player", build: cloneDefaultBuild() }];
+  as(rescuerId, () => rescuer.startRace(entries));
+  assert.equal(app.runtime.isHost, true, "a non-participant GM did not start authority");
+  assert.equal(app.screen, "race");
+  assert.equal(app.runtime.localCarId, null);
+  assert.equal(liveWorkers, 1);
+  const duplicate = makeNetwork(rescuerId), duplicateApp = as(rescuerId, () => new BigRacesApp(duplicate));
+  as(rescuerId, () => duplicate.requestState());
+  assert.equal(duplicateApp.runtime.isHost, false);
+  assert.equal(liveWorkers, 1, "secondary GM window started a second Worker");
+  await rescuer.sessionWrite;
+  const config = rescuer.activeRace.config;
+  const sim = new RaceSimulation({ ...config, entries, track: generateTrack(config.seed, config.trackComplexity, config.environmentTheme) });
+  assert.equal(as(rescuerId, () => rescuer.saveRecoveryCheckpoint(JSON.stringify(sim.exportCheckpoint()))), true);
+  app.shutdown(); rescuer.destroy();
+  const returning = makeNetwork(rescuerId), returningApp = as(rescuerId, () => new BigRacesApp(returning));
+  assert.equal(as(rescuerId, () => returning.restoreSavedRace()), true);
+  await returning.sessionWrite;
+  assert.equal(returningApp.runtime.isHost, true, "a non-participant GM did not restore authority");
+  assert.equal(returningApp.runtime.localCarId, null);
+  assert.equal(liveWorkers, 1);
+  as(rescuerId, () => returning.stopRace());
+  returningApp.shutdown(); duplicateApp.shutdown(); returning.destroy(); duplicate.destroy(); player.destroy();
+  assert.equal(liveWorkers, 0);
+  users.delete(rescuerId);
+  game.user = previousUser;
+  if (previousWorker === undefined) delete globalThis.Worker; else globalThis.Worker = previousWorker;
+}
+
+// Renewing an already durable same-race lease must not pause tab checkpoints,
+// even with a slow ACK or failed write. A replacement race still waits for ACK.
+for (const failure of [false, true]) {
+  const originalInterval = window.setInterval, originalSet = game.settings.set, originalWarn = console.warn;
+  const heartbeats = [];
+  window.setInterval = fn => { heartbeats.push({ owner: game.user.id, fn }); return heartbeats.length; };
+  settingsState.delete("raceSession");
+  const { host, player } = setup();
+  await host.sessionWrite;
+  const saved = [];
+  host.recoveryStore.save = data => { saved.push(data.checkpoint); return true; };
+  assert.equal(host.saveRecoveryCheckpoint("before-renewal"), true);
+  let finish;
+  const gate = new Promise((resolve, reject) => { finish = failure ? () => reject(new Error("renewal failed")) : resolve; });
+  game.settings.set = async (...args) => { await gate; return originalSet(...args); };
+  console.warn = () => {};
+  advance(31_000);
+  as("host", heartbeats.find(h => h.owner === "host").fn);
+  await Promise.resolve(); await Promise.resolve();
+  assert.equal(host.saveRecoveryCheckpoint("during-renewal"), true, "same-race renewal paused tab checkpoints");
+  finish(); await host.sessionWrite;
+  assert.equal(host.saveRecoveryCheckpoint("after-renewal"), true, "failed renewal disabled tab checkpoints");
+  assert.deepEqual(saved, ["before-renewal", "during-renewal", "after-renewal"]);
+  game.settings.set = originalSet;
+  const entries = host.activeRace.entries;
+  host.stopRace(); host.startRace(entries);
+  assert.equal(host.saveRecoveryCheckpoint("new-race-before-ack"), false, "replacement race reused the old durable lease");
+  await host.sessionWrite;
+  assert.equal(saved.at(-1), "new-race-before-ack", "new-race checkpoint was not flushed after ACK");
+  host.destroy(); player.destroy();
+  window.setInterval = originalInterval; game.settings.set = originalSet; console.warn = originalWarn;
+}
+
 console.log("session-regression-tests: ok (single host instance, F5 restore, leases, view lifecycle, obsolete launches, results dismissal, preferences, control sessions)");

@@ -4,7 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const manifest = JSON.parse(fs.readFileSync(path.join(root, "module.json"), "utf8"));
+const manifest = JSON.parse(fs.readFileSync(path.join(root, "module-source.json"), "utf8"));
 const expectedOrder = [
   "styles/fbl-need-for-speed.css",
   "styles/layout/shell.css",

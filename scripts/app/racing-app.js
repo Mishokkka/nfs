@@ -126,7 +126,7 @@ export class BigRacesApp extends HandlebarsApplicationMixin(ApplicationV2) {
   #shouldPresentRace(race) {
     if (this.runtime.practice) return false;
     if ((race?.sessionId ?? race?.raceId) === this.dismissedRaceId && !this.resumeRequested && !this.viewingNetworkRace) return false;
-    return this.resumeRequested || this.viewingNetworkRace
+    return this.network.isHost || this.resumeRequested || this.viewingNetworkRace
       || Boolean(race?.controlAssignments?.[game.user.id] && this.network.participant);
   }
 

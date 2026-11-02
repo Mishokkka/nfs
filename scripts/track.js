@@ -1647,14 +1647,16 @@ export function generateTrack(seed, complexity = 2, environmentTheme = "auto") {
   let usedAttempt = 0;
   let city = null;
 
-  const prepareCandidate = (candidateControls, candidateSamples, { requireTournamentProfile = true } = {}) => {
+  const prepareCandidate = (candidateControls, candidateSamples, {
+    requireTournamentProfile = true, urbanWidthSeed = seed
+  } = {}) => {
     if (!candidateSamples?.length || polylineSelfIntersects(candidateSamples)) return null;
     const rotated = rotateToBestStart(candidateSamples);
     let length = 0;
     for (let geometryPass = 0; geometryPass < 9; geometryPass += 1) {
       if (polylineSelfIntersects(rotated)) return null;
       length = finalizeClosedSamples(rotated);
-      if (resolvedEnvironmentTheme === "city") assignUrbanWidths(rotated, length, width, seed);
+      if (resolvedEnvironmentTheme === "city") assignUrbanWidths(rotated, length, width, urbanWidthSeed);
       assignTrackRunoffProfile(rotated, length, width, seed, resolvedEnvironmentTheme);
       assignWallCoordinates(rotated, width, true);
       smoothWallCoordinates(rotated, 1, true);
@@ -1720,10 +1722,11 @@ export function generateTrack(seed, complexity = 2, environmentTheme = "auto") {
   }
 
   if (!samples && resolvedEnvironmentTheme === "city") {
-    // Keep the city profile if all varied block routes fail validation. A
-    // seed-independent street template cannot turn into the rural oval fallback.
-    const urban = makeUrbanCircuit(seededRng(`city-safe:${safeComplexity}`), safeComplexity, width, false);
-    const prepared = prepareCandidate(urban.controls, urban.samples);
+    // Keep a validated city template if all varied routes fail. Fix both the
+    // centreline and width phase, preserving every wall/pit/tournament check.
+    const fallbackSeed = `city-safe:${safeComplexity}`;
+    const urban = makeUrbanCircuit(seededRng(fallbackSeed), safeComplexity, width, false);
+    const prepared = prepareCandidate(urban.controls, urban.samples, { urbanWidthSeed: fallbackSeed });
     if (!prepared) throw new Error(`Unable to generate a valid city circuit for seed ${seed}`);
     ({ controls, samples, totalLength, tournamentLayout, pit, spatialGrid } = prepared);
     city = urban.city;

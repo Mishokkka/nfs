@@ -991,7 +991,9 @@ export class RaceNetwork {
     const value = this.activeRace?.phase === "race" ? {
       raceId: this.raceId, protocol: PROTOCOL_VERSION, ...authority
     } : {};
-    this.sessionReadyRaceId = null;
+    // Renewing the same authority does not invalidate its durable tab save.
+    // Only a different race (or stop) must wait for a new world-setting ACK.
+    if (this.sessionReadyRaceId !== value.raceId) this.sessionReadyRaceId = null;
     if (!value.raceId) this.pendingRecoverySave = null;
     this.sessionWrite = this.sessionWrite.catch(() => {}).then(async () => {
       // Settings writes are asynchronous. A queued write from an old race or a
@@ -1047,7 +1049,9 @@ export class RaceNetwork {
     })
       .catch(error => {
         console.warn("FBL Need for Speed | не удалось сохранить состояние сессии", error);
-        this.#warnRecoveryUnavailable();
+        this.#warnRecoveryUnavailable(value.raceId && this.sessionReadyRaceId === value.raceId
+          ? "Не удалось продлить запись восстановления. Локальные сохранения продолжаются; проверьте связь с сервером."
+          : undefined);
       }).finally(() => {
         if (generation === this.sessionWriteGeneration) this.sessionWritePending = false;
       });

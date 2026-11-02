@@ -16,6 +16,11 @@ jobs:
         with:
           node-version: 22
           package-manager-cache: false
+      - name: Verify public update channel
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: node scripts/publish-manifest.mjs --check
       - run: npm run test:all
       - run: npm run build
       - uses: actions/upload-artifact@v7
@@ -35,13 +40,23 @@ jobs:
           node-version: 22
           package-manager-cache: false
       - name: Verify tag matches manifest
-        run: node -e "if (process.env.GITHUB_REF_NAME !== 'v' + JSON.parse(require('fs').readFileSync('package.json')).version) process.exit(1)"
+        run: node -e "const v = JSON.parse(require('fs').readFileSync('package.json')).version; if (!/^\d+\.\d+\.\d+$/.test(v) || process.env.GITHUB_REF_NAME !== 'v' + v) process.exit(1)"
       - uses: actions/download-artifact@v8
         with:
           name: module-Linux
           path: dist/
-      - name: Publish tested module archive
+      - name: Upload tested release assets privately
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-        run: gh release create "$GITHUB_REF_NAME" dist/*.zip dist/SHA256SUMS.txt --verify-tag --title "$GITHUB_REF_NAME" --generate-notes
+        run: gh release create "$GITHUB_REF_NAME" dist/*.zip dist/SHA256SUMS.txt dist/module.json --draft --verify-tag --title "$GITHUB_REF_NAME" --generate-notes
+      - name: Publish complete release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release edit "$GITHUB_REF_NAME" --draft=false --latest
+      - name: Update legacy manifest after release assets are public
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: node scripts/publish-manifest.mjs

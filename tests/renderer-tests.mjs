@@ -72,6 +72,37 @@ const { VehicleSprites } = await import(pathToFileURL(path.join(root, "scripts/r
 const { TrackArt } = await import(pathToFileURL(path.join(root, "scripts/rendering/track-art.js")).href);
 const track = generateTrack("renderer-countdown", 2);
 
+// HTML Canvas starts at 300x150. The first computed backing size may already
+// match it, including a different CSS size at a lower output scale.
+for (const [cssWidth, cssHeight, dpr] of [[300, 150, 1], [600, 300, .5]]) {
+  const previousDpr = window.devicePixelRatio;
+  window.devicePixelRatio = dpr;
+  const canvas = makeCanvas();
+  canvas.width = 300; canvas.height = 150;
+  canvas.getBoundingClientRect = () => ({ width: cssWidth, height: cssHeight });
+  const renderer = new RaceRenderer(canvas, track, { localCarId: "driver" });
+  assert.ok(renderer.instruments.layout, "initial matching backing size skipped the instruments");
+  assert.equal(renderer.instruments.layout.width, cssWidth);
+  assert.equal(renderer.instruments.layout.height, cssHeight);
+  assert.equal(renderer.outputScale, dpr);
+  assert.ok(renderer.minimapProjection, "initial matching backing size skipped the minimap");
+  assert.equal(renderer.background.width, 300);
+  assert.equal(renderer.background.height, 150);
+  const { buildRaceCarMeta } = await import("../scripts/physics.js");
+  const { cloneDefaultBuild } = await import("../scripts/catalog.js");
+  const meta = buildRaceCarMeta({ id: "driver", name: "Driver", build: cloneDefaultBuild() });
+  const car = { ...meta, x: track.start.x, y: track.start.y, angle: 0, vx: 0, vy: 0,
+    place: 1, lap: 0, progress: 0, health: meta.maxHealth, charge: meta.maxCharge, heat: 0, pitState: "track" };
+  const snapshot = { cars: [car], tick: 1, simulationTime: 1, time: 1, countdown: 0, started: true, laps: 3 };
+  renderer.setSimulationFrame(snapshot, snapshot, 0);
+  assert.doesNotThrow(() => renderer.render(performance.now() + 100), "priority label crashed without HUD layout");
+  const projection = renderer.minimapProjection, builds = renderer.instruments.staticBuilds;
+  for (let i = 0; i < 5; i++) renderer.resize();
+  assert.equal(renderer.instruments.staticBuilds, builds, "unchanged resize rebuilt the HUD");
+  assert.equal(renderer.minimapProjection, projection, "unchanged resize rebuilt the minimap");
+  renderer.destroy(); window.devicePixelRatio = previousDpr;
+}
+
 // Dense urban scenery is still baked into bounded static layers. Pavers add
 // one small texture; closing a city view must release it with the old assets.
 {

@@ -779,21 +779,25 @@ export class RaceRenderer {
     const requestedScale = Math.max(0.01, Math.min(window.devicePixelRatio || 1, MAX_OUTPUT_SCALE, pixelBudgetScale));
     const width = Math.max(1, Math.floor(rect.width * requestedScale));
     const height = Math.max(1, Math.floor(rect.height * requestedScale));
-    if (this.canvas.width !== width || this.canvas.height !== height) {
+    const backingChanged = this.canvas.width !== width || this.canvas.height !== height;
+    const previousScale = this.outputScale, previousLayout = this.instruments.layout;
+    // CSS size/output scale can change even when rounded backing dimensions do
+    // not. The native 300x150 default also needs its first HUD/background bake.
+    const scaleX = width / Math.max(1, rect.width);
+    const scaleY = height / Math.max(1, rect.height);
+    this.outputScale = (scaleX + scaleY) * 0.5;
+    if (backingChanged) {
       this.canvas.width = width;
       this.canvas.height = height;
-      // Use the actual backing-store/CSS ratio. Rounded canvas dimensions can be
-      // a fraction away from requestedScale and that mismatch causes resampling.
-      const scaleX = width / Math.max(1, rect.width);
-      const scaleY = height / Math.max(1, rect.height);
-      this.outputScale = (scaleX + scaleY) * 0.5;
+    }
+    if (backingChanged || previousScale !== this.outputScale || !previousLayout) {
       this.context.imageSmoothingEnabled = true;
       this.context.imageSmoothingQuality = "high";
       this.#clearLabelCache();
-      this.instruments.resize(width / this.outputScale, height / this.outputScale, this.outputScale);
-      this.#rebuildBackground(width, height);
-      this.#rebuildMinimapLayer();
     }
+    if (backingChanged || !previousLayout) this.#rebuildBackground(width, height);
+    this.instruments.resize(width / this.outputScale, height / this.outputScale, this.outputScale);
+    if (previousLayout !== this.instruments.layout || !this.minimapProjection) this.#rebuildMinimapLayer();
   }
 
 

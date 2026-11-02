@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { generateTrack, polylineSelfIntersects, pitLaneFitsCircuit, wallBoundaryPoint, RUNOFF_SURFACES, roadWidthAt, nearestTrackPoint, pointAtTrackProgress } from "../scripts/track.js";
 import { sceneryRoadDistance, sceneryRoadClearance, sceneryOverlaps, sceneryContact } from "../scripts/scenery-geometry.js";
 import { RaceSimulation, buildRaceCarMeta, neutralInput } from "../scripts/physics.js";
@@ -52,6 +53,35 @@ assert.ok(layouts.size>=20,"city seeds did not produce distinct routes");
 const first=generateTrack("repeat-city",4,"city"), second=generateTrack("repeat-city",4,"city");
 assert.deepEqual(first,second,"city generation is not deterministic");
 assert.deepEqual(generateTrack(9,2.9,"city"),generateTrack(9,2,"city"),"fractional public complexity was not normalized");
+
+// Fault-inject exhaustion of the ten varied attempts. Exercise the production
+// fallback and every geometry/pit check without exposing a test-only runtime
+// option or waiting for a rare random seed. Only the attempt limit is changed.
+{
+  const trackUrl = new URL("../scripts/track.js", import.meta.url);
+  const source = readFileSync(trackUrl, "utf8");
+  const attemptLimit = "attempt < 10;";
+  assert.equal(source.split(attemptLimit).length, 2, "update fallback fault injection after refactoring the attempt loop");
+  const fallbackSource = source.replace(attemptLimit, "attempt < 0;")
+    .replaceAll(/from "(\.\/[^"]+)"/g, (_match, relative) => `from ${JSON.stringify(new URL(relative, trackUrl).href)}`);
+  const { generateTrack: generateFallback } = await import(`data:text/javascript;base64,${Buffer.from(fallbackSource).toString("base64")}`);
+  for (let complexity = 1; complexity <= 5; complexity++) {
+    const tracks = [0, 88201].map(seed => generateFallback(seed, complexity, "city"));
+    for (const track of tracks) {
+      assert.equal(track.generationAttempt, 90, "fixture missed the city fallback");
+      assert.equal(track.city.kind, "route-grown");
+      assert.equal(polylineSelfIntersects(track.samples), false);
+      assert.ok(pitLaneFitsCircuit(track.pit, track.samples, track.totalLength, track.width, track.spatialGrid));
+      for (const side of [-1, 1]) assert.equal(polylineSelfIntersects(track.samples.map(p => wallBoundaryPoint(p, track.width, side))), false);
+      if (complexity === 5) {
+        assert.ok(track.tournamentLayout.technicalRatio >= .28);
+        assert.ok(track.tournamentLayout.longestStraightRatio >= .105);
+      }
+    }
+    assert.deepEqual(tracks[0].samples, tracks[1].samples, "last-resort driving geometry depends on the failed outer seed");
+    assert.deepEqual(tracks[0].pit, tracks[1].pit, "last-resort pit geometry depends on the failed outer seed");
+  }
+}
 
 for(let seed=0;seed<25;seed++) {
   const circuit=generateTrack(`foundation-audit-${seed}`,1+seed%5,["industrial","woodland","estate","ruins","tournament"][seed%5]);
