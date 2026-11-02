@@ -213,7 +213,7 @@ export function applyDriveModel(state, input, physics, dt, modifiers = {}) {
   const wheelbase = wheelbaseFor(p);
   const wheelLock = clamp(steeringLockAngle(p) * steeringMultiplier, 0, .55);
   const geometricYaw = forwardSpeed / wheelbase * Math.tan(steering * wheelLock);
-  const steeringActive = Math.abs(requestedSteering) > .001 || Math.abs(state.steeringPosition) > .001
+  const steeringActive = Math.abs(requestedSteering) > .001 || Math.abs(steering) > 0
     || Math.abs(previousSteer) > .001;
   if (driftAmount > .04) {
     state.angularVelocity = (Number(state.angularVelocity) || 0)

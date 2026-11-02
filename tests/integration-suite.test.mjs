@@ -10,4 +10,5 @@ test("multiple virtual clients converge", { timeout: 20_000 }, () => runScript("
 test("session recovery, input coalescing and app isolation", { timeout: 15_000 }, () => runScript("session-regression-tests.mjs", { timeout: 10_000 }));
 test("application architecture and technical-debt guards", { timeout: 20_000 }, () => runScript("app-architecture-tests.mjs", { timeout: 15_000 }));
 test("UI controllers and focus lifecycle", { timeout: 10_000 }, () => runScript("ui-controller-tests.mjs", { timeout: 5_000 }));
+test("continuous audio and sound lifecycle", { timeout: 10_000 }, () => runScript("audio-tests.mjs", { timeout: 5_000 }));
 test("application startup and Journal Notes button", { timeout: 20_000 }, () => runScript("startup-tests.mjs", { timeout: 15_000 }));

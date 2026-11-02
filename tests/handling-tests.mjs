@@ -227,6 +227,16 @@ assert.ok(longArc.radius/shortArc.radius>1.8,'wheelbase did not constrain the tu
   const tiny=carAt(600);tiny.angularVelocity=4;
   applyDriveModel(tiny,neutralInput(),physics,1e-6);
   assert.ok(tiny.angularVelocity>3.999,'neutral tyres instantly deleted impact rotation');
+  for (const rack of [.024, .012, .002]) {
+    for (const elapsed of [1e-6, dt]) {
+      const impact = { ...carAt(600), steeringPosition: rack, angularVelocity: 4 };
+      const neutral = { ...carAt(600), angularVelocity: 4 };
+      applyDriveModel(impact, neutralInput(), physics, elapsed);
+      applyDriveModel(neutral, neutralInput(), physics, elapsed);
+      assert.ok(Math.abs(impact.angularVelocity - neutral.angularVelocity) < 1e-10,
+        'rack residual inside the dead-zone truncated impact rotation');
+    }
+  }
   const samples=[];
   for(const hz of [60,120]) {
     const car=carAt(600);car.angularVelocity=4;

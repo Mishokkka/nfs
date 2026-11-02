@@ -135,7 +135,7 @@ export class RaceRuntime {
   mount(root) {
     const canvas = root?.querySelector("canvas[data-race-canvas]");
     if (!canvas || !this.track) return;
-    this.#unmountView();
+    this.#unmountView({ stopAudio: false });
     try {
       this.pitUi.mount(root);
       this.hud.mount(root);
@@ -398,7 +398,7 @@ export class RaceRuntime {
     }
   }
 
-  #unmountView() {
+  #unmountView({ stopAudio = true } = {}) {
     if (this.raceFrame) cancelAnimationFrame(this.raceFrame);
     this.raceFrame = null;
     this.renderer?.destroy();
@@ -406,7 +406,7 @@ export class RaceRuntime {
     this.input.destroyListeners();
     this.hud.destroy();
     this.pitUi.destroy();
-    this.audio.stop();
+    if (stopAudio) this.audio.stop();
     this.networkStatus = null;
     this.lastConnectionCheckAt = -Infinity;
   }
