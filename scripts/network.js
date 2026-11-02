@@ -9,6 +9,7 @@ import {
 } from "./constants.js";
 import { RaceRecoveryStore } from "./race-recovery.js";
 import { RecoveryLeaseGuard, RECOVERY_LEASE_MS, RECOVERY_LEASE_RENEW_MS } from "./netcode/recovery-lease.js";
+import { RecoveryProbe } from "./netcode/recovery-probe.js";
 import { generateTrack } from "./track.js";
 import { normalizeBuild } from "./catalog.js";
 import { buildRaceCarMeta, sanitizeInput, RaceSimulation } from "./physics.js";
@@ -663,6 +664,9 @@ export class RaceNetwork {
     this.instanceId = `${MESSAGE_SESSION}:n${++networkInstanceCounter}`;
     this.recoveryStore = new RaceRecoveryStore();
     this.recoveryCheckpoint = null;
+    this.recoveryProbe = null;
+    this.recoveryAttempt = null;
+    this.recoveryGeneration = 0;
     this.sessionWrite = Promise.resolve();
     this.sessionWriteGeneration = 0;
     this.sessionWritePending = false;
@@ -742,6 +746,7 @@ export class RaceNetwork {
   }
 
   destroy() {
+    this.cancelRecovery();
     this.sessionWriteGeneration += 1;
     this.sessionWritePending = false;
     if (this.sessionRetry != null) clearTimeout(this.sessionRetry);
@@ -1058,11 +1063,49 @@ export class RaceNetwork {
   }
 
   restoreSavedRace() {
-    if (!game.user.isGM || this.activeRace) return false;
-    let saved;
-    try { saved = this.recoveryStore.load(game.settings.get(MODULE_ID, "raceSession")); }
-    catch (_) { return false; }
+    if (this.recoveryAttempt) return this.recoveryAttempt;
+    const attempt = this.#probeSavedRace();
+    this.recoveryAttempt = attempt;
+    const clear = () => { if (this.recoveryAttempt === attempt) this.recoveryAttempt = null; };
+    void attempt.then(clear, clear);
+    return attempt;
+  }
+
+  cancelRecovery() {
+    this.recoveryGeneration++;
+    this.recoveryProbe?.cancel();
+  }
+
+  async #probeSavedRace() {
+    if (!game.user.isGM || this.activeRace || !this.initialized || game.socket.connected === false) return false;
+    let saved, lease, fingerprint;
+    try {
+      lease = game.settings.get(MODULE_ID, "raceSession");
+      saved = this.recoveryStore.load(lease);
+      fingerprint = JSON.stringify(lease);
+    } catch (_) { return false; }
     if (!saved) return false;
+    const userId = game.user.id, generation = this.sessionWriteGeneration, recoveryGeneration = this.recoveryGeneration;
+    const probe = new RecoveryProbe(lease, {
+      connected: () => this.initialized && game.socket.connected !== false,
+      requestState: () => this.requestState()
+    });
+    this.recoveryProbe = probe;
+    const quiet = await probe.start();
+    if (this.recoveryProbe === probe) this.recoveryProbe = null;
+    if (!quiet || !this.initialized || game.socket.connected === false || game.user.id !== userId
+      || !game.user.isGM || this.activeRace || generation !== this.sessionWriteGeneration || recoveryGeneration !== this.recoveryGeneration
+      || this.retiredRaceIds.has(saved.race.raceId) || this.closedLobbyIds.has(saved.lobby.id)) return false;
+    try {
+      if (JSON.stringify(game.settings.get(MODULE_ID, "raceSession")) !== fingerprint) return false;
+      if (this.lobby && (this.lobby.phase !== "race" || this.lobby.id !== lease.lobbyId || this.lobby.hostId !== lease.hostId
+        || this.lobby.hostEpoch !== lease.hostEpoch
+        || (this.lobby.hostInstanceId ?? null) !== (lease.hostInstanceId ?? null))) return false;
+    } catch (_) { return false; }
+    return this.#restoreCheckpoint(saved);
+  }
+
+  #restoreCheckpoint(saved) {
     try {
       const race = this.#normalizeRace(saved.race, game.user.id, Date.now());
       if (!race || race.lobbyId !== saved.lobby?.id || saved.lobby.hostId !== game.user.id) return false;
@@ -1515,6 +1558,7 @@ export class RaceNetwork {
     if (!message?.id || this.seen.has(message.id)) return;
     if (message.protocolVersion !== PROTOCOL_VERSION || !messageFitsLimit(message)) return;
     this.recoveryLeaseGuard.observe(message);
+    this.recoveryProbe?.observe(message);
     this.seen.add(message.id);
     if (this.seen.size > 5000) {
       const iterator = this.seen.values();

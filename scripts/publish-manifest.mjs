@@ -14,13 +14,12 @@ const compareVersion = (a, b) => {
   return left[0] - right[0] || left[1] - right[1] || left[2] - right[2];
 };
 
-/** Plan the legacy raw-main update only from a complete public stable release.
- * The content SHA also makes GitHub reject a concurrent manifest replacement. */
-export function publicManifestUpdate(manifestText, release, current = null) {
+function validateRelease(manifestText, release, { allowDraft = false } = {}) {
   const manifest = JSON.parse(manifestText);
   if (manifest.id !== MODULE_ID || !stableVersion(manifest.version)
     || manifest.manifest !== UPDATE_URL || release.tag_name !== `v${manifest.version}`
-    || release.draft !== false || release.prerelease !== false || !release.published_at
+    || !(release.draft === false && release.published_at || allowDraft && release.draft === true)
+    || release.prerelease !== false
     || manifest.download !== `https://github.com/${REPOSITORY}/releases/download/v${manifest.version}/${MODULE_ID}-${manifest.version}.zip`) {
     throw new Error("Refusing to expose a manifest without its public stable release");
   }
@@ -31,16 +30,66 @@ export function publicManifestUpdate(manifestText, release, current = null) {
       throw new Error(`Release asset missing or incomplete: ${name}`);
     }
   }
+  return manifest;
+}
+
+function legacyManifest(current) {
+  if (!current) return null;
+  if (!current.sha || typeof current.content !== "string") throw new Error("Invalid existing manifest response");
+  const manifest = JSON.parse(Buffer.from(current.content, "base64").toString("utf8"));
+  if (manifest.id !== MODULE_ID || !stableVersion(manifest.version)) throw new Error("Invalid existing public manifest");
+  return manifest;
+}
+
+/** Plan the legacy raw-main update only from a complete public stable release.
+ * The content SHA also makes GitHub reject a concurrent manifest replacement. */
+export function publicManifestUpdate(manifestText, release, current = null) {
+  const manifest = validateRelease(manifestText, release);
   if (current) {
-    if (!current.sha || typeof current.content !== "string") throw new Error("Invalid existing manifest response");
+    const previous = legacyManifest(current);
     const previousText = Buffer.from(current.content, "base64").toString("utf8");
-    const previous = JSON.parse(previousText);
-    if (previous.id !== MODULE_ID || !stableVersion(previous.version)
-      || compareVersion(previous.version, manifest.version) > 0) throw new Error("Refusing to roll back the public manifest");
+    if (compareVersion(previous.version, manifest.version) > 0) throw new Error("Refusing to roll back the public manifest");
     if (previousText === manifestText) return null;
   }
   return { message: `Publish v${manifest.version} manifest after release assets`, branch: "main",
     content: Buffer.from(manifestText).toString("base64"), ...(current ? { sha: current.sha } : {}) };
+}
+
+/** Run inside the repository-wide stable-release concurrency group. Validate
+ * both channels BEFORE publishing, then publish without changing Latest. Only
+ * complete public assets may advance legacy; a failed legacy write leaves
+ * Latest untouched. A later-finishing older tag is published as history only. */
+export async function publishRelease(api, tag) {
+  if (!/^v\d+\.\d+\.\d+$/.test(tag ?? "")) throw new Error("Only stable release tags update the public channels");
+  let release = await api.release(tag);
+  if (release.tag_name !== tag) throw new Error("Release tag differs from the requested tag");
+  const text = await api.manifest(tag);
+  const candidate = validateRelease(text, release, { allowDraft: true });
+  const channels = async () => {
+    const latest = await api.latest();
+    const latestManifest = latest ? validateRelease(await api.manifest(latest.tag_name), latest) : null;
+    const legacy = await api.legacy();
+    const previous = legacyManifest(legacy);
+    const newer = [latestManifest, previous].some(item => item && compareVersion(item.version, candidate.version) > 0);
+    return { latest, legacy, newer };
+  };
+  const before = await channels();
+  if (release.draft) {
+    await api.publishWithoutLatest(release);
+    release = await api.release(tag);
+    if (await api.manifest(tag) !== text) throw new Error("Manifest asset changed during publication");
+  }
+  validateRelease(text, release);
+  const current = await channels();
+  if (before.newer || current.newer) return { promoted: false, reason: "newer-public-version" };
+  const payload = publicManifestUpdate(text, release, current.legacy);
+  if (payload) await api.updateLegacy(payload);
+  // Other tag jobs are serialized, but recheck before the final side effect so
+  // a newer external promotion observed here is never replaced by this tag.
+  const final = await channels();
+  if (final.newer) return { promoted: false, reason: "newer-public-version" };
+  if (final.latest?.tag_name !== tag) await api.promote(release);
+  return { promoted: true };
 }
 
 export function verifyPublicManifest(localText, releasedText, release) {
@@ -69,25 +118,34 @@ function checkPublicManifest() {
   verifyPublicManifest(manifestText, releasedText, release);
 }
 
-function publishManifest() {
-  const tag = process.env.GITHUB_REF_NAME;
-  if (!/^v\d+\.\d+\.\d+$/.test(tag ?? "")) throw new Error("Only stable release tags update the public manifest");
-  const release = JSON.parse(gh("api", `repos/${REPOSITORY}/releases/tags/${tag}`));
-  const manifestText = gh("release", "download", tag, "--repo", REPOSITORY, "--pattern", "module.json", "--output", "-");
-  let current = null;
-  try { current = JSON.parse(gh("api", `repos/${REPOSITORY}/contents/module.json?ref=main`)); }
-  catch (error) { if (!String(error.stderr ?? "").includes("HTTP 404")) throw error; }
-  const payload = publicManifestUpdate(manifestText, release, current);
-  if (!payload) return;
+function optionalResource(endpoint) {
+  try { return JSON.parse(gh("api", endpoint)); }
+  catch (error) { if (!String(error.stderr ?? "").includes("HTTP 404")) throw error; return null; }
+}
+
+function writeResource(method, endpoint, payload) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "nfs-release-manifest-"));
   const payloadPath = path.join(directory, "manifest-update.json");
   try {
     fs.writeFileSync(payloadPath, JSON.stringify(payload));
-    gh("api", "--method", "PUT", `repos/${REPOSITORY}/contents/module.json`, "--input", payloadPath);
+    gh("api", "--method", method, endpoint, "--input", payloadPath);
   } finally { fs.rmSync(payloadPath, { force: true }); fs.rmdirSync(directory); }
+}
+
+function publishManifest() {
+  const endpoint = `repos/${REPOSITORY}`;
+  return publishRelease({
+    release: tag => JSON.parse(gh("api", `${endpoint}/releases/tags/${tag}`)),
+    manifest: tag => gh("release", "download", tag, "--repo", REPOSITORY, "--pattern", "module.json", "--output", "-"),
+    latest: () => optionalResource(`${endpoint}/releases/latest`),
+    legacy: () => optionalResource(`${endpoint}/contents/module.json?ref=main`),
+    publishWithoutLatest: release => writeResource("PATCH", `${endpoint}/releases/${release.id}`, { draft: false, make_latest: "false" }),
+    updateLegacy: payload => writeResource("PUT", `${endpoint}/contents/module.json`, payload),
+    promote: release => writeResource("PATCH", `${endpoint}/releases/${release.id}`, { make_latest: "true" })
+  }, process.env.GITHUB_REF_NAME);
 }
 
 if (process.argv[1] && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url) {
   if (process.argv[2] === "--check") checkPublicManifest();
-  else publishManifest();
+  else await publishManifest();
 }

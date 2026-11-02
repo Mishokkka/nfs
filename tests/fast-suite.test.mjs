@@ -8,5 +8,6 @@ test("handling transitions and brake priority", { timeout: 10_000 }, () => runSc
 test("prediction, handling and latency/loss matrix", { timeout: 15_000 }, () => runScript("prediction-tests.mjs", { timeout: 10_000 }));
 test("netcode reload and latency invariants", { timeout: 10_000 }, () => runScript("netcode-latency-tests.mjs", { timeout: 5_000 }));
 test("release metadata consistency", { timeout: 10_000 }, () => runScript("metadata-tests.mjs", { timeout: 5_000 }));
+test("release channels never roll back", { timeout: 10_000 }, () => runScript("release-channel-tests.mjs", { timeout: 5_000 }));
 
 test("CSS architecture and narrow-window contract", { timeout: 10_000 }, () => runScript("css-architecture-tests.mjs", { timeout: 5_000 }));

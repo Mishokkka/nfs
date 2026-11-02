@@ -3,6 +3,7 @@ import { RaceNetwork } from "../scripts/network.js";
 import { RaceSimulation, neutralInput } from "../scripts/physics.js";
 import { cloneDefaultBuild } from "../scripts/catalog.js";
 import { generateTrack } from "../scripts/track.js";
+import { RECOVERY_PROBE_MS } from "../scripts/netcode/recovery-probe.js";
 
 let clock = 10000, nextTimer = 1;
 const timers = new Map(), listeners = [], sent = [];
@@ -350,7 +351,9 @@ const setup = () => {
   as("host", () => host.destroy());
   const reloaded = makeNetwork("host");
   const app = as("host", () => new BigRacesApp(reloaded));
-  assert.equal(as("host", () => reloaded.restoreSavedRace()), true);
+  const restoring = as("host", () => reloaded.restoreSavedRace());
+  advance(RECOVERY_PROBE_MS);
+  assert.equal(await restoring, true);
   assert.equal(JSON.parse(recoveryValues.get(as("host", () => reloaded.recoveryStore.key))).race.raceId, oldRaceId,
     "unacknowledged world lease overwrote the last durable checkpoint");
   await reloaded.sessionWrite;
@@ -385,7 +388,7 @@ const setup = () => {
   await reloaded.sessionWrite;
   assert.deepEqual(settingsState.get("raceSession"), {});
   const nextReload = makeNetwork("host");
-  assert.equal(as("host", () => nextReload.restoreSavedRace()), false, "stop revived a stale save");
+  assert.equal(await as("host", () => nextReload.restoreSavedRace()), false, "stop revived a stale save");
   as("host", () => reloaded.closeLobby());
   assert.equal(player.lobby, null, "the resumed epoch could not close its lobby");
   nextReload.destroy(); reloaded.destroy(); player.destroy();
@@ -530,7 +533,9 @@ for(const claimFirst of [false,true]) {
   as('host',()=>primaryApp.shutdown());host.destroy();
   assert.equal(liveWorkers,0);
   const resumed=makeNetwork('host'),resumedApp=as('host',()=>new BigRacesApp(resumed));
-  assert.equal(as('host',()=>resumed.restoreSavedRace()),true);
+  const restoring=as('host',()=>resumed.restoreSavedRace());
+  advance(RECOVERY_PROBE_MS);
+  assert.equal(await restoring,true);
   await resumed.sessionWrite;
   assert.equal(liveWorkers,1,'F5 created competing workers in the other GM tab');
   assert.equal(resumedApp.runtime.isHost,true);
@@ -541,6 +546,92 @@ for(const claimFirst of [false,true]) {
   resumed.destroy();duplicate.destroy();player.destroy();
   assert.equal(liveWorkers,0);
   if(previousWorker===undefined)delete globalThis.Worker;else globalThis.Worker=previousWorker;
+}
+
+// Opening/duplicating a tab can clone the entire sessionStorage checkpoint.
+// A live owner must keep authority and the player's newer tick, even when its
+// state reply is delayed. The copied save itself must never claim authority.
+for (const delay of [0, 900, "drop-first"]) {
+  settingsState.delete("raceSession");
+  const previousWorker = globalThis.Worker, originalStorage = globalThis.sessionStorage;
+  let workers = 0;
+  globalThis.Worker = class {
+    constructor() { workers++; }
+    addEventListener(type, fn) { if (type === "message") this.listener = fn; }
+    removeEventListener() {}
+    postMessage(message) { if (message.type === "init") setTimeout(() => this.listener({ data: { type: "ready", raceId: message.raceId } }), 1); }
+    terminate() { workers--; }
+  };
+  const { host, player } = setup();
+  const primaryApp = as("host", () => new BigRacesApp(host));
+  const entries = host.activeRace.entries;
+  as("host", () => host.stopRace()); as("host", () => host.startRace(entries));
+  await host.sessionWrite;
+  const sim = new RaceSimulation({ ...host.activeRace.config, entries,
+    track: generateTrack(host.activeRace.config.seed, host.activeRace.config.trackComplexity, host.activeRace.config.environmentTheme) });
+  sim.tick = 600;
+  assert.equal(as("host", () => host.saveRecoveryCheckpoint(JSON.stringify(sim.exportCheckpoint()))), true);
+  as("host", () => host.sendSnapshot({ ...sim.snapshot(), tick: 900 }));
+  const copiedValues = new Map(recoveryValues), oldRaceId = host.raceId, oldEpoch = host.lobby.hostEpoch;
+  globalThis.sessionStorage = { getItem: key => copiedValues.get(key),
+    setItem: (key, value) => copiedValues.set(key, value), removeItem: key => copiedValues.delete(key) };
+  const duplicate = makeNetwork("host"), secondaryApp = as("host", () => new BigRacesApp(duplicate));
+  const originalEmit = game.socket.emit;
+  let requests = 0;
+  game.socket.emit = (...args) => {
+    if (args[1].type === "state-request" && ++requests === 1 && delay === "drop-first") return;
+    originalEmit(...args);
+  };
+  wireDelay.set("lobby-state", Number(delay) || 0); wireDelay.set("race-state", Number(delay) || 0);
+  const restoring = as("host", () => duplicate.restoreSavedRace());
+  assert.equal(as("host", () => duplicate.restoreSavedRace()), restoring, "parallel startup did not share its probe");
+  advance(RECOVERY_PROBE_MS);
+  assert.equal(await restoring, false, "a copied tab stole a live race");
+  assert.equal(host.raceId, oldRaceId); assert.equal(player.raceId, oldRaceId);
+  assert.equal(host.lobby.hostEpoch, oldEpoch);
+  assert.equal(as("host", () => host.isHost), true);
+  assert.equal(player.lastSnapshot.tick, 900, "a copied checkpoint rolled back the player");
+  assert.equal(secondaryApp.runtime.isHost, false);
+  assert.equal(secondaryApp.runtime.localCarId, null);
+  assert.equal(workers, 1, "a copied tab started another authoritative Worker");
+  assert.ok(!sent.some(message => message.type === "host-claim"));
+  if (delay === "drop-first") assert.ok(requests >= 2, "lost discovery was not retried");
+  game.socket.emit = originalEmit;
+  globalThis.sessionStorage = originalStorage;
+  wireDelay.clear();
+  as("host", () => host.stopRace()); primaryApp.shutdown(); secondaryApp.shutdown();
+  host.destroy(); duplicate.destroy(); player.destroy();
+  assert.equal(workers, 0);
+  if (previousWorker === undefined) delete globalThis.Worker; else globalThis.Worker = previousWorker;
+}
+
+// Recovery is an asynchronous operation, so an intervening lifecycle/lease
+// change must fence the commit even after a quiet probe has just completed.
+for (const interrupt of ["destroy", "close", "cancel-after-quiet", "offline", "lease-change", "new-lobby", "peer-results", "suspended"]) {
+  settingsState.delete("raceSession");
+  const { host, player } = setup();
+  await host.sessionWrite;
+  const sim = new RaceSimulation({ ...host.activeRace.config, entries: host.activeRace.entries,
+    track: generateTrack(host.activeRace.config.seed, host.activeRace.config.trackComplexity, host.activeRace.config.environmentTheme) });
+  as("host", () => host.saveRecoveryCheckpoint(JSON.stringify(sim.exportCheckpoint())));
+  host.destroy();
+  if (interrupt === "peer-results") { player.hostOffline = true; player.lobby.phase = "results"; }
+  else player.destroy();
+  const returning = makeNetwork("host"), app = as("host", () => new BigRacesApp(returning));
+  const restoring = as("host", () => returning.restoreSavedRace());
+  if (interrupt === "destroy") returning.destroy();
+  if (interrupt === "close") await app._preClose({});
+  if (interrupt === "offline") game.socket.connected = false;
+  if (interrupt === "lease-change") settingsState.set("raceSession", { ...settingsState.get("raceSession"), expiresAt: Date.now() + 1 });
+  if (interrupt === "new-lobby") as("host", () => returning.createLobby({ build: cloneDefaultBuild() }));
+  if (interrupt === "suspended") { clock += 2000; for (const timer of timers.values()) timer.at += 2000; }
+  advance(RECOVERY_PROBE_MS);
+  if (interrupt === "cancel-after-quiet") returning.cancelRecovery();
+  assert.equal(await restoring, false, `${interrupt} allowed delayed recovery`);
+  assert.equal(returning.activeRace, null);
+  assert.ok(!sent.some(message => message.type === "host-claim"));
+  delete game.socket.connected;
+  app.shutdown(); returning.destroy(); player.destroy();
 }
 
 // The object saved during a setting round-trip must remain the comparison and
@@ -840,7 +931,9 @@ for(const action of ['results-lobby','show-garage','show-lobby']) {
   assert.equal(as(rescuerId, () => rescuer.saveRecoveryCheckpoint(JSON.stringify(sim.exportCheckpoint()))), true);
   app.shutdown(); rescuer.destroy();
   const returning = makeNetwork(rescuerId), returningApp = as(rescuerId, () => new BigRacesApp(returning));
-  assert.equal(as(rescuerId, () => returning.restoreSavedRace()), true);
+  const restoring = as(rescuerId, () => returning.restoreSavedRace());
+  advance(RECOVERY_PROBE_MS);
+  assert.equal(await restoring, true);
   await returning.sessionWrite;
   assert.equal(returningApp.runtime.isHost, true, "a non-participant GM did not restore authority");
   assert.equal(returningApp.runtime.localCarId, null);

@@ -126,7 +126,7 @@ globalThis.Hooks = {
 };
 const network = {
   lobby: null, participant: null, isHost: false,
-  on: () => () => {}, requestState() {}
+  on: () => () => {}, requestState() {}, cancelRecovery() {}
 };
 const racingAppUrl = pathToFileURL(path.join(appDir, "racing-app.js"));
 racingAppUrl.searchParams.set("smoke", String(Date.now()));

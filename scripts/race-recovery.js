@@ -3,7 +3,8 @@ import { MODULE_ID, VERSION, PROTOCOL_VERSION } from "./constants.js";
 const MAX_BYTES = 256_000;
 const MAX_AGE_MS = 12 * 60 * 60 * 1000;
 
-/** Tab-local checkpoints survive F5 without sharing authority between tabs. */
+/** Checkpoints survive F5; a live-owner probe must precede restoring authority
+ * because browsers can clone sessionStorage when opening another tab. */
 export class RaceRecoveryStore {
   constructor() { this.warned = false; }
 

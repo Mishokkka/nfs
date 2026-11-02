@@ -186,6 +186,7 @@ export class BigRacesApp extends HandlebarsApplicationMixin(ApplicationV2) {
     // stopRace synchronously broadcasts stop/lobby events. Mark closing before
     // them, or those handlers queue a forced render behind Foundry's close.
     this.closing = true;
+    this.network.cancelRecovery();
     this.viewGeneration++;
     if (!this.runtime.practice) this.#dismissRaceView();
     if (this.screenStateMachine.is("race") && !this.runtime.practice) {
@@ -208,6 +209,7 @@ export class BigRacesApp extends HandlebarsApplicationMixin(ApplicationV2) {
   }
 
   shutdown() {
+    this.network.cancelRecovery();
     this.viewGeneration++;
     this.renderAbortController?.abort();
     this.tooltips.destroy({ removeElement: true });
@@ -335,6 +337,7 @@ export class BigRacesApp extends HandlebarsApplicationMixin(ApplicationV2) {
   }
 
   #startPractice(build = this.garage.build) {
+    this.network.cancelRecovery();
     this.viewingNetworkRace = false;
     this.resumeRequested = false;
     const { config, entries } = this.lobby.createPractice(build);

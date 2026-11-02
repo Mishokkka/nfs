@@ -19,6 +19,7 @@ async function openBigRaces() {
   try {
     const currentApp = ensureModuleInitialized();
     await currentApp.render(true);
+    if (currentApp.rendered && !currentApp.closing && !currentApp.runtime.practice) await network.restoreSavedRace();
     return currentApp;
   } catch (error) {
     console.error("FBL Need for Speed | не удалось открыть окно Больших Гонок", error);
@@ -121,11 +122,11 @@ Hooks.once("init", () => {
   });
 });
 
-Hooks.once("ready", () => {
+Hooks.once("ready", async () => {
   exposeApi();
   try {
     ensureModuleInitialized();
-    if (!network.restoreSavedRace()) network.requestState();
+    if (!await network.restoreSavedRace()) network.requestState();
     console.info(`FBL Need for Speed | Большие Гонки ${VERSION} готовы`);
   } catch (error) {
     // Keep the scene-control button alive even when initialization encountered a
