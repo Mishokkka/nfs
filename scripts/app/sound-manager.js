@@ -1,6 +1,7 @@
 // @ts-check
 
 import { MODULE_ID } from "../constants.js";
+import { BufferedLoops } from "../audio/buffered-loops.js";
 
 const SPEED_TO_KMH = 0.62 / 3;
 const AUDIO_UPDATE_INTERVAL_MS = 90;
@@ -83,8 +84,9 @@ export class RaceSoundManager {
     this.getLocalCarId = getLocalCarId;
     this.active = false;
     this.suspended = false;
-    this.loops = new Map();
-    this.loopState = new Map();
+    this.loopBank = null;
+    this.loopErrors = new Set();
+    this.lastSnapshot = null;
     this.oneShots = new Set();
     this.cooldowns = new Map();
     this.previous = null;
@@ -99,14 +101,17 @@ export class RaceSoundManager {
   }
 
   mount(root) {
+    const wasActive = this.active;
     this.active = true;
-    this.suspended = false;
+    this.suspended = Boolean(globalThis.document?.hidden);
     this.settings = this.#readSettings();
-    this.updateCount = 0;
-    this.updateCostEma = 0;
-    this.updateCostMax = 0;
-    this.#stopLoops();
+    if (!wasActive) {
+      this.updateCount = 0;
+      this.updateCostEma = 0;
+      this.updateCostMax = 0;
+    }
     this.#loadLoops();
+    this.loopBank?.setMuted(this.suspended || !this.settings.enabled);
     this.#bindUnlock(root);
     this.#tryUnlock();
   }
@@ -114,22 +119,18 @@ export class RaceSoundManager {
   reload() {
     this.settings = this.#readSettings();
     if (!this.active) return;
-    const previous = this.previous;
-    this.#stopLoops();
     this.#loadLoops();
-    this.previous = previous;
+    this.loopBank?.setMuted(this.suspended || !this.settings.enabled);
+    if (!this.settings.enabled) this.#stopOneShots();
+    if (this.lastSnapshot) this.#mixLoops(this.lastSnapshot);
     this.#tryUnlock();
   }
 
   setSuspended(suspended) {
     this.suspended = Boolean(suspended);
+    this.loopBank?.setMuted(this.suspended || !this.settings.enabled);
     if (this.suspended) {
-      for (const [name, audio] of this.loops) {
-        audio.volume = 0;
-        try { audio.pause(); } catch (_) { /* already disposed */ }
-        const state = this.loopState.get(name);
-        if (state) state.volume = 0;
-      }
+      this.#stopOneShots();
       return;
     }
     this.#tryUnlock();
@@ -139,6 +140,7 @@ export class RaceSoundManager {
     this.active = false;
     this.suspended = false;
     this.previous = null;
+    this.lastSnapshot = null;
     this.lastUpdateAt = 0;
     this.updateCount = 0;
     this.updateCostEma = 0;
@@ -147,11 +149,16 @@ export class RaceSoundManager {
     this.unlockAbortController?.abort();
     this.unlockAbortController = null;
     this.#stopLoops();
+    this.#stopOneShots();
+    this.cooldowns.clear();
+    this.loopErrors.clear();
+  }
+
+  #stopOneShots() {
     for (const audio of this.oneShots) {
       try { audio.pause(); } catch (_) { /* already disposed */ }
     }
     this.oneShots.clear();
-    this.cooldowns.clear();
   }
 
   destroy() {
@@ -162,16 +169,13 @@ export class RaceSoundManager {
 
 
   getDiagnosticStats() {
-    let playingLoops = 0;
-    for (const audio of this.loops.values()) {
-      if (!audio.paused) playingLoops += 1;
-    }
+    const loops = this.loopBank?.stats() ?? { backend: "unavailable", loops: 0, playingLoops: 0, bufferBytes: 0 };
     return {
       active: this.active,
       suspended: this.suspended,
       updateIntervalMs: AUDIO_UPDATE_INTERVAL_MS,
-      loops: this.loops.size,
-      playingLoops,
+      ...loops,
+      loopErrors: this.loopErrors.size,
       oneShots: this.oneShots.size,
       unlockPending: Boolean(this.unlockPromise),
       updateCount: this.updateCount,
@@ -181,6 +185,7 @@ export class RaceSoundManager {
   }
 
   update(snapshot) {
+    if (snapshot) this.lastSnapshot = snapshot;
     if (!this.active || this.suspended || !snapshot) return;
     const now = performance.now();
     if (now - this.lastUpdateAt < AUDIO_UPDATE_INTERVAL_MS) return;
@@ -215,24 +220,27 @@ export class RaceSoundManager {
   }
 
   #loadLoops() {
-    if (!canUseAudio()) return;
+    if (!BufferedLoops.supported() || !this.settings.enabled) return;
+    try {
+      this.loopBank ??= new BufferedLoops({ onError: (name, error) => {
+        const key = `${name}:${this.settings.paths[name]}`;
+        if (this.loopErrors.has(key)) return;
+        this.loopErrors.add(key);
+        console.warn(`FBL Need for Speed | не удалось загрузить непрерывный звук (${name})`, error);
+        globalThis.ui?.notifications?.warn?.("Большие Гонки: не удалось загрузить один из непрерывных звуков. Проверьте звуковые файлы; подробности в консоли.");
+      } });
+    } catch (error) {
+      console.warn("FBL Need for Speed | звуковой контекст недоступен", error);
+      return;
+    }
     for (const name of ["engine", "wind", "skid", "ambience", "pitAmbience"]) {
-      const audio = makeAudio(this.settings.paths[name], true);
-      if (!audio) continue;
-      this.loops.set(name, audio);
-      this.loopState.set(name, { volume: 0, playbackRate: 1 });
+      void this.loopBank.setLoop(name, this.settings.paths[name]);
     }
   }
 
   #stopLoops() {
-    for (const audio of this.loops.values()) {
-      try {
-        audio.pause();
-        audio.currentTime = 0;
-      } catch (_) { /* ignored */ }
-    }
-    this.loops.clear();
-    this.loopState.clear();
+    this.loopBank?.stop();
+    this.loopBank = null;
   }
 
   #bindUnlock(root) {
@@ -245,34 +253,22 @@ export class RaceSoundManager {
   }
 
   #tryUnlock() {
-    if (!this.active || this.suspended || !canUseAudio() || this.unlockPromise) return;
-    const attempts = [];
-    for (const audio of this.loops.values()) {
-      if (!audio.paused) continue;
-      attempts.push(audio.play().catch(() => null));
-    }
-    if (!attempts.length) return;
-    // Autoplay may be rejected until the next real user gesture. Do not retry
-    // from the 10-20 Hz audio update loop: repeated play() calls create rejected
-    // promises and Chromium media tasks that can stall the Foundry main thread.
-    this.unlockPromise = Promise.all(attempts).finally(() => {
-      this.unlockPromise = null;
+    if (!this.active || this.suspended || !this.settings.enabled || !this.loopBank || this.unlockPromise) return;
+    // Retry autoplay only on mount/settings/real gestures, never on snapshots.
+    const pending = this.loopBank.unlock().catch(() => {}).finally(() => {
+      if (this.unlockPromise === pending) this.unlockPromise = null;
     });
+    this.unlockPromise = pending;
   }
 
   #setLoop(name, targetVolume, playbackRate = 1) {
-    const audio = this.loops.get(name);
-    const state = this.loopState.get(name);
-    if (!audio || !state) return;
-    const target = clamp(targetVolume);
-    const next = state.volume + (target - state.volume) * (target > state.volume ? 0.38 : 0.26);
-    state.volume = Math.abs(next - target) < 0.004 ? target : clamp(next);
-    const rate = clamp(playbackRate, 0.5, 2.2);
-    if (Math.abs(audio.volume - state.volume) >= 0.004) audio.volume = state.volume;
-    if (Math.abs(state.playbackRate - rate) >= 0.015) {
-      state.playbackRate = rate;
-      audio.playbackRate = rate;
-    }
+    this.loopBank?.setLevel(name, targetVolume, playbackRate);
+  }
+
+  #mixLoops(snapshot) {
+    const car = snapshot.cars?.find(candidate => String(candidate.id) === String(this.getLocalCarId?.() ?? "")) ?? null;
+    this.#updateLoops(snapshot, car, { master: this.settings.enabled ? this.settings.master : 0,
+      vehicle: this.settings.vehicle, ambience: this.settings.ambience });
   }
 
   #updateLoops(snapshot, car, volumes) {
@@ -282,10 +278,11 @@ export class RaceSoundManager {
     const pit = car && car.pitState !== "track";
     const service = car?.pitState === "service";
 
-    const engineLevel = car && racing
-      ? volumes.master * volumes.vehicle * (service ? 0.12 : clamp(0.18 + speedKmh / 155, 0.18, 0.92))
+    const engineRunning = car && !snapshot.finished && !car.finished && !car.disabled;
+    const engineLevel = engineRunning
+      ? volumes.master * volumes.vehicle * (!racing || service ? 0.12 : clamp(0.18 + speedKmh / 155, 0.18, 0.92))
       : 0;
-    const engineRate = service ? 0.62 : 0.68 + clamp(speedKmh / 125, 0, 1) * 0.9;
+    const engineRate = service ? 0.62 : !racing ? 0.68 : 0.68 + clamp(speedKmh / 125, 0, 1) * 0.9;
     this.#setLoop("engine", engineLevel, engineRate);
 
     const windLevel = car && racing
@@ -298,7 +295,9 @@ export class RaceSoundManager {
       const rightX = -Math.sin(Number(car.angle) || 0);
       const rightY = Math.cos(Number(car.angle) || 0);
       const lateral = Math.abs((Number(car.vx) || 0) * rightX + (Number(car.vy) || 0) * rightY);
-      skidLevel = volumes.master * volumes.vehicle * clamp((lateral - 18) / 90 + Number(car.surfaceSeverity || 0) * 0.45, 0, 0.62);
+      const moving = clamp((speedKmh - 3) / 12);
+      skidLevel = volumes.master * volumes.vehicle * moving
+        * clamp((lateral - 18) / 90 + Number(car.surfaceSeverity || 0) * 0.45, 0, 0.62);
     }
     this.#setLoop("skid", skidLevel, 0.9 + clamp(speedKmh / 160, 0, 1) * 0.25);
 
@@ -355,6 +354,11 @@ export class RaceSoundManager {
     this.cooldowns.set(name, now + Math.max(0, cooldownMs));
     const audio = makeAudio(this.settings.paths[name]);
     if (!audio) return;
+    if (this.oneShots.size >= 12) {
+      const oldest = this.oneShots.values().next().value;
+      try { oldest.pause(); } catch (_) { /* already disposed */ }
+      this.oneShots.delete(oldest);
+    }
     audio.volume = clamp(volume);
     this.oneShots.add(audio);
     const cleanup = () => this.oneShots.delete(audio);

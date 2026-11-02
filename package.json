@@ -13,5 +13,5 @@
     "test:soak:race": "node tests/race-soak-tests.mjs",
     "test:soak:full": "npm run test:soak"
   },
-  "version": "0.16.10"
+  "version": "0.17.0"
 }

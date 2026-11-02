@@ -74,7 +74,8 @@ const { PitUi } = await load("scripts/app/pit-ui.js");
     ["[data-pit-errors]", errors],
     ["[data-pit-count]", count]
   ]);
-  const rootElement = { querySelector: (selector) => bySelector.get(selector) ?? null };
+  const rootElement = new FakeElement();
+  rootElement.querySelector = (selector) => bySelector.get(selector) ?? null;
   const completed = [];
   let restored = 0;
   const pit = new PitUi({
@@ -93,6 +94,11 @@ const { PitUi } = await load("scripts/app/pit-ui.js");
   assert.equal(input.disabled, true);
   assert.equal(errors.textContent, "Подтверждение обслуживания…");
   assert.equal(overlay.getAttribute("aria-busy"), "true");
+  assert.equal(overlay.focusCount, 1, "waiting for the authority must keep focus in the pit dialog");
+  let trapped = 0;
+  rootElement.listeners.get("keydown")({ key: "Tab", preventDefault() { trapped++; }, stopPropagation() {} });
+  assert.equal(trapped, 1);
+  assert.equal(overlay.focusCount, 2, "Tab escaped the busy pit dialog");
 
   pit.update({ pitState: "exit", pitWord: "", pitAttemptId: null, pitStopsCompleted: 1, pitStopsRequired: 1 });
   assert.equal(restored, 1);
@@ -111,6 +117,13 @@ const { PitUi } = await load("scripts/app/pit-ui.js");
   assert.equal(overlay.classList.contains("is-complete"), false);
   assert.equal(input.focusCount, 2);
   assert.equal(restored, 1, "retry must keep focus in the pit dialog");
+  rootElement.listeners.get("keydown")({ key: "Tab", shiftKey: true, preventDefault() { trapped++; }, stopPropagation() {} });
+  assert.equal(input.focusCount, 3, "Shift+Tab escaped the active pit input");
+  rootElement.listeners.get("keydown")({ key: "Tab", ctrlKey: true, preventDefault() { trapped++; }, stopPropagation() {} });
+  assert.equal(trapped, 2, "browser Ctrl+Tab shortcut was trapped");
+  pit.update({ pitState: "track" });
+  rootElement.listeners.get("keydown")({ key: "Tab", preventDefault() { trapped++; }, stopPropagation() {} });
+  assert.equal(trapped, 2, "hidden pit dialog intercepted normal keyboard navigation");
   pit.destroy();
 }
 
@@ -163,6 +176,26 @@ const { RaceInput } = await load("scripts/app/race-input.js");
 }
 
 const { RaceHud } = await load("scripts/app/race-hud.js");
+// The delayed focus retries must respect a later user blur, and must never
+// refocus driving underneath an interactive service dialog.
+{
+  const priorDocument=globalThis.document,priorAdd=window.addEventListener;
+  const canvas=new FakeElement();let service=false;
+  globalThis.document={activeElement:canvas,hidden:false,addEventListener(){}};
+  window.addEventListener=()=>{};
+  const input=new RaceInput({getLocalCarId:()=> 'driver',getSnapshot:()=>({cars:[{id:'driver',pitState:service?'service':'track'}]}),
+    isRaceActive:()=>true,onInput(){},onCameraMode(){},onToggleCamera(){},onToggleMinimap(){},onVisibilityChange(){}});
+  input.mount(canvas,{querySelector:()=>null});input.restoreFocus();
+  const frame=frameCallbacks.get(input.restoreFrame),timer=window.timers.get(input.restoreTimer)?.callback;
+  document.activeElement=new FakeInput();canvas.emit('blur');const count=canvas.focusCount;
+  frame?.(0);timer?.();await Promise.resolve();
+  assert.equal(canvas.focusCount,count,'old focus retries overrode a newer user focus');
+  service=true;input.restoreFocus();await Promise.resolve();
+  assert.equal(canvas.focusCount,count,'focus jumped from pit input to driving');
+  input.destroyListeners();globalThis.document=priorDocument;
+  if(priorAdd===undefined)delete window.addEventListener;else window.addEventListener=priorAdd;
+}
+
 {
   const hud = new RaceHud({ pitUi: { update() {} } });
   hud.updateCount = 9;
@@ -177,83 +210,54 @@ const { RaceHud } = await load("scripts/app/race-hud.js");
   hud.destroy();
 }
 
-
-// Autoplay rejection must not cause play() retries from the periodic audio update loop.
+// Losing local ownership must close an existing service dialog once, without
+// copying the followed leader's interactive pit state to a spectator.
 {
-  const instances = [];
-  let allowPlayback = false;
-  let audioClock = 0;
-  globalThis.performance = { now: () => audioClock };
-  class FakeAudio {
-    constructor(path) {
-      this.path = path;
-      this.paused = true;
-      this.volume = 0;
-      this.playbackRate = 1;
-      this.currentTime = 0;
-      this.loop = false;
-      this.preload = "";
-      this.playCalls = 0;
-      instances.push(this);
-    }
-    play() {
-      this.playCalls += 1;
-      if (!allowPlayback) return Promise.reject(new Error("autoplay blocked"));
-      this.paused = false;
-      return Promise.resolve();
-    }
-    pause() { this.paused = true; }
-    addEventListener() {}
-  }
-  globalThis.Audio = FakeAudio;
-  const soundManagerUrl = pathToFileURL(path.join(root, "scripts/app/sound-manager.js"));
-  soundManagerUrl.searchParams.set("audio", String(Date.now()));
-  const { RaceSoundManager } = await import(soundManagerUrl.href);
-  const audioRoot = new FakeElement();
-  const manager = new RaceSoundManager({ getLocalCarId: () => "car-1" });
-  manager.mount(audioRoot);
-  await Promise.resolve();
-  await Promise.resolve();
-  assert.equal(instances.length, 5);
-  assert.equal(instances.reduce((sum, audio) => sum + audio.playCalls, 0), 5);
-
-  const snapshot = {
-    started: true,
-    finished: false,
-    countdown: 0,
-    cars: [{ id: "car-1", vx: 0, vy: 0, angle: 0, pitState: "track", health: 100 }]
-  };
-  for (let index = 0; index < 50; index += 1) {
-    audioClock += 100;
-    manager.update(snapshot);
-  }
-  await Promise.resolve();
-  assert.equal(instances.reduce((sum, audio) => sum + audio.playCalls, 0), 5,
-    "audio update loop retried blocked autoplay");
-
-  allowPlayback = true;
-  audioRoot.emit("pointerdown");
-  await Promise.resolve();
-  await Promise.resolve();
-  assert.equal(instances.reduce((sum, audio) => sum + audio.playCalls, 0), 10,
-    "real user gesture did not retry paused loops");
-  assert.equal(manager.getDiagnosticStats().playingLoops, 5);
-  audioRoot.emit("pointerdown");
-  await Promise.resolve();
-  assert.equal(instances.reduce((sum, audio) => sum + audio.playCalls, 0), 10,
-    "already playing loops were restarted on every pointer event");
-
-  manager.setSuspended(true);
-  assert.equal(manager.getDiagnosticStats().playingLoops, 0, "suspending audio left loop decoders running");
-  assert.ok(instances.every((audio) => audio.paused), "suspending audio did not pause every loop");
-  manager.setSuspended(false);
-  await Promise.resolve();
-  await Promise.resolve();
-  assert.equal(manager.getDiagnosticStats().playingLoops, 5, "resuming audio did not restart eligible loops");
-  assert.equal(instances.reduce((sum, audio) => sum + audio.playCalls, 0), 15,
-    "resuming audio retried an unexpected number of loops");
-  manager.destroy();
-  delete globalThis.Audio;
+  const updates=[];
+  const hud=new RaceHud({pitUi:{update:car=>updates.push(car)}});
+  const service={id:'own',pitState:'service',pitAttemptId:'a',pitWord:'ядро'};
+  hud.update(service,{cars:[service]});
+  hud.update(null,{cars:[service]});
+  hud.update(null,{cars:[service]});
+  assert.equal(updates.length,2);
+  assert.equal(updates[0].pitState,'service');
+  assert.notEqual(updates[1].pitState,'service','spectator retained an interactive pit dialog');
 }
+
+// A lobby update may arrive before blur/change commits a typed value. Preserve
+// that draft and its caret, but never carry it into another lobby or a disabled
+// control after the host role changes.
+{
+  const {ViewState}=await load('scripts/app/view-state.js');
+  const state=new ViewState(),field=new FakeInput();
+  field.name='seed';field.type='number';field.value='777888';field.selectionStart=null;field.selectionEnd=null;
+  field.matches=()=>true;field.closest=()=>({dataset:{form:'lobby-config'}});
+  const disclosure={dataset:{nfsDisclosure:'track-code'},open:true};
+  const scroll={scrollTop:231};
+  const shell={dataset:{nfsScreen:'lobby',nfsScope:'lobby-a'}};
+  const rootElement={contains:el=>el===field,querySelector:s=>s==='[data-nfs-screen]'?shell:s==='.nfs-view'?scroll:null,
+    querySelectorAll:s=>s==='[data-nfs-disclosure]'?[disclosure]:[field]};
+  const priorDocument=globalThis.document;globalThis.document={activeElement:field};
+  state.capture(rootElement);
+  field.value='88201';disclosure.open=false;scroll.scrollTop=0;
+  state.restore(rootElement);
+  assert.equal(field.value,'777888');assert.equal(field.focusCount,1);assert.equal(disclosure.open,true);assert.equal(scroll.scrollTop,231);
+  shell.dataset.nfsScope='lobby-b';field.value='123';state.restore(rootElement);assert.equal(field.value,'123');
+  shell.dataset.nfsScope='lobby-a';field.disabled=true;state.restore(rootElement);assert.equal(field.value,'123');
+  field.disabled=false;field.type='text';field.selectionStart=2;field.selectionEnd=4;field.value='late edit';
+  let selection;field.setSelectionRange=(...range)=>selection=range;
+  state.capture(rootElement);field.value='stale template';state.restore(rootElement);
+  assert.equal(field.value,'late edit');assert.deepEqual(selection,[2,4]);
+  field.setAttribute('aria-invalid','true');field.validity={customError:true};field.validationMessage='Введите целое число';
+  let restoredValidity;field.setCustomValidity=message=>restoredValidity=message;
+  state.capture(rootElement);field.setAttribute('aria-invalid','false');state.restore(rootElement);
+  assert.equal(field.getAttribute('aria-invalid'),'true');assert.equal(restoredValidity,'Введите целое число');
+  state.capture(null);assert.equal(state.saved,null);
+  globalThis.document=priorDocument;
+}
+
+
+// Audio autoplay/visibility coverage now lives in audio-tests.mjs and exercises
+// the buffered backend, which mutes without restarting five HTML decoders.
 
 console.log("ui-controller-tests: ok");

@@ -26,6 +26,7 @@ export class LobbyController {
       isHost: this.network.isHost,
       isParticipant: Boolean(this.network.participant),
       isLobbyRacing: lobby?.phase === "race",
+      canResumeRace: lobby?.phase === "race" && !this.network.recoveryRequired,
       isLobbyResults: lobby?.phase === "results",
       hostOffline,
       canRecoverHost: Boolean(hostOffline && game.user.isGM),

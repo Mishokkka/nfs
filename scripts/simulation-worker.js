@@ -9,6 +9,13 @@ let lastWallTime = 0;
 let nextPumpAt = 0;
 let finishedPublished = false;
 let lastPublishedTick = -Infinity;
+let checkpoints = false;
+let lastCheckpointTick = -Infinity;
+let snapshotFlowControl = false;
+let snapshotSequence = 0;
+let awaitingSnapshotId = null;
+let snapshotPending = false;
+let compactSnapshots = false;
 
 const fixedDt = 1 / PHYSICS_HZ;
 const tickIntervalMs = 1000 / PHYSICS_HZ;
@@ -19,19 +26,35 @@ function clearClockTimer() {
   timer = null;
 }
 
-function publishSnapshot({ force = false } = {}) {
+function publishSnapshot({ force = false, flush = false } = {}) {
   if (!simulation) return;
   const tick = Number(simulation.tick) || 0;
-  if (!force && !simulation.finished && tick - lastPublishedTick < snapshotEveryTicks) return;
-  const snapshot = simulation.snapshot();
-  lastPublishedTick = Number(snapshot.tick) || tick;
-  if (snapshot.finished && !finishedPublished) {
+  if (!force && !flush && !simulation.finished && tick - lastPublishedTick < snapshotEveryTicks) return;
+  if (checkpoints && !simulation.finished && (force || tick - lastCheckpointTick >= PHYSICS_HZ / 2)) {
+    lastCheckpointTick = tick;
+    self.postMessage({ type: "checkpoint", raceId, checkpoint: JSON.stringify(simulation.exportCheckpoint()) });
+  }
+  lastPublishedTick = tick;
+  if (simulation.finished && !finishedPublished) {
     finishedPublished = true;
-    self.postMessage({ type: "finished", raceId, snapshot, generatedAt: performance.timeOrigin + performance.now() });
+    snapshotPending = false;
+    const snapshot = simulation.snapshot({ includeMetadata: !compactSnapshots });
+    self.postMessage({ type: "finished", raceId, snapshot, compact: compactSnapshots, generatedAt: performance.timeOrigin + performance.now() });
     clearClockTimer();
     return;
   }
-  self.postMessage({ type: "snapshot", raceId, snapshot, generatedAt: performance.timeOrigin + performance.now() });
+  if (snapshotFlowControl && awaitingSnapshotId !== null && !force) {
+    // Do not clone stale frames into the main-thread event queue. The next ACK
+    // requests the then-current state, replacing all missed periodic snapshots.
+    snapshotPending = true;
+    return;
+  }
+  const snapshot = simulation.snapshot({ includeMetadata: !compactSnapshots });
+  const stateEvent = snapshotFlowControl && awaitingSnapshotId !== null;
+  const snapshotId = stateEvent ? null : ++snapshotSequence;
+  if (snapshotFlowControl && !stateEvent) awaitingSnapshotId = snapshotId;
+  self.postMessage({ type: stateEvent ? "state" : "snapshot", raceId, snapshot, snapshotId, compact: compactSnapshots,
+    generatedAt: performance.timeOrigin + performance.now() });
 }
 
 function schedulePump(now = performance.now()) {
@@ -88,6 +111,13 @@ function stopClock() {
   nextPumpAt = 0;
   finishedPublished = false;
   lastPublishedTick = -Infinity;
+  lastCheckpointTick = -Infinity;
+  checkpoints = false;
+  snapshotFlowControl = false;
+  snapshotSequence = 0;
+  awaitingSnapshotId = null;
+  snapshotPending = false;
+  compactSnapshots = false;
 }
 
 self.addEventListener("message", (event) => {
@@ -105,10 +135,23 @@ self.addEventListener("message", (event) => {
           botDifficulty: message.config?.botDifficulty,
           requiredPitStops: message.config?.requiredPitStops
         });
+        if (message.checkpoint) simulation.restoreCheckpoint(message.checkpoint, { resetInputs: true });
+        checkpoints = message.checkpoints === true;
+        snapshotFlowControl = message.snapshotFlowControl === true;
+        compactSnapshots = message.compactSnapshots === true;
+        if (compactSnapshots) self.postMessage({ type: "metadata", raceId, cars: simulation.carMetadata() });
         finishedPublished = false;
         startClock();
         publishSnapshot({ force: true });
         self.postMessage({ type: "ready", raceId });
+        break;
+      case "snapshot-consumed":
+        if (awaitingSnapshotId === null || message.raceId !== raceId || message.snapshotId !== awaitingSnapshotId) break;
+        awaitingSnapshotId = null;
+        if (snapshotPending && simulation && !simulation.finished) {
+          snapshotPending = false;
+          publishSnapshot({ flush: true });
+        }
         break;
       case "input":
         simulation?.setInput(message.carId, message.input, message.sequence);

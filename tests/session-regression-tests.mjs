@@ -1,0 +1,982 @@
+import assert from "node:assert/strict";
+import { RaceNetwork } from "../scripts/network.js";
+import { RaceSimulation, neutralInput } from "../scripts/physics.js";
+import { cloneDefaultBuild } from "../scripts/catalog.js";
+import { generateTrack } from "../scripts/track.js";
+import { RECOVERY_PROBE_MS } from "../scripts/netcode/recovery-probe.js";
+
+let clock = 10000, nextTimer = 1;
+const timers = new Map(), listeners = [], sent = [];
+const wireDelay = new Map();
+Object.defineProperty(globalThis, "performance", { configurable: true, value: { now: () => clock, timeOrigin: 0 } });
+const users = new Map([
+  ["host", { id: "host", name: "Host", isGM: true, active: true }],
+  ["player", { id: "player", name: "Player", isGM: false, active: true }],
+  ["observer", { id: "observer", name: "Observer", isGM: false, active: true }]
+]);
+const as = (id, fn) => { const before = game.user; game.user = users.get(id); try { return fn(); } finally { game.user = before; } };
+globalThis.setTimeout = (fn, delay) => { const id = nextTimer++; timers.set(id, { at: clock + delay, fn, owner: game.user.id }); return id; };
+globalThis.clearTimeout = id => timers.delete(id);
+const advance = ms => {
+  const until = clock + ms;
+  for (;;) {
+    const next = [...timers].filter(([, t]) => t.at <= until).sort((a, b) => a[1].at - b[1].at)[0];
+    if (!next) break;
+    timers.delete(next[0]); clock = next[1].at; as(next[1].owner, next[1].fn);
+  }
+  clock = until;
+};
+globalThis.window = { setInterval: () => 1, clearInterval() {}, setTimeout, clearTimeout, addEventListener() {} };
+globalThis.document = { hidden: false, activeElement: null };
+globalThis.HTMLElement = class {};
+globalThis.HTMLInputElement = class {};
+globalThis.HTMLSelectElement = class {};
+globalThis.HTMLFormElement = class {};
+globalThis.Hooks = { on: () => 1, off() {} };
+globalThis.requestAnimationFrame = () => 1;
+globalThis.cancelAnimationFrame = () => {};
+globalThis.ui = { notifications: { warn() {}, info() {}, error() {} } };
+class MockApp {
+  constructor() { this.rendered = false; this.element = null; this.renderCalls = 0; }
+  render() { this.rendered = true; this.renderCalls++; return Promise.resolve(this); }
+  async _onRender() {} async _preClose() {} async _onClose() {}
+}
+globalThis.foundry = {
+  utils: { deepClone: structuredClone, mergeObject: (a, b) => ({ ...structuredClone(a), ...structuredClone(b) }) },
+  applications: { api: { ApplicationV2: MockApp, HandlebarsApplicationMixin: a => a, DialogV2: { confirm: async () => true } } }
+};
+const settingsState = new Map();
+const recoveryValues = new Map();
+globalThis.sessionStorage = { getItem: key => recoveryValues.get(key), setItem: (key, value) => recoveryValues.set(key, value), removeItem: key => recoveryValues.delete(key) };
+globalThis.game = {
+  user: users.get("host"), users,
+  settings: { get: (_m, key) => settingsState.get(key) ?? ({ build: {}, cameraMode: "overview", soundEnabled: false })[key],
+    set: async (_m, key, value) => settingsState.set(key, structuredClone(value)) },
+  socket: {
+    on(_name, fn) { listeners.push({ owner: game.user.id, fn }); },
+    off(_name, fn) { const index = listeners.findIndex(x => x.fn === fn); if (index >= 0) listeners.splice(index, 1); },
+    emit(_name, message) {
+      sent.push(structuredClone(message));
+      const deliver = () => {
+        for (const listener of [...listeners]) as(listener.owner, () => listener.fn(structuredClone(message)));
+      };
+      if (wireDelay.has(message.type)) setTimeout(deliver, wireDelay.get(message.type));
+      else deliver();
+    }
+  }
+};
+const { BigRacesApp } = await import("../scripts/app/racing-app.js");
+const { RaceRuntime } = await import("../scripts/app/race-runtime.js");
+const { RaceInput } = await import("../scripts/app/race-input.js");
+const makeNetwork = id => as(id, () => { const n = new RaceNetwork(); n.initialize(); return n; });
+const setup = () => {
+  listeners.length = 0; sent.length = 0; timers.clear(); clock += 1000;
+  wireDelay.clear();
+  const host = makeNetwork("host"), player = makeNetwork("player");
+  let hostStarts = 0;
+  host.on("start", () => hostStarts++);
+  as("host", () => host.createLobby({ build: cloneDefaultBuild(), config: { seed: 88201, bots: 0 } }));
+  as("player", () => player.join(cloneDefaultBuild()));
+  as("host", () => host.startRace(Object.values(host.lobby.participants).map(p => ({ id: "car-" + p.userId, userId: p.userId, build: p.build, name: p.userName }))));
+  assert.equal(hostStarts, 1, "the first local race-init did not start the host runtime");
+  return { host, player };
+};
+
+// The sole GM can discover and explicitly abort an orphaned race after reload.
+{
+  const { host, player } = setup();
+  const raceId = player.raceId;
+  as("host", () => host.destroy());
+  const reloaded = makeNetwork("host");
+  wireDelay.set("session-offer", 120);
+  as("host", () => reloaded.requestState());
+  advance(1);
+  as("host", () => reloaded.requestState());
+  advance(119);
+  assert.equal(reloaded.lobby.id, player.lobby.id);
+  assert.equal(reloaded.hostOffline, true);
+  assert.equal(as("host", () => reloaded.isHost), false, "discovery started an authority without a simulation");
+  assert.equal(as("player", () => player.recoverOrphanedSession()), false);
+  assert.equal(as("host", () => reloaded.recoverOrphanedSession()), true);
+  assert.equal(player.raceId, null);
+  assert.equal(reloaded.raceId, null);
+  assert.equal(player.lobby.phase, "lobby");
+  assert.equal(player.lobby.hostEpoch, reloaded.lobby.hostEpoch);
+  assert.ok(sent.some(m => m.type === "host-claim" && m.abortedRaceId === raceId));
+  reloaded.destroy(); player.destroy();
+}
+
+// Rapid key changes coalesce to the latest state within 8 ms, including release.
+{
+  const { host, player } = setup();
+  const received = [];
+  host.on("input", message => received.push(message));
+  const input = new RaceInput({ getLocalCarId: () => "car-player", getSnapshot: () => null,
+    isRaceActive: () => true, onInput: (value, sequence) => as("player", () => player.sendInput("car-player", value, sequence)) });
+  as("player", () => { input.keys.add("KeyW"); input.dispatch(undefined, { force: true }); });
+  advance(1);
+  as("player", () => { input.keys.add("KeyD"); input.dispatch(undefined, { force: true }); });
+  assert.equal(received.length, 1);
+  advance(7);
+  assert.equal(received.at(-1).input.steer, 1);
+  assert.equal(received.at(-1).sequence, 2);
+  advance(1);
+  as("player", () => input.neutralize());
+  advance(7);
+  assert.deepEqual(received.at(-1).input, neutralInput());
+  // Reordered commands cannot replace a newer release, and stop cancels timers.
+  as("player", () => player.sendInput("car-player", { throttle: 1 }, 1));
+  advance(8);
+  assert.deepEqual(received.at(-1).input, neutralInput());
+  as("player", () => player.sendInput("car-player", { throttle: 1 }, 4));
+  advance(1);
+  as("player", () => player.sendInput("car-player", { steer: 1 }, 5));
+  const before = received.length;
+  as("host", () => host.stopRace()); advance(20);
+  assert.equal(received.length, before);
+  host.destroy(); player.destroy();
+}
+
+// Runtime events are scoped to a chosen race. Practice and unopened observers
+// survive start/snapshot/results/stop from another group in the same world.
+{
+  const { host, player } = setup();
+  const observer = makeNetwork("observer");
+  const app = as("observer", () => new BigRacesApp(observer));
+  as("observer", () => observer.requestState());
+  for (const fn of observer.handlers.start) as("observer", () => fn(host.activeRace));
+  assert.equal(app.screen, "garage");
+  assert.equal(app.rendered, false);
+  app.runtime.start({ host: false, practice: true, raceId: "practice", config: {}, entries: [] });
+  app.screenStateMachine.transition("race");
+  const localSnapshot = { sentinel: true };
+  app.runtime.currentSimulationSnapshot = localSnapshot;
+  for (const [event, data] of [["start", host.activeRace], ["snapshot", {}], ["results", {}], ["stop", {}]]) {
+    for (const fn of observer.handlers[event]) as("observer", () => fn(data));
+  }
+  assert.equal(app.runtime.currentRaceId, "practice");
+  assert.equal(app.runtime.currentSimulationSnapshot, localSnapshot);
+  assert.equal(app.screen, "race");
+  app.shutdown(); host.destroy(); player.destroy(); observer.destroy();
+}
+
+// A participant editing the garage is not navigated away by someone joining.
+{
+  const { host, player } = setup();
+  as("host", () => host.stopRace());
+  const app = as("player", () => new BigRacesApp(player));
+  app.rendered = true;
+  app.garage.build.name = "Черновик";
+  for (const fn of player.handlers.lobby) as("player", () => fn(player.lobby));
+  assert.equal(app.screen, "garage");
+  assert.equal(app.garage.build.name, "Черновик");
+  assert.equal(app.renderCalls, 0);
+  app.shutdown(); host.destroy(); player.destroy();
+}
+
+// A worker frame must go straight to the socket for the active host, and never
+// for practice. Exercise the real message handler instead of matching its text.
+{
+  let worker;
+  globalThis.Worker = class {
+    constructor() { worker = this; this.handlers = new Map(); }
+    addEventListener(type, fn) { this.handlers.set(type, fn); }
+    removeEventListener(type) { this.handlers.delete(type); }
+    postMessage() {} terminate() {}
+  };
+  const frames = [];
+  const network = { isHost: true, sendSnapshot: (snapshot, timing) => frames.push({ snapshot, timing }) };
+  const runtime = new RaceRuntime({ network, isRaceActive: () => true, onFinished() {} });
+  const entries = [{ id: "car", userId: "host", build: cloneDefaultBuild() }];
+  for (const practice of [false, true]) {
+    runtime.start({ entries, host: true, practice, raceId: "runtime", config: {} });
+    const snapshot = new RaceSimulation({ track: generateTrack(88201, 2), entries }).snapshot();
+    worker.handlers.get("message")({ data: { type: "snapshot", raceId: "runtime", snapshot, generatedAt: clock } });
+    assert.equal(frames.length, 1);
+  }
+  network.isHost = false;
+  runtime.practice = false;
+  worker.handlers.get("message")({ data: { type: "snapshot", raceId: "runtime", snapshot: frames[0].snapshot, generatedAt: clock } });
+  assert.equal(frames.length, 1, "former host kept publishing authoritative frames");
+  runtime.destroy(); delete globalThis.Worker;
+}
+
+// Probe timestamps are local monotonic times; the midpoint maps simulation time
+// correctly without assuming that two computers share an epoch or wall clock.
+{
+  const { host, player } = setup();
+  wireDelay.set("race-ping", 100); wireDelay.set("race-pong", 100);
+  const simulation = new RaceSimulation({ track: generateTrack(88201, 2), entries: host.activeRace.entries });
+  const snapshot = simulation.snapshot(); snapshot.simulationTime = 7;
+  const sentAt = clock;
+  as("host", () => host.sendSnapshot(snapshot));
+  advance(200);
+  assert.equal(player.timing.rttMs, 200);
+  assert.ok(Math.abs(player.timing.clockOffset - (sentAt / 1000 - 7)) < 1e-8);
+  host.destroy(); player.destroy();
+}
+
+
+// Delayed control/state packets must not rewind a newer race or resurrect one
+// that the GM has already stopped. Lobby revisions also order configuration.
+{
+  const { host, player } = setup();
+  const firstInit = structuredClone(sent.find(m => m.type === "race-init"));
+  as("player", () => player.requestState());
+  const staleState = structuredClone(sent.find(m => m.type === "race-state" && m.targetId === "player"));
+  const staleLobby = structuredClone(sent.find(m => m.type === "lobby-state"));
+  const simulation = new RaceSimulation({ track: generateTrack(88201, 2), entries: host.activeRace.entries });
+  const snapshot = simulation.snapshot(); snapshot.tick = 120; snapshot.simulationTime = 2;
+  as("host", () => host.sendSnapshot(snapshot));
+  const lastTick = player.lastSnapshot.tick;
+  as("host", () => game.socket.emit("test", { ...staleState, id: "late-state-before-stop" }));
+  assert.equal(player.lastSnapshot.tick, lastTick);
+  as("host", () => host.stopRace());
+  const revision = player.lobby.revision;
+  for (const [i, message] of [firstInit, staleState, staleLobby].entries()) {
+    as("host", () => game.socket.emit("test", { ...message, id: "retired-message-" + i }));
+  }
+  assert.equal(player.raceId, null);
+  assert.equal(player.lobby.phase, "lobby");
+  assert.equal(player.lobby.revision, revision);
+  as("host", () => host.closeLobby());
+  as("host", () => game.socket.emit("test", { ...staleLobby, id: "closed-lobby-state" }));
+  assert.equal(player.lobby, null);
+  host.destroy(); player.destroy();
+}
+
+// A reloading player still restores when a full race-state reply overtakes the
+// lobby metadata. Late race-init must not remount the newly restored runtime.
+{
+  const { host, player } = setup();
+  const simulation = new RaceSimulation({ track: generateTrack(88201, 2), entries: host.activeRace.entries });
+  const snapshot = simulation.snapshot(); snapshot.tick = 2;
+  as("host", () => host.sendSnapshot(snapshot));
+  const init = structuredClone(sent.find(m => m.type === "race-init"));
+  player.destroy();
+  const returning = makeNetwork("player");
+  const app = as("player", () => new BigRacesApp(returning));
+  wireDelay.set("lobby-state", 120);
+  as("player", () => returning.requestState());
+  assert.equal(returning.raceId, null, "state was accepted without known lobby authority");
+  advance(120);
+  assert.equal(returning.raceId, host.raceId);
+  assert.equal(returning.lastSnapshot.tick, 2);
+  assert.equal(app.runtime.localCarId, "car-player");
+  assert.equal(app.screen, "race");
+  const renders = app.renderCalls;
+  as("host", () => game.socket.emit("test", { ...init, id: "late-init-after-restore" }));
+  assert.equal(app.renderCalls, renders);
+  app.shutdown(); host.destroy(); returning.destroy();
+}
+
+// Leaving is a persistent choice while the user browses Garage/Lobby. Only an
+// explicit Resume action may bring the same retired driver back as a spectator.
+{
+  const { host, player } = setup();
+  const beforeUser = game.user;
+  game.user = users.get("player");
+  const simulation = new RaceSimulation({ track: generateTrack(88201, 2), entries: host.activeRace.entries });
+  host.on("leaveRace", message => { simulation.handToBot(message.carId); host.sendSnapshot(simulation.snapshot()); });
+  const app = new BigRacesApp(player);
+  const events = new Map();
+  app.element = { querySelector: () => null, addEventListener: (type, fn) => events.set(type, fn), contains: () => true };
+  for (const fn of player.handlers.start) fn(player.activeRace);
+  await app._onRender({}, {});
+  const click = async action => {
+    const button = { dataset: { action } };
+    events.get("click")({ target: { closest: () => button }, preventDefault() {} });
+    await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+  };
+  const raceId = player.raceId;
+  await click("abandon-race");
+  assert.equal(app.dismissedRaceId, raceId);
+  assert.equal(app.screen, "lobby");
+  await click("show-garage");
+  advance(300);
+  await click("show-lobby");
+  assert.equal(app.screen, "lobby", "a state reply reopened a race the user left");
+  advance(300);
+  await click("resume-race");
+  assert.equal(app.screen, "race");
+  assert.equal(app.runtime.localCarId, null, "resuming an abandoned car restored manual ownership");
+  app.shutdown(); host.destroy(); player.destroy(); game.user = beforeUser;
+}
+
+// If Worker creation fails during F5 recovery, fallback must import the same
+// checkpoint rather than placing the cars back on the grid.
+{
+  const config = { seed: 88201, trackComplexity: 2, laps: 3, requiredPitStops: 1 };
+  const entries = [{ id: "car-host", userId: "host", name: "Host", build: cloneDefaultBuild() }];
+  const sim = new RaceSimulation({ ...config, entries, track: generateTrack(88201, 2) });
+  for (let tick = 0; tick < 420; tick++) sim.step();
+  Object.assign(sim.cars[0], { health: sim.cars[0].health - 20, heat: 31, lastInputSequence: 40,
+    currentInput: { ...neutralInput(), throttle: 1 } });
+  globalThis.Worker = class { constructor() { throw new Error("Worker blocked"); } };
+  const saves = [];
+  const runtime = new RaceRuntime({ network: { isHost: true, saveRecoveryCheckpoint: value => saves.push(value) },
+    isRaceActive: () => true, onFinished() {} });
+  const warn = console.warn; console.warn = () => {};
+  try { runtime.start({ config, entries, host: true, raceId: "fallback-recovery", checkpoint: sim.exportCheckpoint() }); }
+  finally { console.warn = warn; delete globalThis.Worker; }
+  assert.equal(runtime.simulationWorker, null);
+  assert.equal(runtime.simulation.tick, 420);
+  assert.equal(runtime.simulation.cars[0].health, sim.cars[0].health);
+  assert.equal(runtime.simulation.cars[0].heat, 31);
+  assert.deepEqual(runtime.simulation.cars[0].currentInput, neutralInput());
+  assert.equal(runtime.simulation.cars[0].lastInputSequence, -1);
+  assert.equal(JSON.parse(saves[0]).tick, 420);
+  runtime.stop();
+}
+
+// F5 resumes full authority, fences old transport packets even when the saved
+// tick precedes the player's last frame, and reassigns the same human cars.
+{
+  await new Promise(resolve => setImmediate(resolve));
+  const { host, player } = setup();
+  await host.sessionWrite;
+  const sim = new RaceSimulation({ ...host.activeRace.config, entries: host.activeRace.entries,
+    track: generateTrack(host.activeRace.config.seed, host.activeRace.config.trackComplexity, host.activeRace.config.environmentTheme) });
+  Object.assign(sim, { tick: 6200, simulationTime: 103.333, time: 99.933, countdown: 0, started: true });
+  Object.assign(sim.cars[0], { lap: 1, nextSector: 2, pitState: "service", pitWord: "ядро", pitAttemptId: "f5-attempt", pitServiceTimer: 2.7 });
+  as("host", () => host.sendSnapshot({ ...sim.snapshot(), tick: 6500 }));
+  const staleFrame = structuredClone(sent.findLast(m => m.type === "race-frame"));
+  as("player", () => player.sendInput("car-player", { throttle: 1 }, 999));
+  advance(8);
+  const staleInput = structuredClone(sent.findLast(m => m.type === "race-input"));
+  assert.equal(as("host", () => host.saveRecoveryCheckpoint(JSON.stringify(sim.exportCheckpoint()))), true);
+  const oldRaceId = host.raceId;
+  const dismissedApp = as("player", () => new BigRacesApp(player));
+  dismissedApp.dismissedRaceId = oldRaceId;
+  as("host", () => host.destroy());
+  const reloaded = makeNetwork("host");
+  const app = as("host", () => new BigRacesApp(reloaded));
+  const restoring = as("host", () => reloaded.restoreSavedRace());
+  advance(RECOVERY_PROBE_MS);
+  assert.equal(await restoring, true);
+  assert.equal(JSON.parse(recoveryValues.get(as("host", () => reloaded.recoveryStore.key))).race.raceId, oldRaceId,
+    "unacknowledged world lease overwrote the last durable checkpoint");
+  await reloaded.sessionWrite;
+  assert.equal(JSON.parse(recoveryValues.get(as("host", () => reloaded.recoveryStore.key))).race.raceId, reloaded.raceId);
+  assert.notEqual(reloaded.raceId, oldRaceId);
+  assert.equal(player.raceId, reloaded.raceId);
+  assert.equal(reloaded.activeRace.sessionId, oldRaceId);
+  assert.equal(player.lastSnapshot.tick, 6200, "new transport retained the old monotonic tick window");
+  assert.equal(dismissedApp.screen, "garage", "F5 pulled a player back into a race they had left");
+  assert.equal(app.screen, "race");
+  assert.equal(app.runtime.simulation.tick, 6200);
+  assert.equal(app.runtime.simulation.cars[0].lap, 1);
+  assert.equal(app.runtime.simulation.cars[0].pitAttemptId, "f5-attempt");
+  assert.equal(app.runtime.localCarId, "car-host");
+  assert.equal(as("player", () => player.participantCarId), "car-player");
+  const oldEpoch = staleFrame.hostEpoch;
+  let inputs = 0;
+  reloaded.on("input", () => inputs++);
+  const deliver = message => { for (const listener of [...listeners]) as(listener.owner, () => listener.fn(message)); };
+  deliver({ ...staleFrame, id: "delayed-old-frame" });
+  deliver({ ...staleInput, id: "delayed-old-input" });
+  deliver({ ...staleFrame, type: "lobby-closed", id: "delayed-old-close", hostEpoch: oldEpoch });
+  assert.equal(inputs, 0);
+  assert.equal(player.lastSnapshot.tick, 6200);
+  assert.ok(player.lobby && reloaded.lobby, "old host epoch closed the resumed lobby");
+  as("player", () => player.sendInput("car-player", { throttle: 1 }, 1)); advance(8);
+  assert.equal(inputs, 1, "fresh low sequence was rejected after resume");
+  assert.equal(app.runtime.simulation.cars[1].currentInput.throttle, 1);
+  as("host", () => app.shutdown());
+  as("player", () => dismissedApp.shutdown());
+  as("host", () => reloaded.stopRace());
+  await reloaded.sessionWrite;
+  assert.deepEqual(settingsState.get("raceSession"), {});
+  const nextReload = makeNetwork("host");
+  assert.equal(await as("host", () => nextReload.restoreSavedRace()), false, "stop revived a stale save");
+  as("host", () => reloaded.closeLobby());
+  assert.equal(player.lobby, null, "the resumed epoch could not close its lobby");
+  nextReload.destroy(); reloaded.destroy(); player.destroy();
+}
+
+// A player's F5 keeps the race ID but must retire its old input namespace.
+// Late input/ready/claim packets cannot poison the new small sequence numbers.
+{
+  const {host,player}=setup(),assignments=[];
+  const simulation=new RaceSimulation({track:generateTrack(88201,2),entries:host.activeRace.entries});
+  host.on('input',m=>simulation.setInput(m.carId,m.input,m.sequence));
+  let claims=0;
+  host.on('claimControl',m=>{claims++;simulation.claimControl(m.carId);});
+  player.on('controlAssignment',m=>assignments.push(m));
+  as('player',()=>player.beginControlSession('car-player'));
+  as('player',()=>player.requestControlAssignment());
+  assert.equal(claims,1,'assignment was confirmed before establishing the host input window');
+  assert.equal(assignments.length,1);
+  as('player',()=>player.sendInput('car-player',{throttle:1,steer:1},500));advance(20);
+  const oldInput=structuredClone(sent.findLast(m=>m.type==='race-input'));
+  const oldReady=structuredClone(sent.findLast(m=>m.type==='race-ready'));
+  const car=simulation.cars.find(c=>c.id==='car-player');
+  assert.equal(car.lastInputSequence,500);
+  player.destroy();advance(300);
+  const reloaded=makeNetwork('player');
+  as('player',()=>reloaded.requestState());
+  assert.equal(claims,1,'state discovery implicitly reclaimed the car');
+  as('player',()=>reloaded.beginControlSession('car-player'));
+  as('player',()=>reloaded.requestControlAssignment());
+  assert.equal(claims,2);
+  as('player',()=>reloaded.sendInput('car-player',{throttle:1,steer:-1},1));advance(20);
+  const freshInput=sent.findLast(m=>m.type==='race-input');
+  assert.notEqual(freshInput.controlSession,oldInput.controlSession);
+  assert.equal(car.lastInputSequence,1);
+  as('player',()=>game.socket.emit('test',{...oldInput,id:'late-prior-input',sequence:501}));
+  advance(300);
+  as('player',()=>game.socket.emit('test',{...oldReady,id:'late-prior-ready'}));
+  as('player',()=>game.socket.emit('test',{...oldReady,type:'claim-control',id:'late-prior-claim'}));
+  as('player',()=>reloaded.sendInput('car-player',{throttle:.3,steer:-.5},2));advance(20);
+  assert.equal(car.lastInputSequence,2,'prior connection poisoned the new input sequence');
+  assert.equal(car.currentInput.steer,-.5);
+  assert.equal(claims,2,'retired control claim reopened the host sequence');
+  advance(300);
+  as('player',()=>reloaded.requestControlAssignment());
+  assert.equal(claims,2,'duplicate current assignment reset live control');
+  assert.equal(car.lastInputSequence,2);
+  // A delayed assignment for the old namespace cannot confirm a new runtime.
+  let confirmed=0;reloaded.on('controlAssignment',()=>confirmed++);
+  const priorAssignment=sent.find(m=>m.type==='control-assignment'&&m.controlSession===oldInput.controlSession);
+  as('host',()=>game.socket.emit('test',{...priorAssignment,id:'late-prior-assignment'}));
+  assert.equal(confirmed,0);
+  host.destroy();reloaded.destroy();
+}
+
+// A queued world-setting write must recheck its owner before issuing I/O.
+// Otherwise a GM who has already lost authority can invalidate the winner's F5.
+{
+  await new Promise(resolve=>setImmediate(resolve));
+  const {host,player}=setup();
+  const oldRace=host.raceId;
+  users.set('winner',{id:'winner',name:'Winner',isGM:true,active:true});
+  const lobby={...host.lobby,hostId:'winner',hostEpoch:1,hostClaimedAt:Date.now(),hostClaimId:'winning-claim',phase:'lobby'};
+  const winnerLease={raceId:'winner-race',lobbyId:lobby.id,hostId:'winner',hostEpoch:1};
+  as('winner',()=>game.socket.emit('test',{type:'host-claim',id:'new-authority-before-write',protocolVersion:host.activeRace.protocolVersion,
+    senderId:'winner',sentAt:Date.now(),lobby,abortRace:true,abortedRaceId:oldRace}));
+  settingsState.set('raceSession',winnerLease);
+  await host.sessionWrite;
+  assert.deepEqual(settingsState.get('raceSession'),winnerLease,'obsolete GM overwrote the current world lease');
+  host.destroy();player.destroy();users.delete('winner');
+}
+
+// Superseding queued operations must still persist a newly started race, and
+// an explicit close must clear its own lease even after lobby becomes null.
+{
+  settingsState.delete('raceSession');
+  const {host,player}=setup();
+  const entries=host.activeRace.entries;
+  as('host',()=>host.stopRace());
+  as('host',()=>host.startRace(entries));
+  await host.sessionWrite;
+  assert.equal(settingsState.get('raceSession').raceId,host.raceId);
+  as('host',()=>host.closeLobby());
+  await host.sessionWrite;
+  assert.deepEqual(settingsState.get('raceSession'),{});
+  host.destroy();player.destroy();
+}
+
+// A newer durable owner can be visible before its socket claim arrives. The
+// equal-epoch tie-break must agree with lobby election, not just compare epochs.
+for(const epoch of [0,1]) {
+  settingsState.delete('raceSession');
+  const {host,player}=setup();
+  const durable={raceId:'durable-winner',protocol:host.activeRace.protocolVersion,lobbyId:host.lobby.id,
+    hostId:'winner',hostInstanceId:'winner-instance',hostEpoch:epoch,hostClaimedAt:1,hostClaimId:'winner'};
+  settingsState.set('raceSession',durable);
+  await host.sessionWrite;
+  assert.deepEqual(settingsState.get('raceSession'),durable,'pending write defeated the durable owner');
+  host.destroy();player.destroy();
+}
+
+// A resumed race-state may precede the replacement host metadata. Existing
+// lobby knowledge must not make that reply disappear permanently.
+for(const claimFirst of [false,true]) {
+  settingsState.delete('raceSession');
+  const {host,player}=setup(),previous=player.raceId;
+  const lobby={...host.lobby,hostEpoch:1,hostInstanceId:'replacement-instance',hostClaimedAt:1,hostClaimId:'replacement'};
+  const race={...host.activeRace,raceId:'replacement-race',hostInstanceId:lobby.hostInstanceId};
+  const meta={senderId:'host',sentAt:Date.now(),protocolVersion:race.protocolVersion,hostEpoch:1,hostInstanceId:lobby.hostInstanceId};
+  as('host',()=>game.socket.emit('test',{...meta,type:'race-state',id:'resumed-state-first',targetId:'player',lobbyId:lobby.id,race,frame:null,results:null}));
+  assert.equal(player.raceId,previous,'unconfirmed ownership was accepted');
+  if(claimFirst)as('host',()=>game.socket.emit('test',{...meta,type:'host-claim',id:'resumed-claim-later',lobby,abortRace:true,abortedRaceId:previous}));
+  as('host',()=>game.socket.emit('test',{...meta,type:'lobby-state',id:'resumed-owner-later',lobby}));
+  assert.equal(player.raceId,race.raceId,'replacement state was lost before its ownership metadata');
+  assert.equal(player.pendingRaceState,null);
+  host.destroy();player.destroy();
+}
+
+// The same GM account in two tabs must have exactly one simulation owner.
+// A secondary tab spectates, including when the original owner resumes via F5.
+{
+  settingsState.delete('raceSession');
+  const previousWorker=globalThis.Worker;let liveWorkers=0;
+  globalThis.Worker=class {
+    constructor(){liveWorkers++;this.alive=true;}
+    addEventListener(){}removeEventListener(){}postMessage(){}
+    terminate(){if(this.alive){liveWorkers--;this.alive=false;}}
+  };
+  const {host,player}=setup(),duplicate=makeNetwork('host');
+  const primaryApp=as('host',()=>new BigRacesApp(host));
+  const secondaryApp=as('host',()=>new BigRacesApp(duplicate));
+  as('host',()=>duplicate.requestState());
+  assert.equal(as('host',()=>duplicate.isHost),false);
+  assert.equal(secondaryApp.runtime.localCarId,null);
+  const entries=host.activeRace.entries;
+  as('host',()=>host.stopRace());as('host',()=>host.startRace(entries));
+  assert.equal(liveWorkers,1,'a second GM tab forked the authoritative simulation');
+  assert.equal(primaryApp.runtime.isHost,true);assert.equal(secondaryApp.runtime.isHost,false);
+  assert.equal(secondaryApp.runtime.localCarId,null,'secondary GM tab claimed the primary driver');
+  await host.sessionWrite;
+  const simulation=new RaceSimulation({...host.activeRace.config,track:generateTrack(88201,2),entries});
+  as('host',()=>host.saveRecoveryCheckpoint(JSON.stringify(simulation.exportCheckpoint())));
+  as('host',()=>primaryApp.shutdown());host.destroy();
+  assert.equal(liveWorkers,0);
+  const resumed=makeNetwork('host'),resumedApp=as('host',()=>new BigRacesApp(resumed));
+  const restoring=as('host',()=>resumed.restoreSavedRace());
+  advance(RECOVERY_PROBE_MS);
+  assert.equal(await restoring,true);
+  await resumed.sessionWrite;
+  assert.equal(liveWorkers,1,'F5 created competing workers in the other GM tab');
+  assert.equal(resumedApp.runtime.isHost,true);
+  assert.equal(secondaryApp.runtime.isHost,false);
+  assert.equal(secondaryApp.runtime.localCarId,null);
+  assert.notEqual(resumed.lobby.hostInstanceId,host.instanceId);
+  as('host',()=>resumed.stopRace());resumedApp.shutdown();secondaryApp.shutdown();
+  resumed.destroy();duplicate.destroy();player.destroy();
+  assert.equal(liveWorkers,0);
+  if(previousWorker===undefined)delete globalThis.Worker;else globalThis.Worker=previousWorker;
+}
+
+// Opening/duplicating a tab can clone the entire sessionStorage checkpoint.
+// A live owner must keep authority and the player's newer tick, even when its
+// state reply is delayed. The copied save itself must never claim authority.
+for (const delay of [0, 900, "drop-first"]) {
+  settingsState.delete("raceSession");
+  const previousWorker = globalThis.Worker, originalStorage = globalThis.sessionStorage;
+  let workers = 0;
+  globalThis.Worker = class {
+    constructor() { workers++; }
+    addEventListener(type, fn) { if (type === "message") this.listener = fn; }
+    removeEventListener() {}
+    postMessage(message) { if (message.type === "init") setTimeout(() => this.listener({ data: { type: "ready", raceId: message.raceId } }), 1); }
+    terminate() { workers--; }
+  };
+  const { host, player } = setup();
+  const primaryApp = as("host", () => new BigRacesApp(host));
+  const entries = host.activeRace.entries;
+  as("host", () => host.stopRace()); as("host", () => host.startRace(entries));
+  await host.sessionWrite;
+  const sim = new RaceSimulation({ ...host.activeRace.config, entries,
+    track: generateTrack(host.activeRace.config.seed, host.activeRace.config.trackComplexity, host.activeRace.config.environmentTheme) });
+  sim.tick = 600;
+  assert.equal(as("host", () => host.saveRecoveryCheckpoint(JSON.stringify(sim.exportCheckpoint()))), true);
+  as("host", () => host.sendSnapshot({ ...sim.snapshot(), tick: 900 }));
+  const copiedValues = new Map(recoveryValues), oldRaceId = host.raceId, oldEpoch = host.lobby.hostEpoch;
+  globalThis.sessionStorage = { getItem: key => copiedValues.get(key),
+    setItem: (key, value) => copiedValues.set(key, value), removeItem: key => copiedValues.delete(key) };
+  const duplicate = makeNetwork("host"), secondaryApp = as("host", () => new BigRacesApp(duplicate));
+  const originalEmit = game.socket.emit;
+  let requests = 0;
+  game.socket.emit = (...args) => {
+    if (args[1].type === "state-request" && ++requests === 1 && delay === "drop-first") return;
+    originalEmit(...args);
+  };
+  wireDelay.set("lobby-state", Number(delay) || 0); wireDelay.set("race-state", Number(delay) || 0);
+  const restoring = as("host", () => duplicate.restoreSavedRace());
+  assert.equal(as("host", () => duplicate.restoreSavedRace()), restoring, "parallel startup did not share its probe");
+  advance(RECOVERY_PROBE_MS);
+  assert.equal(await restoring, false, "a copied tab stole a live race");
+  assert.equal(host.raceId, oldRaceId); assert.equal(player.raceId, oldRaceId);
+  assert.equal(host.lobby.hostEpoch, oldEpoch);
+  assert.equal(as("host", () => host.isHost), true);
+  assert.equal(player.lastSnapshot.tick, 900, "a copied checkpoint rolled back the player");
+  assert.equal(secondaryApp.runtime.isHost, false);
+  assert.equal(secondaryApp.runtime.localCarId, null);
+  assert.equal(workers, 1, "a copied tab started another authoritative Worker");
+  assert.ok(!sent.some(message => message.type === "host-claim"));
+  if (delay === "drop-first") assert.ok(requests >= 2, "lost discovery was not retried");
+  game.socket.emit = originalEmit;
+  globalThis.sessionStorage = originalStorage;
+  wireDelay.clear();
+  as("host", () => host.stopRace()); primaryApp.shutdown(); secondaryApp.shutdown();
+  host.destroy(); duplicate.destroy(); player.destroy();
+  assert.equal(workers, 0);
+  if (previousWorker === undefined) delete globalThis.Worker; else globalThis.Worker = previousWorker;
+}
+
+// Recovery is an asynchronous operation, so an intervening lifecycle/lease
+// change must fence the commit even after a quiet probe has just completed.
+for (const interrupt of ["destroy", "close", "cancel-after-quiet", "offline", "lease-change", "new-lobby", "peer-results", "suspended"]) {
+  settingsState.delete("raceSession");
+  const { host, player } = setup();
+  await host.sessionWrite;
+  const sim = new RaceSimulation({ ...host.activeRace.config, entries: host.activeRace.entries,
+    track: generateTrack(host.activeRace.config.seed, host.activeRace.config.trackComplexity, host.activeRace.config.environmentTheme) });
+  as("host", () => host.saveRecoveryCheckpoint(JSON.stringify(sim.exportCheckpoint())));
+  host.destroy();
+  if (interrupt === "peer-results") { player.hostOffline = true; player.lobby.phase = "results"; }
+  else player.destroy();
+  const returning = makeNetwork("host"), app = as("host", () => new BigRacesApp(returning));
+  const restoring = as("host", () => returning.restoreSavedRace());
+  if (interrupt === "destroy") returning.destroy();
+  if (interrupt === "close") await app._preClose({});
+  if (interrupt === "offline") game.socket.connected = false;
+  if (interrupt === "lease-change") settingsState.set("raceSession", { ...settingsState.get("raceSession"), expiresAt: Date.now() + 1 });
+  if (interrupt === "new-lobby") as("host", () => returning.createLobby({ build: cloneDefaultBuild() }));
+  if (interrupt === "suspended") { clock += 2000; for (const timer of timers.values()) timer.at += 2000; }
+  advance(RECOVERY_PROBE_MS);
+  if (interrupt === "cancel-after-quiet") returning.cancelRecovery();
+  assert.equal(await restoring, false, `${interrupt} allowed delayed recovery`);
+  assert.equal(returning.activeRace, null);
+  assert.ok(!sent.some(message => message.type === "host-claim"));
+  delete game.socket.connected;
+  app.shutdown(); returning.destroy(); player.destroy();
+}
+
+// The object saved during a setting round-trip must remain the comparison and
+// lobby baseline even when the current draft is edited before it completes.
+{
+  const { GarageController } = await import("../scripts/app/garage-controller.js");
+  const originalSet = game.settings.set;
+  let release, submitted;
+  const gate = new Promise(resolve => { release = resolve; });
+  game.settings.set = async (_module, key, value) => {
+    submitted = value;
+    await gate;
+    settingsState.set(key, structuredClone(value));
+  };
+  const updates = [];
+  const garage = new GarageController({ network: { participant: {}, updateBuild: b => updates.push(structuredClone(b)) } });
+  garage.readFromForm = () => garage.build;
+  garage.refreshPreview = () => {};
+  const expected = structuredClone(garage.build);
+  const save = garage.saveFromForm(null, false);
+  garage.build.name = "Unsaved draft";
+  garage.build.driver.name = "Unsaved driver";
+  release();
+  const saved = await save;
+  assert.deepEqual(submitted, expected);
+  assert.deepEqual(saved, expected);
+  assert.deepEqual(garage.comparisonBuild, expected);
+  assert.deepEqual(updates, [expected]);
+  assert.equal(garage.build.name, "Unsaved draft", "completion discarded the newer form draft");
+  assert.equal(garage.build.driver.name, "Unsaved driver");
+  game.settings.set = originalSet;
+}
+
+// A delayed Leave/Stop answer belongs to the exact runtime that opened it.
+for (const role of ["player", "host"]) for (const changed of ["currentRaceId", "localCarId"]) {
+  const { host, player } = setup();
+  const beforeUser = game.user;
+  game.user = users.get(role);
+  const network = role === "host" ? host : player;
+  const app = new BigRacesApp(network);
+  for (const fn of network.handlers.start) fn(network.activeRace);
+  const events = new Map();
+  app.element = { querySelector: () => null, addEventListener: (type, fn) => events.set(type, fn), contains: () => true };
+  await app._onRender({}, {});
+  let answer;
+  foundry.applications.api.DialogV2.confirm = () => new Promise(resolve => { answer = resolve; });
+  const actions = sent.length;
+  events.get("click")({ target: { closest: () => ({ dataset: { action: "abandon-race" } }) }, preventDefault() {} });
+  app.runtime[changed] = "replacement-" + changed;
+  answer(true);
+  await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+  assert.equal(app.screen, "race", "stale confirmation closed the replacement runtime");
+  assert.equal(sent.slice(actions).some(m => ["leave-race", "stop-race"].includes(m.type)), false);
+  app.shutdown(); host.destroy(); player.destroy(); game.user = beforeUser;
+  foundry.applications.api.DialogV2.confirm = async () => true;
+}
+
+// An unrelated expired lease is recoverable, but a live owner keeps it even
+// when all of its ordinary lobby broadcasts are rejected by the racing lobby.
+{
+  const { host, player } = setup();
+  const orphan = { raceId: "orphan-race", lobbyId: "orphan-lobby", hostId: "orphan",
+    hostInstanceId: "orphan-instance", hostEpoch: 0, protocol: host.activeRace.protocolVersion, expiresAt: Date.now() - 1 };
+  settingsState.set("raceSession", orphan);
+  let savedCheckpoint = null;
+  host.recoveryStore.save = data => { savedCheckpoint = data.checkpoint; return true; };
+  assert.equal(host.saveRecoveryCheckpoint("latest-checkpoint"), false);
+  await host.sessionWrite;
+  assert.deepEqual(settingsState.get("raceSession"), orphan);
+  for (let i = 0; i < 50; i++) {
+    game.socket.emit("test", { type: "host-heartbeat", id: "orphan-heartbeat-" + i,
+      senderId: "orphan", protocolVersion: orphan.protocol, hostInstanceId: orphan.hostInstanceId,
+      hostEpoch: 0, lobbyId: orphan.lobbyId, raceId: orphan.raceId });
+    advance(2000); await host.sessionWrite;
+  }
+  assert.deepEqual(settingsState.get("raceSession"), orphan, "live cross-lobby owner was overwritten");
+  for (let i = 0; i < 46; i++) { advance(2000); await host.sessionWrite; }
+  assert.equal(settingsState.get("raceSession").raceId, host.raceId, "quiet expired cross-lobby lease blocked recovery forever");
+  assert.equal(host.sessionReadyRaceId, host.raceId);
+  assert.equal(savedCheckpoint, "latest-checkpoint");
+  assert.ok(settingsState.get("raceSession").expiresAt > Date.now());
+  host.destroy(); player.destroy();
+}
+
+// Periodic renewals never enqueue a growing promise/socket backlog when the
+// transport is offline or a world-setting acknowledgement is slow.
+{
+  const originalInterval = window.setInterval, originalSet = game.settings.set;
+  const previousConnected = game.socket.connected;
+  const heartbeats = [];
+  window.setInterval = fn => { heartbeats.push({ owner: game.user.id, fn }); return heartbeats.length; };
+  settingsState.delete("raceSession");
+  const { host, player } = setup();
+  await host.sessionWrite;
+  let release, writes = 0;
+  const pending = new Promise(resolve => { release = resolve; });
+  game.settings.set = async (...args) => { writes++; await pending; return originalSet(...args); };
+  const heartbeat = () => as("host", heartbeats.find(h => h.owner === "host").fn);
+  game.socket.connected = false;
+  advance(31_000); heartbeat();
+  assert.equal(writes, 0, "offline heartbeat queued a lease RPC");
+  game.socket.connected = true;
+  heartbeat(); await Promise.resolve(); await Promise.resolve();
+  assert.equal(writes, 1);
+  for (let i = 0; i < 4; i++) { advance(31_000); heartbeat(); await Promise.resolve(); }
+  assert.equal(writes, 1, "slow setting ACK queued repeated lease renewals");
+  release(); await host.sessionWrite;
+  assert.equal(host.sessionWritePending, false);
+  game.settings.set = originalSet;
+  window.setInterval = originalInterval;
+  if (previousConnected === undefined) delete game.socket.connected;
+  else game.socket.connected = previousConnected;
+  host.destroy(); player.destroy();
+}
+
+// A suspension, disconnect, or renewed durable lease restarts the observation
+// period. Wall-clock jumps alone never authorize replacing an active owner.
+{
+  const { RecoveryLeaseGuard, RECOVERY_LEASE_MS } = await import("../scripts/netcode/recovery-lease.js");
+  const lease = { raceId: "a", lobbyId: "a", hostId: "old", expiresAt: 1 };
+  const guard = new RecoveryLeaseGuard();
+  let now = 0;
+  const check = (connected = true) => guard.canReplace(lease, { now, wallNow: 1e15, connected });
+  assert.equal(check(), false);
+  now = 100_000;
+  assert.equal(check(), false, "tab suspension counted as a quiet observation");
+  for (let i = 0; i < 44; i++) { now += 2000; assert.equal(check(), false); }
+  now += 2000;
+  assert.equal(check(), true);
+  assert.equal(check(false), false);
+  now += 2000;
+  assert.equal(check(), false, "disconnect did not reset quiet observation");
+  for (let i = 0; i < RECOVERY_LEASE_MS / 2000; i++) { now += 2000; check(); }
+  assert.equal(check(), true);
+  lease.expiresAt = 2;
+  assert.equal(check(), false, "a renewal did not reset the observed durable identity");
+}
+
+// Foundry serializes a render queued by stopRace behind close(). The close
+// lifecycle must fence synchronous stop/lobby handlers before either can queue
+// a forced reopen. A player's close also suppresses unsolicited state replies.
+for(const role of ['host','player']) {
+  const {host,player}=setup(),beforeUser=game.user;game.user=users.get(role);
+  const network=role==='host'?host:player,app=new BigRacesApp(network);
+  for(const fn of network.handlers.start)fn(network.activeRace);
+  app.rendered=true;const count=app.renderCalls;
+  await app._preClose({});
+  assert.equal(app.renderCalls,count,'closing queued a forced render of the lobby');
+  assert.equal(app.closing,true);
+  await app._onClose({});app.rendered=false;
+  if(role==='player') {
+    const before=app.renderCalls;
+    for(const fn of network.handlers.raceState)fn({race:network.activeRace,snapshot:null});
+    assert.equal(app.renderCalls,before,'closed player view reopened on unsolicited state');
+    assert.equal(sent.some(m=>m.type==='leave-race'),false,'closing permanently abandoned the car');
+  }
+  app.shutdown();host.destroy();player.destroy();game.user=beforeUser;
+}
+
+// Delayed saves may persist, but cannot launch an obsolete test drive after
+// navigation/close or supersede the user's newer launch intent.
+for(const outcome of ['navigate','close','latest']) {
+  listeners.length=0;const network=makeNetwork('host'),app=new BigRacesApp(network);
+  const events=new Map();app.element={querySelector:()=>null,querySelectorAll:()=>[],addEventListener:(type,fn)=>events.set(type,fn),contains:()=>true};
+  app.rendered=true;await app._onRender({},{});
+  const starts=[];app.runtime.start=options=>starts.push(options);
+  const originalSet=game.settings.set;let release;
+  const gate=new Promise(resolve=>release=resolve);
+  game.settings.set=async()=>{await gate;};
+  const click=action=>events.get('click')({target:{closest:()=>({dataset:{action}})},preventDefault(){}});
+  click('practice');
+  if(outcome==='navigate')click('show-lobby');
+  if(outcome==='close'){await app._preClose({});await app._onClose({});app.rendered=false;}
+  if(outcome==='latest')click('practice');
+  release();for(let i=0;i<8;i++)await Promise.resolve();
+  assert.equal(starts.length,outcome==='latest'?1:0,`obsolete launch survived ${outcome}`);
+  game.settings.set=originalSet;app.shutdown();network.destroy();
+}
+
+// Leaving results is an explicit presentation choice too. State discovery must
+// not pull a player back into the finished race when browsing Garage/Lobby.
+for(const action of ['results-lobby','show-garage','show-lobby']) {
+  const {host,player}=setup(),beforeUser=game.user;game.user=users.get('player');
+  const app=new BigRacesApp(player);
+  for(const fn of player.handlers.start)fn(player.activeRace);
+  as('host',()=>host.sendResults({cars:host.activeRace.entries.map((e,i)=>({id:e.id,finished:true,finishTime:100+i}))}));
+  assert.equal(app.screen,'results');
+  const events=new Map();app.element={querySelector:()=>null,querySelectorAll:()=>[],addEventListener:(type,fn)=>events.set(type,fn),contains:()=>true};
+  await app._onRender({},{});
+  events.get('click')({target:{closest:()=>({dataset:{action}})},preventDefault(){}});
+  advance(1100);player.requestState();
+  assert.equal(app.screen,action==='show-garage'?'garage':'lobby',`state reply undid ${action}`);
+  app.shutdown();host.destroy();player.destroy();game.user=beforeUser;
+}
+
+// A player can host, but cannot maintain the world lease required for F5. Do
+// not report such a checkpoint as saved, or repeatedly write an unusable save.
+{
+  listeners.length=0;const beforeUser=game.user;game.user=users.get('player');
+  const network=makeNetwork('player'),originalWarn=ui.notifications.warn,warnings=[];
+  ui.notifications.warn=message=>warnings.push(message);
+  network.createLobby({build:cloneDefaultBuild(),config:{seed:88201,bots:0}});
+  const entries=[{id:'player-car',userId:'player',build:cloneDefaultBuild()}];
+  network.startRace(entries);
+  let writes=0;network.recoveryStore.save=()=>{writes++;return true;};
+  assert.equal(network.saveRecoveryCheckpoint('not-recoverable'),false);
+  assert.equal(network.saveRecoveryCheckpoint('still-not-recoverable'),false);
+  assert.equal(writes,0);assert.equal(warnings.length,1);
+  network.stopRace();network.startRace(entries);network.saveRecoveryCheckpoint('new-race');
+  assert.equal(warnings.length,2,'a new race suppressed its recovery warning');
+  ui.notifications.warn=originalWarn;network.destroy();game.user=beforeUser;
+}
+
+// A failed build write stays on the current form with its draft intact and
+// produces a handled error, rather than an unhandled event-handler rejection.
+{
+  listeners.length=0;const network=makeNetwork('host'),app=new BigRacesApp(network),events=new Map();
+  app.element={querySelector:()=>null,querySelectorAll:()=>[],addEventListener:(type,fn)=>events.set(type,fn),contains:()=>true};
+  app.rendered=true;await app._onRender({},{});app.garage.build.name='Unsaved draft';
+  const originalSet=game.settings.set,originalError=ui.notifications.error,originalConsole=console.error,errors=[];
+  game.settings.set=async()=>{throw new Error('client storage unavailable');};
+  ui.notifications.error=message=>errors.push(message);console.error=()=>{};
+  events.get('click')({target:{closest:()=>({dataset:{action:'save-build'}})},preventDefault(){}});
+  for(let i=0;i<8;i++)await Promise.resolve();
+  assert.equal(errors.length,1);assert.equal(app.screen,'garage');assert.equal(app.garage.build.name,'Unsaved draft');
+  assert.notEqual(app.garage.comparisonBuild.name,'Unsaved draft');
+  game.settings.set=originalSet;ui.notifications.error=originalError;console.error=originalConsole;
+  app.shutdown();network.destroy();
+}
+
+// A reconnect can discover a finished race while the newly opened app is still
+// on Garage; this is a valid transition to Results, not a rejected UI state.
+{
+  const {host,player}=setup(),beforeUser=game.user;game.user=users.get('player');
+  as('host',()=>host.sendResults({cars:host.activeRace.entries.map((e,i)=>({id:e.id,finished:true,finishTime:100+i}))}));
+  const app=new BigRacesApp(player);player.requestState();
+  assert.equal(app.screen,'results','cold reconnect could not present finished results from Garage');
+  app.shutdown();host.destroy();player.destroy();game.user=beforeUser;
+}
+
+// Preferences are optional persistence: camera/map must apply immediately,
+// and an older acknowledgement must not rewind the latest choice.
+{
+  const originalSet=game.settings.set,originalWarn=ui.notifications.warn,originalConsoleWarn=console.warn;
+  const runtime=new RaceRuntime({network:{},isRaceActive:()=>true,onFinished(){}}),cameras=[],maps=[],pending=[],warnings=[];
+  runtime.renderer={setCameraMode:mode=>cameras.push(mode),setMinimapEnabled:enabled=>maps.push(enabled)};
+  runtime.input.focus=()=>{};document.querySelectorAll=()=>[];
+  game.settings.set=()=>new Promise(resolve=>pending.push(resolve));
+  const first=runtime.setCameraMode('chase'),second=runtime.setCameraMode('overview');
+  assert.deepEqual(cameras,['chase','overview'],'camera waited for preference persistence');
+  pending[1]();await second;pending[0]();await first;
+  assert.equal(cameras.at(-1),'overview','older camera ACK undid the latest choice');
+  const off=runtime.toggleMinimap(),on=runtime.toggleMinimap();
+  assert.deepEqual(maps,[false,true],'map waited for preference persistence');
+  pending[3]();await on;pending[2]();await off;assert.equal(maps.at(-1),true);
+  ui.notifications.warn=message=>warnings.push(message);console.warn=()=>{};
+  game.settings.set=async()=>{throw new Error('client storage unavailable');};
+  await runtime.setCameraMode('chase');await runtime.toggleMinimap();
+  assert.equal(runtime.cameraMode,'chase');assert.equal(warnings.length,1,'preference errors were silent or spammed');
+  runtime.renderer=null;runtime.destroy();
+  game.settings.set=originalSet;ui.notifications.warn=originalWarn;console.warn=originalConsoleWarn;delete document.querySelectorAll;
+}
+
+// A GM who recovers another host's lobby need not be a driver. Starting and
+// restoring the race must still create exactly one authoritative Worker.
+{
+  settingsState.delete("raceSession");
+  const { host, player } = setup(), previousWorker = globalThis.Worker, previousUser = game.user;
+  const rescuerId = "rescue-gm";
+  users.set(rescuerId, { id: rescuerId, name: "Rescue GM", isGM: true, active: true });
+  game.user = users.get(rescuerId);
+  let liveWorkers = 0;
+  globalThis.Worker = class {
+    constructor() { liveWorkers++; this.alive = true; }
+    addEventListener() {} removeEventListener() {} postMessage() {}
+    terminate() { if (this.alive) { liveWorkers--; this.alive = false; } }
+  };
+  host.destroy();
+  player.hostOffline = true; // the remaining participant has timed out the former host
+  const rescuer = makeNetwork(rescuerId), app = as(rescuerId, () => new BigRacesApp(rescuer));
+  as(rescuerId, () => rescuer.requestState());
+  assert.equal(as(rescuerId, () => rescuer.recoverOrphanedSession()), true);
+  assert.equal(as(rescuerId, () => rescuer.participant), null);
+  const entries = [{ id: "car-player", userId: "player", build: cloneDefaultBuild() }];
+  as(rescuerId, () => rescuer.startRace(entries));
+  assert.equal(app.runtime.isHost, true, "a non-participant GM did not start authority");
+  assert.equal(app.screen, "race");
+  assert.equal(app.runtime.localCarId, null);
+  assert.equal(liveWorkers, 1);
+  const duplicate = makeNetwork(rescuerId), duplicateApp = as(rescuerId, () => new BigRacesApp(duplicate));
+  as(rescuerId, () => duplicate.requestState());
+  assert.equal(duplicateApp.runtime.isHost, false);
+  assert.equal(liveWorkers, 1, "secondary GM window started a second Worker");
+  await rescuer.sessionWrite;
+  const config = rescuer.activeRace.config;
+  const sim = new RaceSimulation({ ...config, entries, track: generateTrack(config.seed, config.trackComplexity, config.environmentTheme) });
+  assert.equal(as(rescuerId, () => rescuer.saveRecoveryCheckpoint(JSON.stringify(sim.exportCheckpoint()))), true);
+  app.shutdown(); rescuer.destroy();
+  const returning = makeNetwork(rescuerId), returningApp = as(rescuerId, () => new BigRacesApp(returning));
+  const restoring = as(rescuerId, () => returning.restoreSavedRace());
+  advance(RECOVERY_PROBE_MS);
+  assert.equal(await restoring, true);
+  await returning.sessionWrite;
+  assert.equal(returningApp.runtime.isHost, true, "a non-participant GM did not restore authority");
+  assert.equal(returningApp.runtime.localCarId, null);
+  assert.equal(liveWorkers, 1);
+  as(rescuerId, () => returning.stopRace());
+  returningApp.shutdown(); duplicateApp.shutdown(); returning.destroy(); duplicate.destroy(); player.destroy();
+  assert.equal(liveWorkers, 0);
+  users.delete(rescuerId);
+  game.user = previousUser;
+  if (previousWorker === undefined) delete globalThis.Worker; else globalThis.Worker = previousWorker;
+}
+
+// Renewing an already durable same-race lease must not pause tab checkpoints,
+// even with a slow ACK or failed write. A replacement race still waits for ACK.
+for (const failure of [false, true]) {
+  const originalInterval = window.setInterval, originalSet = game.settings.set, originalWarn = console.warn;
+  const heartbeats = [];
+  window.setInterval = fn => { heartbeats.push({ owner: game.user.id, fn }); return heartbeats.length; };
+  settingsState.delete("raceSession");
+  const { host, player } = setup();
+  await host.sessionWrite;
+  const saved = [];
+  host.recoveryStore.save = data => { saved.push(data.checkpoint); return true; };
+  assert.equal(host.saveRecoveryCheckpoint("before-renewal"), true);
+  let finish;
+  const gate = new Promise((resolve, reject) => { finish = failure ? () => reject(new Error("renewal failed")) : resolve; });
+  game.settings.set = async (...args) => { await gate; return originalSet(...args); };
+  console.warn = () => {};
+  advance(31_000);
+  as("host", heartbeats.find(h => h.owner === "host").fn);
+  await Promise.resolve(); await Promise.resolve();
+  assert.equal(host.saveRecoveryCheckpoint("during-renewal"), true, "same-race renewal paused tab checkpoints");
+  finish(); await host.sessionWrite;
+  assert.equal(host.saveRecoveryCheckpoint("after-renewal"), true, "failed renewal disabled tab checkpoints");
+  assert.deepEqual(saved, ["before-renewal", "during-renewal", "after-renewal"]);
+  game.settings.set = originalSet;
+  const entries = host.activeRace.entries;
+  host.stopRace(); host.startRace(entries);
+  assert.equal(host.saveRecoveryCheckpoint("new-race-before-ack"), false, "replacement race reused the old durable lease");
+  await host.sessionWrite;
+  assert.equal(saved.at(-1), "new-race-before-ack", "new-race checkpoint was not flushed after ACK");
+  host.destroy(); player.destroy();
+  window.setInterval = originalInterval; game.settings.set = originalSet; console.warn = originalWarn;
+}
+
+console.log("session-regression-tests: ok (single host instance, F5 restore, leases, view lifecycle, obsolete launches, results dismissal, preferences, control sessions)");

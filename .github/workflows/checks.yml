@@ -1,0 +1,65 @@
+name: Checks and module package
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  check:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          package-manager-cache: false
+      - name: Verify public update channel
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: node scripts/publish-manifest.mjs --check
+      - run: npm run test:all
+      - run: npm run build
+      - uses: actions/upload-artifact@v7
+        with:
+          name: module-${{ runner.os }}
+          path: dist/
+  release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: check
+    concurrency:
+      group: nfs-stable-release
+      cancel-in-progress: false
+      queue: max
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          package-manager-cache: false
+      - name: Verify tag matches manifest
+        run: node -e "const v = JSON.parse(require('fs').readFileSync('package.json')).version; if (!/^\d+\.\d+\.\d+$/.test(v) || process.env.GITHUB_REF_NAME !== 'v' + v) process.exit(1)"
+      - uses: actions/download-artifact@v8
+        with:
+          name: module-Linux
+          path: dist/
+      - name: Upload tested release assets privately
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: node scripts/publish-manifest.mjs --prepare
+      - name: Publish complete release and advance eligible update channels
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: node scripts/publish-manifest.mjs

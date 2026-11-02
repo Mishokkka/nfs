@@ -1,14 +1,14 @@
-/* Гоночный Canvas, HUD, камера, уведомления и пит-стоп. */
-
+/* Race overlays: canvas instruments, discrete DOM controls and pit service. */
 .nfs-race-stage {
+  container: race / inline-size;
   position: relative;
+  min-width: 0;
   min-height: 0;
   overflow: hidden;
   contain: layout paint style;
   isolation: isolate;
-  background: #090d0f;
+  background: #101610;
 }
-
 .nfs-race-stage canvas {
   display: block;
   width: 100%;
@@ -16,7 +16,170 @@
   contain: strict;
   outline: none;
 }
+.nfs-race-stage canvas:focus-visible {
+  outline: 2px solid var(--nfs-crystal);
+  outline-offset: -3px;
+}
+.nfs-camera-switch {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--nfs-line);
+  border-radius: 4px;
+  background: var(--nfs-bg-0);
+}
+.nfs-camera-switch__button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: auto;
+  min-height: 28px;
+  margin: 0;
+  padding: 4px 8px;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  color: var(--nfs-muted);
+  background: transparent;
+  box-shadow: none;
+  font-size: 11px;
+  cursor: pointer;
+}
+.nfs-camera-switch__button:hover {
+  color: var(--nfs-text);
+  background: var(--nfs-surface-2);
+}
+.nfs-camera-switch__button.is-active {
+  color: #f0e7ff;
+  border-color: #9474c1;
+  background: #392a51;
+}
+.nfs-camera-switch__button kbd {
+  color: var(--nfs-muted);
+  font: 10px ui-monospace,monospace;
+}
+.nfs-race-exit {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: auto;
+  min-height: 30px;
+  margin: 0;
+  padding: 5px 9px;
+  border: 1px solid #86564a;
+  border-radius: 4px;
+  color: #efc2b5;
+  background: #342821;
+  box-shadow: none;
+  font-size: 11px;
+  cursor: pointer;
+}
+.nfs-race-exit:hover {
+  background: #4a3028;
+}
+.nfs-controls-help {
+  position: absolute;
+  z-index: 7;
+  bottom: 10px;
+  left: 10px;
+  max-width: calc(100% - 20px);
+  border: 1px solid var(--nfs-line);
+  border-radius: 4px;
+  color: var(--nfs-text);
+  background: #101521f2;
+  font-size: 11px;
+}
+.nfs-controls-help > summary {
+  padding: 7px 10px;
+  min-height: 30px;
+  cursor: pointer;
+}
+.nfs-controls-help > summary i {
+  margin-right: 5px;
+  color: var(--nfs-amber);
+}
+.nfs-controls-help__keys {
+  display: grid;
+  grid-template-columns: repeat(2,minmax(0,1fr));
+  gap: 9px 12px;
+  max-width: 390px;
+  padding: 10px;
+  border-top: 1px solid var(--nfs-line-soft);
+}
 
+.nfs-controls-help__resume {
+  margin: 0 10px 10px;
+}
+
+.nfs-controls-help[open] ~ .nfs-input-status {
+  visibility: hidden;
+}
+.nfs-controls-help__keys span {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--nfs-muted);
+}
+.nfs-controls-help__keys span:last-child {
+  grid-column: 1 / -1;
+  line-height: 1.4;
+}
+.nfs-controls-help kbd {
+  flex: 0 0 auto;
+  padding: 2px 4px;
+  border: 1px solid var(--nfs-line);
+  border-radius: 3px;
+  color: var(--nfs-text);
+  background: var(--nfs-bg-0);
+  font: 10px ui-monospace,monospace;
+}
+.nfs-network-status, .nfs-input-status, .nfs-race-status {
+  position: absolute;
+  left: 50%;
+  z-index: 8;
+  max-width: calc(100% - 24px);
+  padding: 7px 10px;
+  border: 1px solid #9b8155;
+  border-radius: 4px;
+  color: #f1d7ad;
+  background: #181319f5;
+  font-size: 11px;
+  line-height: 1.4;
+  text-align: center;
+  transform: translateX(-50%);
+}
+.nfs-network-status {
+  top: 178px;
+  pointer-events: none;
+}
+.nfs-network-status[hidden] {
+  display: none;
+}
+.nfs-input-status {
+  top: auto;
+  bottom: 48px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  opacity: 0;
+  pointer-events: none;
+  cursor: pointer;
+}
+.nfs-input-status.is-visible {
+  opacity: 1;
+  pointer-events: auto;
+}
+.nfs-race-status {
+  top: 112px;
+  opacity: 0;
+  pointer-events: none;
+}
+.nfs-race-status.is-visible {
+  opacity: 1;
+}
 .nfs-race-error {
   position: absolute;
   inset: 0;
@@ -26,447 +189,180 @@
   align-items: center;
   justify-content: center;
   gap: 9px;
-  padding: 30px;
+  padding: 24px;
   text-align: center;
-  background: rgba(7, 10, 12, 0.94);
+  background: #171d1af5;
 }
-
 .nfs-race-error[hidden] {
   display: none;
 }
-
 .nfs-race-error > i {
   color: var(--nfs-red);
-  font-size: 42px;
+  font-size: 32px;
 }
-
 .nfs-race-error > strong {
-  color: #f2f5f6;
+  color: var(--nfs-text);
   font-size: 18px;
 }
-
 .nfs-race-error > span {
   color: var(--nfs-muted);
-  font-size: 11px;
+  font-size: 12px;
 }
-
 .nfs-hud {
   position: absolute;
   z-index: 5;
   contain: layout paint style;
   pointer-events: none;
 }
-
 .nfs-hud--race {
-  top: 14px;
-  left: 14px;
+  top: 10px;
+  left: 10px;
   display: grid;
-  grid-template-columns: repeat(4, minmax(76px, auto));
-  gap: 7px;
+  grid-template-columns: repeat(4,minmax(65px,auto));
+  gap: 4px;
 }
-
+.nfs-hud--timing {
+  top: 58px;
+  left: 10px;
+  display: grid;
+  grid-template-columns: repeat(3,minmax(80px,auto));
+  gap: 4px;
+}
 .nfs-hud--vehicle {
-  top: 14px;
-  right: 14px;
+  top: 10px;
+  right: 10px;
   display: grid;
-  gap: 7px;
-  width: 210px;
+  gap: 4px;
+  width: 160px;
 }
-
-.nfs-hud-stat,
-.nfs-speed,
-.nfs-meter {
-  border: 1px solid rgba(113, 145, 157, 0.45);
-  border-radius: 8px;
-  background: rgba(12, 18, 21, 0.86);
-  box-shadow: 0 8px 22px rgba(0,0,0,0.28);
+.nfs-hud-stat, .nfs-speed, .nfs-meter {
+  padding: 6px 8px;
+  border: 1px solid var(--nfs-line);
+  border-radius: 4px;
+  background: #171d1aed;
 }
-
-.nfs-hud-stat {
-  min-width: 78px;
-  padding: 8px 10px;
-}
-
-.nfs-hud-stat span,
-.nfs-speed span,
-.nfs-meter span {
-  color: #94a7ae;
+.nfs-hud-stat span, .nfs-speed span, .nfs-meter span {
+  color: var(--nfs-muted);
   font-size: 9px;
-  font-weight: 800;
-  text-transform: uppercase;
-  letter-spacing: 0.12em;
 }
-
-.nfs-hud-stat strong {
+.nfs-hud-stat strong, .nfs-speed strong {
   display: block;
-  margin-top: 3px;
-  color: #f2f6f7;
-  font-size: 16px;
+  color: var(--nfs-text);
+  font-size: 14px;
   font-variant-numeric: tabular-nums;
 }
-
-.nfs-speed {
-  padding: 9px 11px;
-}
-
 .nfs-speed strong {
-  display: block;
-  margin-top: 3px;
-  color: #f5d985;
+  color: var(--nfs-amber-strong);
   font-size: 20px;
-  font-variant-numeric: tabular-nums;
 }
-
 .nfs-meter {
   --ratio: 1;
-
   position: relative;
-  height: 31px;
-  padding: 6px 9px;
+  height: 23px;
+  padding: 3px 8px;
   overflow: hidden;
 }
-
 .nfs-meter i {
   position: absolute;
   left: 0;
   bottom: 0;
   width: 100%;
-  height: 5px;
+  height: 3px;
+  background: var(--nfs-crystal);
   transform: scaleX(var(--ratio));
   transform-origin: left center;
-  will-change: transform;
 }
-
 .nfs-meter--health i {
-  background: linear-gradient(90deg, #8f3f36, #df7265);
+  background: #c47761;
 }
-
-.nfs-meter--charge i {
-  background: linear-gradient(90deg, #247b92, #6de1f7);
-  box-shadow: 0 0 10px rgba(109, 225, 247, 0.5);
-}
-
 .nfs-meter--heat i {
-  background: linear-gradient(90deg, #b27829, #ef5b3e);
+  background: #d6a35c;
 }
-
-.nfs-controls-help {
-  position: absolute;
-  z-index: 5;
-  left: 50%;
-  bottom: 14px;
-  display: flex;
-  gap: 13px;
-  transform: translateX(-50%);
-  padding: 8px 11px;
-  border: 1px solid rgba(113, 145, 157, 0.4);
-  border-radius: 8px;
-  color: #9fb0b6;
-  background: rgba(12, 18, 21, 0.84);
-  font-size: 11px;
-  pointer-events: none;
-}
-
-.nfs-controls-help kbd {
-  padding: 2px 5px;
-  border: 1px solid #546b75;
-  border-bottom-width: 2px;
-  border-radius: 5px;
-  color: #dce7ea;
-  background: #172126;
-}
-
-.nfs-race-exit {
-  position: absolute;
-  z-index: 6;
-  left: 14px;
-  bottom: 14px;
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  min-height: 36px;
-  padding: 0 12px;
-  border: 1px solid rgba(212, 103, 90, 0.58);
-  border-radius: 8px;
-  color: #ffd0ca;
-  background: rgba(105, 48, 42, 0.86);
-  cursor: pointer;
-}
-
-.nfs-camera-switch {
-  position: absolute;
-  z-index: 7;
-  top: 14px;
-  left: 50%;
-  display: inline-flex;
-  gap: 3px;
-  padding: 3px;
-  transform: translateX(-50%);
-  border: 1px solid rgba(113, 145, 157, 0.42);
-  border-radius: 10px;
-  background: rgba(12, 18, 21, 0.88);
-  box-shadow: 0 8px 22px rgba(0,0,0,0.28);
-}
-
-.nfs-camera-switch__button {
-  width: auto;
-  min-height: 32px;
-  margin: 0;
-  padding: 0 10px;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  border: 1px solid transparent;
-  border-radius: 7px;
-  color: #91a3aa;
-  background: transparent;
-  box-shadow: none;
-  font-size: 11px;
-  font-weight: 750;
-  cursor: pointer;
-}
-
-.nfs-camera-switch__button:hover {
-  color: #dce7ea;
-  background: rgba(255,255,255,0.05);
-}
-
-.nfs-camera-switch__button.is-active {
-  color: #eaf8fb;
-  border-color: rgba(99, 198, 220, 0.48);
-  background: linear-gradient(180deg, rgba(48, 125, 143, 0.58), rgba(31, 78, 89, 0.62));
-}
-
-.nfs-camera-switch__button kbd {
-  padding: 1px 4px;
-  border: 1px solid #526770;
-  border-radius: 4px;
-  color: inherit;
-  background: rgba(8, 12, 14, 0.44);
-  font-size: 10px;
-}
-
-.nfs-hud--timing {
-  top: 76px;
-  left: 14px;
-  display: grid;
-  grid-template-columns: repeat(3, minmax(86px, auto));
-  gap: 7px;
-}
-
-.nfs-hud-stat--wide {
-  min-width: 92px;
-}
-
-.nfs-hud-stat--wide strong {
-  font-size: 13px;
-  font-variant-numeric: tabular-nums;
-}
-
-.nfs-race-stage canvas:focus-visible {
-  outline: 2px solid rgba(99, 198, 220, 0.88);
-  outline-offset: -3px;
-}
-
-.nfs-input-status {
-  position: absolute;
-  z-index: 8;
-  left: 50%;
-  top: 72px;
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  transform: translateX(-50%) translateY(-4px);
-  padding: 7px 10px;
-  border: 1px solid rgba(212, 166, 92, 0.52);
-  border-radius: 8px;
-  color: #f3d996;
-  background: rgba(25, 20, 14, 0.92);
-  box-shadow: 0 8px 22px rgba(0,0,0,0.32);
-  font: inherit;
-  font-size: 11px;
-  cursor: pointer;
-  pointer-events: none;
-  opacity: 0;
-  transition: opacity 120ms ease, transform 120ms ease;
-}
-
-.nfs-input-status.is-visible {
-  transform: translateX(-50%) translateY(0);
-  pointer-events: auto;
-  opacity: 1;
-}
-
-.nfs-meter--heat.is-warning {
-  border-color: rgba(236, 171, 72, 0.78);
-  box-shadow: 0 0 0 1px rgba(236, 171, 72, 0.16), 0 8px 22px rgba(0,0,0,0.28);
-}
-
-.nfs-meter--heat.is-critical {
-  border-color: rgba(239, 91, 62, 0.9);
-  box-shadow: 0 0 0 1px rgba(239, 91, 62, 0.2), 0 8px 22px rgba(0,0,0,0.28);
-}
-
-.nfs-meter--charge.is-empty {
-  --ratio: 0;
-
-  border-color: rgba(205, 93, 78, 0.76);
-  background: rgba(58, 24, 20, 0.9);
-}
-
-.nfs-meter--charge.is-empty i {
-  box-shadow: none;
-}
-
-.nfs-meter--charge.is-empty span {
-  color: #f1a69c;
-}
-
-.nfs-race-status {
-  position: absolute;
-  z-index: 9;
-  top: 116px;
-  left: 50%;
-  max-width: min(520px, calc(100% - 32px));
-  padding: 8px 13px;
-  transform: translateX(-50%) translateY(-5px);
-  border: 1px solid rgba(218, 154, 72, 0.62);
-  border-radius: 8px;
-  color: #ffe3a4;
-  background: rgba(48, 31, 15, 0.93);
-  box-shadow: 0 8px 20px rgba(0,0,0,0.34);
-  font-size: 11px;
-  font-weight: 750;
-  text-align: center;
-  pointer-events: none;
-  opacity: 0;
-  transition: opacity 120ms ease, transform 120ms ease;
-}
-
-.nfs-race-status.is-visible {
-  opacity: 1;
-  transform: translateX(-50%) translateY(0);
-}
-
 .nfs-pit-overlay {
   position: absolute;
   inset: 0;
   z-index: 18;
   display: grid;
   place-items: center;
-  padding: 24px;
-  background: rgba(5, 10, 12, 0.66);
+  padding: 16px;
+  background: #101510b3;
 }
-
 .nfs-pit-overlay[hidden] {
   display: none;
 }
-
 .nfs-pit-card {
-  width: min(520px, 100%);
-  padding: 24px;
-  border: 1px solid rgba(103, 203, 224, 0.54);
-  border-radius: 14px;
-  color: #eaf4f6;
-  background: linear-gradient(155deg, rgba(22, 42, 48, 0.98), rgba(12, 23, 28, 0.99));
-  box-shadow: 0 22px 64px rgba(0,0,0,0.56), inset 0 1px rgba(255,255,255,0.04);
+  width: min(400px,100%);
+  padding: 20px;
+  border: 1px solid #957cab;
+  border-radius: 2px;
+  color: var(--nfs-text);
+  background: #101521;
+  box-shadow: 0 16px 40px #0008;
   text-align: center;
-  transition: transform 120ms ease, border-color 120ms ease;
 }
-
 .nfs-pit-overlay.is-error .nfs-pit-card {
-  transform: translateX(-7px);
-  border-color: rgba(235, 98, 82, 0.92);
+  border-color: #e1937d;
 }
-
 .nfs-pit-overlay.is-complete .nfs-pit-card {
-  border-color: rgba(89, 203, 139, 0.88);
+  border-color: #b8d4af;
 }
-
 .nfs-pit-card h2 {
-  margin: 3px 0 5px;
-  color: #f2f7f8;
-  font-size: 24px;
+  margin: 7px 0;
+  color: var(--nfs-text);
+  font: italic 800 25px/1.2 Arial,sans-serif;
 }
-
 .nfs-pit-card p {
-  margin: 0 auto 17px;
-  color: #9fb1b7;
-  font-size: 11px;
+  margin: 0 auto 14px;
+  color: var(--nfs-muted);
+  font-size: 12px;
+  line-height: 1.45;
 }
-
 .nfs-pit-card .nfs-eyebrow {
   display: flex;
   justify-content: center;
   gap: 8px;
 }
-
 .nfs-pit-word {
   display: block;
   margin-bottom: 12px;
-  color: #81dff2;
-  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
-  font-size: clamp(25px, 4vw, 38px);
-  letter-spacing: 0.06em;
+  color: #d7bbf4;
+  font: 600 30px/1.3 ui-monospace,Consolas,monospace;
+  letter-spacing: .04em;
+  overflow-wrap: anywhere;
   user-select: none;
 }
-
-.nfs-pit-card input {
+.fbl-need-for-speed .nfs-pit-card input {
   width: 100%;
-  height: 48px;
+  height: 42px;
   margin: 0;
-  border: 1px solid rgba(105, 201, 220, 0.68);
-  border-radius: 9px;
-  color: #f4fbfc;
-  background: rgba(3, 10, 13, 0.82);
-  box-shadow: inset 0 1px 8px rgba(0,0,0,0.32);
-  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
-  font-size: 22px;
+  border-color: #957cab;
+  color: var(--nfs-text);
+  font: 20px ui-monospace,Consolas,monospace;
   text-align: center;
 }
-
-.nfs-pit-card input:focus {
-  outline: 2px solid rgba(105, 218, 239, 0.72);
-  outline-offset: 2px;
-}
-
-.nfs-pit-card input:disabled {
-  opacity: 0.72;
-}
-
 .nfs-pit-card > small {
   display: block;
   min-height: 16px;
   margin-top: 8px;
-  color: #a9b9be;
+  color: var(--nfs-muted);
+  font-size: 11px;
 }
-
 .nfs-pit-benefits {
   display: flex;
   flex-wrap: wrap;
   justify-content: center;
-  gap: 8px;
+  gap: 7px;
   margin-top: 14px;
 }
-
 .nfs-pit-benefits span {
-  padding: 5px 8px;
-  border: 1px solid rgba(111, 154, 166, 0.28);
-  border-radius: 999px;
-  color: #b9cbd0;
-  background: rgba(255,255,255,0.03);
+  color: var(--nfs-muted);
   font-size: 10px;
 }
-
 .nfs-pit-benefits i {
-  margin-right: 4px;
-  color: #75d2e5;
+  margin-right: 3px;
+  color: var(--nfs-crystal);
 }
-
-
-/* Live values are drawn into the race canvas. The original DOM nodes stay in
-   the template for accessibility/fallback, but are removed from the compositor
-   during an active race to prevent periodic full-window layout stalls. */
+/* Live instruments are canvas-painted; no periodic full-window DOM layout. */
 .nfs-race-stage.nfs-canvas-hud > .nfs-hud,
 .nfs-race-stage.nfs-canvas-hud > .nfs-race-status {
   display: none;

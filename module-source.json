@@ -2,7 +2,7 @@
   "id": "fbl-need-for-speed",
   "title": "Большие Гонки",
   "description": "Многопользовательские гонки кристаллических болидов с процедурными трассами, сборкой машин, контактной борьбой, перегревом и обязательными пит-стопами.",
-  "version": "0.16.10",
+  "version": "0.17.0",
   "authors": [
     {
       "name": "Хозяин"
@@ -28,6 +28,6 @@
     "styles/accessibility.css"
   ],
   "socket": true,
-  "manifest": "https://raw.githubusercontent.com/Mishokkka/nfs/main/module.json",
-  "download": "https://github.com/Mishokkka/nfs/releases/download/v0.16.10/fbl-need-for-speed-0.16.10.zip"
+  "manifest": "https://github.com/Mishokkka/nfs/releases/latest/download/module.json",
+  "download": "https://github.com/Mishokkka/nfs/releases/download/v0.17.0/fbl-need-for-speed-0.17.0.zip"
 }

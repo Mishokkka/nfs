@@ -29,12 +29,12 @@ export class RaceHud {
   }
 
   update(car, snapshot) {
-    if (!car || !snapshot) return;
+    if (!snapshot) return;
     this.updateCount += 1;
-    const pitSignature = `${car.pitState ?? "track"}:${car.pitAttemptId ?? ""}:${car.pitStopsCompleted ?? 0}:${car.pitWord ?? ""}`;
+    const pitSignature = car ? `${car.pitState ?? "track"}:${car.pitAttemptId ?? ""}:${car.pitStopsCompleted ?? 0}:${car.pitWord ?? ""}` : "spectator";
     if (pitSignature === this.pitSignature) return;
     this.pitSignature = pitSignature;
-    this.pitUi.update(car);
+    this.pitUi.update(car ?? {});
   }
 
   getDiagnosticStats() {

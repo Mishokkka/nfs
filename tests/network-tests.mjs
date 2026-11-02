@@ -26,6 +26,7 @@ const emitted = [];
 globalThis.game = {
   user: users.get("player"),
   users,
+  settings: { get: () => ({}), set: async () => {} },
   socket: {
     on: (_channel, handler) => { socketOnCalls += 1; socketHandler = handler; },
     off: (_channel, handler) => {
@@ -39,6 +40,7 @@ globalThis.game = {
 const { PROTOCOL_VERSION } = await import(pathToFileURL(path.join(root, "scripts/constants.js")).href);
 const { cloneDefaultBuild } = await import(pathToFileURL(path.join(root, "scripts/catalog.js")).href);
 const { RaceNetwork, normalizeConfig } = await import(pathToFileURL(path.join(root, "scripts/network.js")).href);
+const { buildRaceCarMeta } = await import(pathToFileURL(path.join(root, "scripts/physics.js")).href);
 
 // Repeated startup and teardown must keep exactly one listener and heartbeat.
 {
@@ -65,6 +67,7 @@ const { RaceNetwork, normalizeConfig } = await import(pathToFileURL(path.join(ro
 assert.equal(normalizeConfig({ requiredPitStops: 0 }).requiredPitStops, 0);
 assert.equal(normalizeConfig({ trackComplexity: 5 }).trackComplexity, 5);
 assert.equal(normalizeConfig({ environmentTheme: "ruins" }).environmentTheme, "ruins");
+assert.equal(normalizeConfig({ environmentTheme: "city" }).environmentTheme, "city");
 assert.equal(normalizeConfig({ environmentTheme: "invalid" }).environmentTheme, "auto");
 
 let counter = 0;
@@ -72,6 +75,7 @@ const message = (payload) => ({
   protocolVersion: PROTOCOL_VERSION,
   id: `test-${++counter}`,
   sentAt: Date.now(),
+  ...(["race-input", "race-ready", "claim-control", "control-assignment"].includes(payload.type) ? { controlSession: "test-control" } : {}),
   ...payload
 });
 
@@ -111,16 +115,22 @@ const message = (payload) => ({
     entries: [
       { id: "car-player", userId: "player", name: "Player", build: cloneDefaultBuild(), isBot: false },
       { id: "car-host", userId: "host", name: "Host", build: cloneDefaultBuild(), isBot: false }
-    ]
+    ],
+    carMeta: [{ id: "car-player", appearance: { frame: "bull", number: 999, halfLength: 10000, halfWidth: 10000 } }]
   };
   socketHandler(message({ ...racePayload, senderId: "attacker" }));
   assert.equal(starts, 0);
   socketHandler(message({ ...racePayload, senderId: "host" }));
   assert.equal(starts, 1);
   const prediction = startedRace.carMeta[0].prediction;
-  for (const key of ["lateralGrip", "longitudinalDrag", "rollingDrag", "spinResistance", "offroadGrip", "boostDrain", "heatRate", "cooling"]) {
+  const expectedAppearance = buildRaceCarMeta(startedRace.entries[0], 0).appearance;
+  assert.deepEqual(startedRace.carMeta[0].appearance, expectedAppearance,
+    "received cosmetics overrode the validated build or physical footprint");
+  for (const key of ["wheelbase", "lateralGrip", "longitudinalDrag", "rollingDrag", "spinResistance", "offroadGrip", "boostDrain", "heatRate", "cooling"]) {
     assert.ok(Number.isFinite(prediction[key]), `prediction metadata ${key} is missing`);
   }
+  assert.ok(Math.abs(prediction.wheelbase-buildRaceCarMeta(startedRace.entries[0],0).prediction.wheelbase)<1e-4,
+    "wheelbase was lost while normalizing race metadata");
 
   const frame = {
     tick: 10,
@@ -142,6 +152,8 @@ const message = (payload) => ({
   socketHandler(message({ type: "race-frame", senderId: "host", lobbyId: "lobby-a", raceId: "race-a", sequence: 2, simulationTick: 10, frame }));
   assert.equal(snapshots, 1);
   assert.equal(network.lastSnapshot.cars[0].name, "Player");
+  assert.deepEqual(network.lastSnapshot.cars[0].appearance, expectedAppearance,
+    "remote snapshot lost the static chassis appearance");
   assert.ok(Number.isFinite(network.lastSnapshot.cars[0].maxHealth));
   socketHandler(message({ type: "race-frame", senderId: "host", lobbyId: "lobby-a", raceId: "race-a", sequence: 1, simulationTick: 9, frame: { ...frame, tick: 9 } }));
   assert.equal(snapshots, 1);
@@ -161,7 +173,8 @@ const message = (payload) => ({
   const compactCar = (id, x, y, place, { driftAmount = 0, pitInServiceZone = false } = {}) => [
     id, x, y, 0, 0, 0, 100, 100, 0, 0,
     0, 0, 0, 0, 0, null, null, place, null,
-    0, 0, 0, null, null, 0, 0, 0, driftAmount, pitInServiceZone ? 1 : 0
+    0, 0, 0, null, null, 0, 0, 0, driftAmount, pitInServiceZone ? 1 : 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0
   ];
   socketHandler(message({
     type: "race-frame", senderId: "host", lobbyId: "lobby-a", raceId: "race-a",
@@ -171,7 +184,7 @@ const message = (payload) => ({
       v: [compactCar("car-player", 5, 6, 1, { driftAmount: 0.73, pitInServiceZone: true }), compactCar("car-host", 7, 8, 2)]
     }
   }));
-  assert.equal(snapshots, 3, "valid 29-field compact race frame was rejected");
+  assert.equal(snapshots, 3, "valid 39-field compact race frame was rejected");
   assert.equal(network.lastSnapshot.cars[0].x, 5);
   assert.equal(network.lastSnapshot.cars[0].driftAmount, 0.73, "remote drift HUD state was lost");
   assert.equal(network.lastSnapshot.cars[0].pitInServiceZone, true, "remote pit service-zone state was lost");
@@ -314,16 +327,17 @@ const message = (payload) => ({
     finishOrder: [],
     cars: [
       { id: "car-host", x: 1.23456, y: 2.34567, health: 100, charge: 100, place: 1, driftAmount: 0.4567, pitInServiceZone: true, name: "must-not-repeat" },
-      { id: "car-player", x: 3.45678, y: 4.56789, health: 100, charge: 100, place: 2, name: "must-not-repeat" }
+      { id: "car-player", x: 3.45678, y: 4.56789, health: 100, charge: 100, place: 2, surfaceType: "paving", name: "must-not-repeat" }
     ]
   });
   const sentFrame = emitted.findLast((entry) => entry.type === "race-frame");
   assert.ok(sentFrame, "host did not emit compact race-frame");
   assert.ok(Array.isArray(sentFrame.frame.v));
   assert.equal(sentFrame.frame.v[0][1], 1.23);
-  assert.equal(sentFrame.frame.v[0].length, 29);
+  assert.equal(sentFrame.frame.v[0].length, 39);
   assert.equal(sentFrame.frame.v[0][27], 0.457);
   assert.equal(sentFrame.frame.v[0][28], 1);
+  assert.equal(sentFrame.frame.v[1][34], 4, "paving was lost from compact frames");
   assert.equal(sentFrame.frame.v[0].includes("must-not-repeat"), false);
   let inputs = 0;
   let acceptedInput = null;
@@ -373,7 +387,8 @@ const message = (payload) => ({
     lobbyId: network.lobby.id,
     raceId: network.activeRace.raceId,
     userId: "player",
-    carId: "car-player"
+    carId: "car-player",
+    controlSession: "reclaimed-control"
   };
   socketHandler(message({ ...claim, senderId: "attacker" }));
   socketHandler(message({ ...claim, senderId: "player", carId: "car-host" }));
@@ -516,6 +531,25 @@ const message = (payload) => ({
   assert.equal(network.lobby.phase, "lobby");
   assert.equal(recoveredStops, 1);
   network.destroy();
+}
+
+// An offline Socket.IO transport must not retain stale inputs or race frames.
+// Reliable control/state requests retain their existing transport semantics.
+{
+  game.user=users.get('player');
+  const network=new RaceNetwork();
+  network.activeRace={raceId:'offline-race'};
+  const before=emitted.length;
+  game.socket.connected=false;
+  for(let i=0;i<120;i++)network.sendInput('car',{throttle:1,steer:i%2?1:-1},i);
+  assert.equal(emitted.length,before,'offline motion was buffered for reconnect');
+  network.requestState();
+  assert.equal(emitted.at(-1).type,'state-request','reliable state recovery was dropped with motion');
+  game.socket.connected=true;
+  network.sendInput('car',{throttle:0,steer:0},120);
+  assert.equal(emitted.at(-1).type,'race-input');
+  assert.equal(emitted.at(-1).sequence,120,'reconnect sent an obsolete command');
+  delete game.socket.connected;
 }
 
 console.log("network-tests: ok");

@@ -1,6 +1,7 @@
 import { runScript } from "./test-harness.mjs";
 
 const jobs = [
+  ["city streets, mixed cars and mandatory pits", "city-soak-tests.mjs", 11 * 60_000, { NFS_CITY_SOAK_PROFILES: "1" }],
   ["representative procedural track fuzz", "track-fuzz-tests.mjs", 11 * 60_000, {
     NFS_TRACK_FUZZ_SEEDS: "120",
     NFS_WALL_FUZZ_SEEDS: "30",

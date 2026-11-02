@@ -74,7 +74,8 @@ assert.equal(shouldBotPit({ ...botFixture, lap: 0 }, 3), false);
 const garageText = fs.readFileSync(path.join(appDir, "garage-controller.js"), "utf8");
 const templateText = fs.readFileSync(path.join(root, "templates/app.hbs"), "utf8");
 assert.match(garageText, /DRIVER_POINT_BUDGET/);
-assert.match(garageText, /deriveCarPhysics/);
+assert.match(garageText, /compareBuildPerformance/);
+assert.match(fs.readFileSync(path.join(root, "scripts/physics/build-preview.js"), "utf8"), /advanceCarMotion/);
 assert.match(templateText, /data-driver-step/);
 assert.match(templateText, /data-physics-preview/);
 assert.match(templateText, /data-nfs-tooltip/);
@@ -125,7 +126,7 @@ globalThis.Hooks = {
 };
 const network = {
   lobby: null, participant: null, isHost: false,
-  on: () => () => {}, requestState() {}
+  on: () => () => {}, requestState() {}, cancelRecovery() {}
 };
 const racingAppUrl = pathToFileURL(path.join(appDir, "racing-app.js"));
 racingAppUrl.searchParams.set("smoke", String(Date.now()));

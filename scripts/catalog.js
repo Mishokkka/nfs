@@ -103,7 +103,7 @@ export const DEFAULT_BUILD = Object.freeze({
   core: "choir",
   transmission: "adaptive",
   steering: "floating",
-  running: "grip",
+  running: "reinforced",
   body: "ribbed",
   module: "none",
   driver: {

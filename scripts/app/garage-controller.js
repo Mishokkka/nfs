@@ -15,7 +15,7 @@ import {
   resolveBuild,
   validateBuild
 } from "../catalog.js";
-import { deriveCarPhysics } from "../physics.js";
+import { compareBuildPerformance } from "../physics/build-preview.js";
 import { optionList, clamp } from "./app-helpers.js";
 
 
@@ -23,6 +23,7 @@ export class GarageController {
   constructor({ network }) {
     this.network = network;
     this.build = this.#loadBuild();
+    this.comparisonBuild = foundry.utils.deepClone(this.build);
   }
 
   #loadBuild() {
@@ -60,7 +61,8 @@ export class GarageController {
         hasOverflow: resolved.overflow[key] > 0,
         percent: Math.round(resolved.stats[key] / 12 * 100)
       })),
-      physicsPreview: this.#physicsPreview(resolved),
+      physicsPreview: this.#physicsPreview(resolved).map(metric => remaining === 0 ? metric
+        : { ...metric, value: "—", comparison: "", comparisonClass: "", tooltip: "Распределите ровно 16 очков гонщика для расчёта." }),
       driverPoints,
       driverPointBudget: DRIVER_POINT_BUDGET,
       driverStatMin: DRIVER_STAT_MIN,
@@ -87,7 +89,8 @@ export class GarageController {
         ...talent,
         tooltip: `${talent.name}. ${talent.description}`,
         checked: driver.talents.includes(talent.id)
-      }))
+      })),
+      selectedTalentNames: DRIVER_TALENTS.filter(t => driver.talents.includes(t.id)).map(t => t.name).join(" · ") || "Выберите два таланта"
     };
   }
 
@@ -121,7 +124,10 @@ export class GarageController {
 
   #onDriverInput(event, root) {
     const target = event.target;
-    if (!(target instanceof HTMLInputElement) || !DRIVER_STAT_KEYS.includes(target.name)) return;
+    if (!(target instanceof HTMLInputElement)) return;
+    if (target.name === "name") { this.build.name = target.value.slice(0, 80); return; }
+    if (target.name === "driverName") { this.build.driver.name = target.value.slice(0, 80); return; }
+    if (!DRIVER_STAT_KEYS.includes(target.name)) return;
     const value = Number(target.value);
     const valid = Number.isInteger(value) && value >= DRIVER_STAT_MIN && value <= DRIVER_STAT_MAX;
     target.setCustomValidity(valid ? "" : `Введите целое число от ${DRIVER_STAT_MIN} до ${DRIVER_STAT_MAX}.`);
@@ -186,6 +192,8 @@ export class GarageController {
     for (const checkbox of root.querySelectorAll("input[name='talents']")) {
       checkbox.closest(".nfs-talent")?.classList.toggle("is-selected", checkbox.checked);
     }
+    const talents = root.querySelector("[data-selected-talents]");
+    if (talents) talents.textContent = DRIVER_TALENTS.filter(t => this.build.driver.talents.includes(t.id)).map(t => t.name).join(" · ") || "Выберите два таланта";
 
     const catalogs = {
       frame: PARTS.frame,
@@ -210,21 +218,21 @@ export class GarageController {
 
 
   #physicsPreview(resolved) {
-    const physics = deriveCarPhysics(resolved);
-    return [
-      { key: "maxSpeed", label: "Максимальная скорость", shortLabel: "Скорость", value: `${Math.round(physics.maxSpeed * (0.62 / 3))} км/ч` },
-      { key: "acceleration", label: "Тяга двигателя", shortLabel: "Тяга", value: Math.round(physics.acceleration) },
-      { key: "steerRate", label: "Скорость руления", shortLabel: "Руление", value: physics.steerRate.toFixed(2) },
-      { key: "lateralGrip", label: "Боковое сцепление", shortLabel: "Сцепл.", value: physics.lateralGrip.toFixed(1) },
-      { key: "maxHealth", label: "Максимальная прочность", shortLabel: "Прочн.", value: Math.round(physics.maxHealth) },
-      { key: "maxCharge", label: "Максимальный заряд", shortLabel: "Заряд", value: Math.round(physics.maxCharge) }
-    ];
+    return compareBuildPerformance(resolved, resolveBuild(this.comparisonBuild));
   }
 
   #syncPhysicsPreview(root, resolved, driverValid = true) {
     for (const metric of this.#physicsPreview(resolved)) {
       const value = root.querySelector(`[data-physics-preview="${metric.key}"]`);
       if (value) value.textContent = driverValid ? String(metric.value) : "—";
+      const delta = root.querySelector(`[data-physics-delta="${metric.key}"]`);
+      if (delta) {
+        delta.textContent = driverValid ? metric.comparison : "";
+        delta.classList.toggle("is-better", driverValid && metric.comparisonClass === "is-better");
+        delta.classList.toggle("is-worse", driverValid && metric.comparisonClass === "is-worse");
+      }
+      const card = value?.parentElement;
+      if (card) card.dataset.nfsTooltip = driverValid ? metric.tooltip : "Распределите ровно 16 очков гонщика для расчёта.";
     }
   }
 
@@ -297,10 +305,16 @@ export class GarageController {
       return false;
     }
     this.build = normalizeBuild(this.build, { repairPoints: true });
-    await game.settings.set(MODULE_ID, "build", this.build);
-    if (this.network.participant) this.network.updateBuild(this.build);
+    // Form edits can replace or mutate the draft during the setting round-trip.
+    // Keep the submitted build independent of that live draft all the way to
+    // the comparison baseline and the lobby update.
+    const submitted = foundry.utils.deepClone(this.build);
+    await game.settings.set(MODULE_ID, "build", submitted);
+    this.comparisonBuild = foundry.utils.deepClone(submitted);
+    this.refreshPreview(root);
+    if (this.network.participant) this.network.updateBuild(submitted);
     if (showNotification) ui.notifications.info("Сборка сохранена.");
-    return true;
+    return submitted;
   }
 
   #driverTotal(driver) {
